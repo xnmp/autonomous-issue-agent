@@ -131,29 +131,29 @@ def git_link(cwd: str, repository: str) -> GitLink | None:
 
 
 def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
-    path = mount.path
+    path, host = mount.path, mount.host
     if mount.access is Access.PRIVATE:
         return ("--tmpfs", path)
     # A top-level system link (/bin -> usr/bin) stays a link.
     if mount.optional and os.path.dirname(path) == "/" and os.path.islink(path):
         return ("--symlink", os.readlink(path), path)
-    if not os.path.exists(path):  # absent, or a dangling link
+    if not os.path.exists(host):  # absent, or a dangling link
         if mount.optional:
             return ()
-        raise SandboxRefused(f"{path} is missing")
+        raise SandboxRefused(f"{host} is missing")
     # bwrap follows a source link, so the plan's protection is re-checked
     # where the path really leads (a PATH entry linked to ~/.ssh).
-    if exposed := exposes(os.path.realpath(path), protected):
+    if exposed := exposes(os.path.realpath(host), protected):
         if mount.optional:
             return ()
-        raise SandboxRefused(f"{path} leads to {exposed}, which no leg may see")
+        raise SandboxRefused(f"{host} leads to {exposed}, which no leg may see")
     if mount.access is Access.READ_ONLY:
-        return ("--ro-bind", path, path)
+        return ("--ro-bind", host, path)
     if mount.access is Access.READ_WRITE:
-        return ("--bind", path, path)
+        return ("--bind", host, path)
     if mount.access is Access.DEVICE:
-        return ("--dev-bind", path, path)
-    return ("--overlay-src", path, "--tmp-overlay", path) if os.path.isdir(path) else ()
+        return ("--dev-bind", host, path)
+    return ("--overlay-src", host, "--tmp-overlay", path) if os.path.isdir(host) else ()
 
 
 def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...]:
@@ -166,6 +166,20 @@ def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...
     for name, value in plan.env:
         args += ["--unsetenv", name] if value is None else ["--setenv", name, value]
     return (*args, "--chdir", plan.cwd)
+
+
+def _make_leg_tmp(root: str, plan: MountPlan) -> None:
+    """The leg's /tmp and /var/tmp directories under `root`, which must not
+    exist yet: nothing planted there (a link, an earlier leg's files) reaches
+    this leg. Mode 0700: no other local user reads a leg's scratch."""
+    try:
+        os.makedirs(os.path.dirname(root), mode=0o700, exist_ok=True)
+        os.mkdir(root, 0o700)
+        for mount in plan.mounts:
+            if mount.source:
+                os.mkdir(mount.source, 0o700)
+    except OSError as exc:
+        raise SandboxRefused(f"the leg's temp directory {root} cannot be created fresh ({exc.strerror})") from exc
 
 
 def _own_commondir(path: str) -> None:
@@ -314,12 +328,15 @@ class LegSandbox:
         *,
         cwd: str,
         env: Mapping[str, str],
+        tmp: str,
         runtime_state: Sequence[str] = (),
         scratch: Sequence[str] = (),
         read_only: bool = False,
     ) -> Launch:
-        """`command` wrapped in bwrap, plus the environment it adds. Raises
-        `SandboxRefused` when the leg cannot run sandboxed."""
+        """`command` wrapped in bwrap, plus the environment it adds. `tmp` is
+        a path for the leg's own temp directories, created here and removed by
+        whoever owns the run (`ProcessSupervisor.kill_tree`). Raises
+        `SandboxRefused` when the leg cannot run sandboxed, leaving no `tmp`."""
         if not command:
             raise SandboxRefused("no command to sandbox")
         if (reason := self.preflight()) is not None:
@@ -343,7 +360,7 @@ class LegSandbox:
         try:
             plan = leg_mount_plan(LegFacts(
                 home=self.home, cwd=root, writable=writes,
-                git=link, runtime_binary=binary, runtime_support=support,
+                git=link, runtime_binary=binary, tmp=tmp, runtime_support=support,
                 runtime_state=tuple(os.path.abspath(p) for p in runtime_state),
                 search_path=tuple(env.get("PATH", "").split(os.pathsep)), build_cache=build_cache,
                 scratch=tuple(os.path.abspath(p) for p in scratch), protected=self.protected,
@@ -351,8 +368,14 @@ class LegSandbox:
             ))
         except UnsafeMount as exc:
             raise SandboxRefused(str(exc)) from exc
-        argv = (self._binary() or self._bwrap, *bwrap_arguments(plan, protected_paths(self.home, self.protected)),
-                "--", binary, *command[1:])
+        leg_tmp = os.path.normpath(tmp)  # as the plan named its directories
+        _make_leg_tmp(leg_tmp, plan)
+        try:
+            argv = (self._binary() or self._bwrap,
+                    *bwrap_arguments(plan, protected_paths(self.home, self.protected)), "--", binary, *command[1:])
+        except SandboxRefused:
+            shutil.rmtree(leg_tmp, ignore_errors=True)
+            raise
         credential = self._credential if plan.publishes else None
         added = _git_config_env(_GIT_CONFIG + (_PUBLISH_GIT_CONFIG if plan.publishes else ()))
         if credential:

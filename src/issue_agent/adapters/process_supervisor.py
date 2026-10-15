@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -58,6 +59,7 @@ class ProcessSupervisor:
         self.state_dir = Path(state_dir).resolve()
         self.directory = self.state_dir / "process-groups"
         self.intent_directory = self.state_dir / "launch-intents"
+        self.tmp_directory = self.state_dir / "leg-tmp"
         self.grace_seconds = grace_seconds
 
     def supervised_command(
@@ -119,6 +121,11 @@ class ProcessSupervisor:
             "ISSUE_AGENT_SUPERVISED_TARGET": json.dumps(list(command)),
             **self.launch_guard_env(),
         }
+
+    def leg_tmp(self, run_id: RunId) -> str:
+        """Where the run's sandbox puts the leg's disk-backed /tmp (#470). It
+        goes with the run's processes (`kill_tree`), or at boot after a crash."""
+        return str(self.tmp_directory / self._safe_name(run_id))
 
     def prepare_launch(self, run_id: RunId) -> str:
         """Persist a generation-token intent before a provider can be spawned."""
@@ -236,6 +243,8 @@ class ProcessSupervisor:
             self._write_intent(intent)
             registration = self._read(self._path(run_id))
         if registration is None:
+            # The cancelled intent stops any registration, so nothing runs.
+            self._remove_tmp(run_id)
             return
         grace = self.grace_seconds if grace_seconds is None else grace_seconds
         self._terminate(registration, grace, reason, run_id)
@@ -250,10 +259,15 @@ class ProcessSupervisor:
                 and current_intent.state == "cancelled"
             ):
                 self._remove_intent(run_id)
+        self._remove_tmp(run_id)
 
     def recover_orphans(self) -> tuple[RunId, ...]:
         self._discard_dead_launcher_intents()
-        return self._reap_registered(self.grace_seconds)
+        recovered = self._reap_registered(self.grace_seconds)
+        # Boot, under the deployment's lock: no leg of this registry is left,
+        # so every temp directory is a crash's leftover.
+        shutil.rmtree(self.tmp_directory, ignore_errors=True)
+        return recovered
 
     def recover_abandoned_orphans(self) -> tuple[RunId, ...]:
         """Reap a registry another daemon may own: only groups whose launcher
@@ -322,11 +336,20 @@ class ProcessSupervisor:
             recovered.append(registration.run_id)
         return tuple(recovered)
 
-    def _path(self, run_id: RunId) -> Path:
+    @staticmethod
+    def _safe_name(run_id: RunId) -> str:
         safe = str(run_id)
         if not safe or safe in {".", ".."} or "/" in safe or "\0" in safe:
             raise ValueError("run id is not safe for a registry filename")
-        return self.directory / f"{safe}.json"
+        return safe
+
+    def _path(self, run_id: RunId) -> Path:
+        return self.directory / f"{self._safe_name(run_id)}.json"
+
+    def _remove_tmp(self, run_id: RunId) -> None:
+        # Never follows a link the leg planted; a file a dying sandbox process
+        # still writes may survive until the next boot's sweep.
+        shutil.rmtree(self.tmp_directory / self._safe_name(run_id), ignore_errors=True)
 
     def _intent_path(self, run_id: RunId) -> Path:
         safe = str(run_id)

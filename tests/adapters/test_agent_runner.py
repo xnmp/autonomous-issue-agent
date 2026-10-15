@@ -708,13 +708,14 @@ class _Sandbox:
         self.refuse, self.launches = refuse, []
         self.launcher = "/usr/bin/bwrap"  # an executable stand-in, set per test
 
-    def launch(self, command, *, cwd, env, runtime_state=(), scratch=(), read_only=False):
+    def launch(self, command, *, cwd, env, tmp, runtime_state=(), scratch=(), read_only=False):
         from issue_agent.adapters.leg_sandbox import Launch, SandboxRefused
 
         if self.refuse:
             raise SandboxRefused(self.refuse)
+        os.makedirs(os.path.join(tmp, "tmp"))  # as the real sandbox makes the leg's /tmp
         self.launches.append({"command": tuple(command), "cwd": cwd, "runtime_state": tuple(runtime_state),
-                              "read_only": read_only})
+                              "read_only": read_only, "tmp": tmp})
         return Launch((self.launcher, "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
 
 
@@ -755,6 +756,9 @@ def test_a_claude_leg_execs_its_cli_through_the_sandbox_with_its_credential(tmp_
     # The session store `--resume` needs is the CLI's own, for this checkout.
     store = sandbox.launches[0]["runtime_state"][0]
     assert store.endswith("/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(tmp_path)))
+    # The leg's disk-backed /tmp lives in the deployment's state, outside the checkout, and goes with the leg.
+    leg_tmp = sandbox.launches[0]["tmp"]
+    assert leg_tmp.startswith(str(tmp_path / "sup" / "leg-tmp") + "/") and not os.path.exists(leg_tmp)
 
 
 def test_a_claude_leg_the_sandbox_refuses_never_starts(tmp_path, monkeypatch):

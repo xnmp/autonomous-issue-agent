@@ -532,6 +532,7 @@ class AgentRunner(AgentRuntime):
                 leg_env = {**os.environ, **kwargs["env"]}
                 try:
                     launch = self._sandbox.launch(command, cwd=cwd, env=leg_env,
+                                                  tmp=self._process_supervisor.leg_tmp(supervised_run_id),
                                                   runtime_state=claude_runtime_state(leg_env, cwd),
                                                   read_only=task.read_only)
                 except SandboxRefused as exc:

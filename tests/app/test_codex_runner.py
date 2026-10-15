@@ -1245,12 +1245,14 @@ def test_a_sandboxed_codex_leg_runs_with_its_scratch_state_and_token_but_not_hom
     assert result.status == "done", result.summary
     assert (work / "seen").read_text().split() == ["hidden", "fake-leg-token"]
     assert (codex_home / "marker").read_text() == "rollout\n"
+    assert not any((tmp_path / "sup" / "leg-tmp").glob("*"))  # its disk-backed /tmp went with it
 
 
 def test_a_codex_leg_the_sandbox_refuses_never_spawns(tmp_path):
     marker = tmp_path / "spawned"
     runner = CodexRunner(codex_bin=_fake_codex(tmp_path, f'touch "{marker}"\n' + _DONE),
                          env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(tmp_path)},
+                         process_supervisor=ProcessSupervisor(str(tmp_path / "sup")),
                          leg_sandbox=_codex_sandbox(tmp_path, bwrap="definitely-not-bwrap"))
 
     result = asyncio.run(runner.run(RuntimePlan(prompt="x", schema=_STATUS_SCHEMA, cwd=str(tmp_path))))
@@ -1258,3 +1260,9 @@ def test_a_codex_leg_the_sandbox_refuses_never_spawns(tmp_path):
     assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE and result.is_error
     assert "not installed" in result.summary
     assert not marker.exists()
+    assert not (tmp_path / "sup" / "leg-tmp").exists()
+
+
+def test_a_sandboxed_codex_runner_without_a_process_supervisor_is_a_wiring_error(tmp_path):
+    with pytest.raises(ValueError):
+        CodexRunner(codex_bin="codex", leg_sandbox=_codex_sandbox(tmp_path))

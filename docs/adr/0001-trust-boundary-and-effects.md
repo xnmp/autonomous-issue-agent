@@ -69,6 +69,15 @@ into place, and removal renames it there before deleting, so a kill at any
 step leaves only scratch the next clone replaces; a restarted daemon reuses
 clones on disk at the same path, so Claude's cwd-keyed session store resumes
 (`tests/adapters/test_worktree_identity.py`).
+A leg's `/tmp` and `/var/tmp` (#470, 2026-10-16) are fresh 0700 directories on
+disk, `leg-tmp/<run>/{tmp,var-tmp}` in the deployment's process registry
+(ADR 0005), not tmpfs: a tmpfs is charged to the unit's memory, and one leg's
+Chrome traces OOM-killed the fix unit. The launch refuses a path that already
+exists or would expose a protected one. Crash points: a refused launch removes
+what it made; the run's `kill_tree`, at every leg end and every reap, removes
+it once no process of the run can run; boot recovery, under the deployment
+lock, removes whatever a crash left (`tests/adapters/test_leg_sandbox.py`,
+`tests/adapters/test_process_supervisor.py`).
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
 the act layer. Secrets reach the daemons as systemd encrypted

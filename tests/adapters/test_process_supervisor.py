@@ -125,6 +125,71 @@ def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
         _wait_dead(process)
 
 
+def _leg_tmp(supervisor, run_id: str) -> Path:
+    """A leg's temp directory as its sandbox leaves it: written, with a link out."""
+    path = Path(supervisor.leg_tmp(RunId(run_id)))
+    (path / "tmp").mkdir(parents=True)
+    (path / "tmp/trace.json").write_text("{}")
+    (path / "tmp/link").symlink_to(path.parent.parent.parent / "keep")
+    return path
+
+
+def test_a_legs_temp_directory_goes_with_its_process_group(tmp_path) -> None:
+    (tmp_path / "keep").mkdir()
+    (tmp_path / "keep/file").write_text("kept")
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (process,) = _sleepers(supervisor, "leg", 1)
+    tmp = _leg_tmp(supervisor, "leg-0")
+
+    supervisor.kill_tree(RunId("leg-0"))
+
+    _wait_dead(process)
+    assert not tmp.exists()
+    assert (tmp_path / "keep/file").read_text() == "kept"  # never follows the leg's link
+
+
+def test_a_legs_temp_directory_goes_when_its_process_never_registered(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"))
+    (tmp_path / "keep").mkdir()
+    tmp = _leg_tmp(supervisor, "never-ran")
+
+    supervisor.kill_tree(RunId("never-ran"))
+
+    assert not tmp.exists()
+
+
+def test_boot_recovery_removes_temp_directories_a_crash_left(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "orphan", 1)
+    left = [_leg_tmp(supervisor, "orphan-0"), _leg_tmp(supervisor, "crashed-before-registering")]
+
+    supervisor.recover_orphans()
+
+    _wait_dead(process)
+    assert not any(path.exists() for path in left)
+    assert ProcessSupervisor(str(tmp_path / "absent")).recover_orphans() == ()  # nothing to sweep
+
+
+def test_wake_recovery_keeps_a_live_legs_temp_directory(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "live", 1)
+    tmp = _leg_tmp(supervisor, "live-0")
+    try:
+        assert supervisor.recover_abandoned_orphans() == ()
+        assert (tmp / "tmp/trace.json").exists()
+    finally:
+        supervisor.kill_tree(RunId("live-0"))
+        _wait_dead(process)
+
+
+@pytest.mark.parametrize("run_id", ["", ".", "..", "../escape", "a/b", "a\0b"])
+def test_a_run_id_that_is_not_a_plain_name_has_no_temp_directory(tmp_path, run_id) -> None:
+    with pytest.raises(ValueError):
+        ProcessSupervisor(str(tmp_path)).leg_tmp(RunId(run_id))
+
+
 def test_legacy_recovery_does_not_reap_a_live_sibling_owner(tmp_path) -> None:
     supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
     (process,) = _sleepers(supervisor, "live-sibling", 1)

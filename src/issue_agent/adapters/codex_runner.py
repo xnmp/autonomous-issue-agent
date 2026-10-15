@@ -574,6 +574,9 @@ class CodexRunner(AgentRuntime):
     leg_sandbox: LegSandbox | None = None
 
     def __post_init__(self) -> None:
+        # The supervisor owns the run's process group and its leg's temp directory.
+        if self.leg_sandbox is not None and self.process_supervisor is None:
+            raise ValueError("a sandboxed runner needs a process supervisor")
         self._log = self.log or (lambda _m: None)
         self._wall_clock = self.wall_clock or time.time
 
@@ -717,9 +720,12 @@ class CodexRunner(AgentRuntime):
         proc_env = self._child_environment(task)
         execution_cwd = task.cwd or os.getcwd()
         spawn_argv = tuple(argv)
+        accounting_run_id = proc_env.get("ISSUE_AGENT_RUN_ID", "")
+        supervision_run_id = RunId(accounting_run_id or f"codex-{uuid.uuid4().hex}")
         if self.leg_sandbox is not None:
             try:
                 launch = self.leg_sandbox.launch(argv, cwd=execution_cwd, env=proc_env,
+                                             tmp=self.process_supervisor.leg_tmp(supervision_run_id),
                                              runtime_state=codex_runtime_state(proc_env, execution_cwd),
                                              scratch=(os.path.dirname(output_path),), read_only=task.read_only)
             except SandboxRefused as exc:
@@ -731,7 +737,6 @@ class CodexRunner(AgentRuntime):
             proc_env.update(launch.env)
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
         rollout_started_at = time.time()
-        accounting_run_id = proc_env.get("ISSUE_AGENT_RUN_ID", "")
         evidence = {
             "cwd": os.path.realpath(execution_cwd),
             "rollout_started_at": rollout_started_at,
@@ -746,7 +751,6 @@ class CodexRunner(AgentRuntime):
             "max_budget_usd": task.max_budget_usd,
         }
         write_spend_evidence(self.spend_evidence_dir, accounting_run_id, evidence)
-        supervision_run_id = RunId(accounting_run_id or f"codex-{uuid.uuid4().hex}")
         if self.process_supervisor is not None:
             spawn_argv = self.process_supervisor.supervised_command(supervision_run_id, spawn_argv)
             proc_env.update(self.process_supervisor.launch_guard_env())
