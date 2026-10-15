@@ -54,37 +54,15 @@ def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     return GitResult(res.returncode, res.stdout)
 
 
-def _registered_branch(listing: str, expected_path: str) -> str | None:
-    """None means absent; an empty branch means a registered detached checkout."""
-    expected = os.path.realpath(expected_path)
-    current = False
-    branch: str | None = None
-    for line in listing.splitlines():
-        if line.startswith("worktree "):
-            current = os.path.realpath(line.removeprefix("worktree ").strip()) == expected
-            if current:
-                branch = ""
-        elif current and line.startswith("branch refs/heads/"):
-            return line.removeprefix("branch refs/heads/").strip()
-        elif current and not line.strip():
-            current = False
-    return branch
-
-
 class WorktreeUnavailable(RuntimeError):
     """No usable worktree. Raised before the agent runs (never a path that
     does not exist, review M20), so the leg records no receipt: a machine end
     the next poll retries."""
 
 
-class WorktreeBranchAmbiguous(RuntimeError):
-    """Several retained branches for one issue: guessing could strand work."""
-
-
 class Worktrees:
     """Per-issue fix clones under `worktree_root`, relative to `repo_dir`,
-    borrowing its objects (ADR 0001: tauri #1106, GIT-OBJECTS). A worktree
-    from before the clones becomes a clone of its branch (drop once none is left)."""
+    borrowing its objects (ADR 0001: tauri #1106, GIT-OBJECTS)."""
 
     def __init__(self, repo_dir: str, worktree_root: str = ".claude/worktrees", base_branch: str = "dev",
                  run: GitRunner = _subprocess_git, path_exists: Callable[[str], bool] = os.path.isdir):
@@ -101,58 +79,27 @@ class Worktrees:
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
 
-    def _listing(self, cwd: str, why: str) -> str:
-        listing = self._git(["worktree", "list", "--porcelain"], cwd)
-        if listing.code != 0:
-            raise WorktreeUnavailable(why)
-        return listing.out
-
-    def prune_validate(self) -> int:
-        """Prune stale metadata and validate the remaining registry (recovery)."""
-        with self._mutation_lock:
-            if self._git(["worktree", "prune"], self.repo_dir).code != 0:
-                raise WorktreeUnavailable("git worktree prune failed during recovery")
-            listing = self._listing(self.repo_dir, "git worktree list failed during recovery")
-            paths = [line.removeprefix("worktree ").strip() for line in listing.splitlines()
-                     if line.startswith("worktree ")]
-            if missing := [path for path in paths if not self._path_exists(path)]:
-                raise WorktreeUnavailable(f"worktree registry contains missing paths: {missing!r}")
-            return len(paths)
-
     def _is_clone(self, abs_path: str) -> bool:
         return self._path_exists(os.path.join(abs_path, ".git"))
 
     def _branch(self, issue: int, abs_path: str) -> str | None:
-        """The branch of the checkout on `abs_path`: None when there is none,
+        """The branch of the clone on `abs_path`: None when there is none,
         "" when it is detached."""
-        registered = _registered_branch(self._listing(self.repo_dir, f"cannot inspect worktrees for issue #{issue}"),
-                                        abs_path)
-        if registered is not None or not self._is_clone(abs_path):
-            return registered
+        if not self._is_clone(abs_path):
+            return None
         observed = self._git(["branch", "--show-current"], abs_path)
         if observed.code != 0:
             raise WorktreeUnavailable(f"cannot read the branch of issue #{issue}'s checkout")
         return observed.out.strip()
 
-    def branch_for_issue(self, issue: int, fallback: str) -> str:
-        """The issue's retained branch: the checkout's own, else the sole
-        local branch for the issue (a non-synthetic one wins over the
-        fallback), else "". Genuine ambiguity raises rather than guessing."""
+    def branch_for_issue(self, issue: int) -> str:
+        """The branch of the issue's clone, else ""."""
         current = self._branch(issue, os.path.join(self.repo_dir, self.path(issue)))
-        if current is not None:
-            if issue_from_branch(current) != issue:
-                raise WorktreeUnavailable(f"issue #{issue} checkout has foreign or detached branch {current!r}")
-            return current
-        refs = self._git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], self.repo_dir)
-        if refs.code != 0:
-            raise WorktreeUnavailable(f"cannot inspect retained branches for issue #{issue}")
-        matches = [ref for ref in refs.out.splitlines() if issue_from_branch(ref) == issue]
-        if len(matches) <= 1:
-            return matches[0] if matches else ""
-        retained = [ref for ref in matches if ref not in {fallback, f"fix/{issue}-issue"}]
-        if len(retained) == 1:
-            return retained[0]
-        raise WorktreeBranchAmbiguous(f"cannot recover issue #{issue}: multiple retained branches {matches!r}")
+        if current is None:
+            return ""
+        if issue_from_branch(current) != issue:
+            raise WorktreeUnavailable(f"issue #{issue} checkout has foreign or detached branch {current!r}")
+        return current
 
     def ensure(self, issue: int, branch: str) -> str:
         with self._mutation_lock:
@@ -160,17 +107,17 @@ class Worktrees:
 
     def _ensure(self, issue: int, branch: str) -> str:
         """The issue's clone on `branch` (reused, else cloned and branched off
-        the host's retained branch or origin/base), verified to exist and to
-        be on that branch."""
+        origin/base), verified to exist and to be on that branch."""
         abs_path = os.path.join(self.repo_dir, self.path(issue))
         if issue_from_branch(branch) != issue:
             raise WorktreeUnavailable(f"branch {branch!r} does not belong to issue #{issue}")
         existing = self._branch(issue, abs_path)
         if existing is not None and existing != branch:
             raise WorktreeUnavailable(f"issue #{issue} requires branch {branch!r}, but {abs_path!r} has {existing!r}")
-        if existing is not None and not self._is_clone(abs_path):
-            self._discard(issue, abs_path)  # a worktree from before the clones; its branch stays on the host
-            existing = None
+        if existing is None and self._path_exists(abs_path):
+            # `.git` is a file: a git worktree from before the clones, which would write into the host's gitdir.
+            raise WorktreeUnavailable(f"{abs_path!r} is a legacy git worktree, not a clone; remove it with "
+                                      f"`git -C {self.repo_dir} worktree remove --force {abs_path}`")
         if existing is None:
             # Built aside, then renamed into place: a clone killed midway
             # leaves only the scratch path, which the next attempt replaces.
@@ -179,12 +126,13 @@ class Worktrees:
             url = self._git(["remote", "get-url", "origin"], self.repo_dir).out.strip()
             # The repository itself: git refuses to borrow through a linked checkout (`start --worktree`).
             common = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"], self.repo_dir).out.strip()
-            retained = self._git(["for-each-ref", "--format=%(objectname)", f"refs/heads/{branch}"],
-                                 self.repo_dir).out.strip()
-            made = (self._git(["clone", "--quiet", "--no-checkout", "--reference", common, url, scratch],
-                              self.repo_dir).code == 0
-                    and self._git(["checkout", "--quiet", "-b", branch, retained or f"origin/{self.base_branch}"],
-                                  scratch).code == 0)
+            made = self._git(["clone", "--quiet", "--no-checkout", "--reference", common, url, scratch],
+                             self.repo_dir).code == 0
+            if made:
+                # A branch already pushed (a leg pushed before the PR opened, then the clone was lost) resumes there.
+                pushed = self._git(["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], scratch)
+                start = f"origin/{branch}" if pushed.code == 0 else f"origin/{self.base_branch}"
+                made = self._git(["checkout", "--quiet", "-b", branch, start], scratch).code == 0
             if made:
                 try:  # a leg's launch mounts hooks/, which a bare init.templateDir leaves out
                     os.makedirs(os.path.join(scratch, ".git", "hooks"), exist_ok=True)
@@ -233,26 +181,21 @@ class Worktrees:
         return sha if listed.code == 0 and name == ref and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) else ""
 
     def _discard(self, issue: int, abs_path: str) -> None:
-        """Delete the checkout on `abs_path`, verified. A clone is renamed
-        away first, so a removal killed midway leaves only the scratch path
-        the next clone replaces."""
-        if self._is_clone(abs_path):
-            scratch = abs_path + ".partial"
-            shutil.rmtree(scratch, ignore_errors=True)
-            try:
-                os.rename(abs_path, scratch)
-            except OSError as exc:
-                raise WorktreeUnavailable(f"cannot remove issue #{issue}'s checkout ({exc.strerror})") from exc
-            shutil.rmtree(scratch, ignore_errors=True)
-        elif self._git(["worktree", "remove", "--force", abs_path], self.repo_dir).code != 0:
-            raise WorktreeUnavailable(f"git refused to remove the worktree for issue #{issue}")
-        verified = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
-        if verified.code != 0 or _registered_branch(verified.out, abs_path) is not None or self._path_exists(abs_path):
+        """Delete the clone on `abs_path`, verified. It is renamed away first,
+        so a removal killed midway leaves only the scratch path the next
+        clone replaces."""
+        scratch = abs_path + ".partial"
+        shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            os.rename(abs_path, scratch)
+        except OSError as exc:
+            raise WorktreeUnavailable(f"cannot remove issue #{issue}'s checkout ({exc.strerror})") from exc
+        shutil.rmtree(scratch, ignore_errors=True)
+        if self._path_exists(abs_path):
             raise WorktreeUnavailable(f"removal of issue #{issue}'s checkout could not be verified")
 
     def remove(self, issue: int) -> None:
-        """Remove the issue's checkout and any branch of it the host retains,
-        each step verified."""
+        """Remove the issue's clone, verified."""
         with self._mutation_lock:
             abs_path = os.path.join(self.repo_dir, self.path(issue))
             branch = self._branch(issue, abs_path)
@@ -261,12 +204,6 @@ class Worktrees:
             if branch is None or issue_from_branch(branch) != issue:
                 raise WorktreeUnavailable(f"refusing to remove unowned issue #{issue} checkout at {abs_path!r}")
             self._discard(issue, abs_path)
-            ref = ["for-each-ref", "--format=%(refname)", f"refs/heads/{branch}"]
-            if self._git(ref, self.repo_dir).out.strip() and self._git(["branch", "-D", branch], self.repo_dir).code:
-                raise WorktreeUnavailable(f"git refused to delete retained branch {branch!r}")
-            left = self._git(ref, self.repo_dir)
-            if left.code != 0 or left.out.strip():
-                raise WorktreeUnavailable(f"branch deletion for {branch!r} could not be verified")
 
 
 class ReviewCheckouts:

@@ -7,7 +7,6 @@ import subprocess
 import pytest
 
 from issue_agent.adapters.worktree import Worktrees, WorktreeUnavailable
-from issue_agent.domain.refs import BRANCH_PREFIXES, issue_from_branch
 
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
@@ -79,7 +78,7 @@ def test_a_restarted_daemon_reuses_the_clone_with_its_unpushed_work(repo):
 
     again = Worktrees(str(repo))  # a new process: nothing in memory
 
-    assert again.branch_for_issue(703, "fix/703-fallback") == "fix/703-new"
+    assert again.branch_for_issue(703) == "fix/703-new"
     assert again.ensure(703, "fix/703-new") == path
     assert git(path, "log", "-1", "--format=%s") == "unpushed"
 
@@ -106,23 +105,6 @@ def test_a_failed_clone_is_never_handed_to_a_leg(repo):
     with pytest.raises(WorktreeUnavailable, match="cannot clone"):
         worktrees.ensure(703, "fix/703-new")
     assert not (repo / worktrees.path(703)).exists()
-
-
-def test_a_worktree_from_before_the_clones_becomes_a_clone_of_its_branch(repo):
-    worktrees = Worktrees(str(repo))
-    legacy = repo / worktrees.path(703)
-    git(repo, "worktree", "add", "-q", "-b", "fix/703-old", str(legacy))
-    git(legacy, "commit", "--allow-empty", "-m", "retained work")
-
-    assert worktrees.branch_for_issue(703, "fix/703-fallback") == "fix/703-old"
-    path = worktrees.ensure(703, "fix/703-old")
-
-    assert os.path.isdir(os.path.join(path, ".git"))
-    assert git(path, "log", "-1", "--format=%s") == "retained work"
-    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
-    worktrees.remove(703)
-    assert not legacy.exists()
-    assert not git(repo, "branch", "--list", "fix/703-old")
 
 
 def test_sync_resets_the_clone_to_the_pushed_head_and_tracks_it_for_force_with_lease(tmp_path, repo, upstream):
@@ -186,17 +168,15 @@ def test_a_clone_has_the_hooks_directory_a_leg_mounts_even_from_a_bare_template(
     assert os.path.isdir(os.path.join(path, ".git/hooks"))
 
 
-def test_remove_deletes_the_clone_and_any_retained_branch(repo):
+def test_remove_deletes_the_clone(repo):
     worktrees = Worktrees(str(repo))
     path = worktrees.ensure(703, "fix/703-new")
-    git(repo, "branch", "fix/703-new")  # a branch the host still retains
 
     worktrees.remove(703)
     worktrees.remove(703)  # already gone: a no-op
 
     assert not os.path.exists(path)
     assert not os.path.exists(path + ".partial")
-    assert not git(repo, "branch", "--list", "fix/703-new")
     assert git(repo, "rev-parse", "dev")
 
 
@@ -209,49 +189,18 @@ def test_a_removal_killed_midway_never_blocks_the_issue_coming_back(repo):
     assert not os.path.exists(path + ".partial")
 
 
-@pytest.mark.parametrize("branch", ["fix/704-other", "dev"])
-def test_foreign_checkout_is_not_adopted_or_removed(repo, branch):
-    worktrees = Worktrees(str(repo))
-    path = repo / worktrees.path(703)
-    if branch == "dev":
-        git(repo, "worktree", "add", "--detach", str(path))
-    else:
-        git(repo, "worktree", "add", "-b", branch, str(path))
-    original_head = git(path, "rev-parse", "HEAD")
-
-    with pytest.raises(WorktreeUnavailable):
-        worktrees.branch_for_issue(703, "fix/703-fallback")
-    with pytest.raises(WorktreeUnavailable):
-        worktrees.ensure(703, "fix/703-required")
-    with pytest.raises(WorktreeUnavailable):
-        worktrees.remove(703)
-
-    assert path.exists()
-    assert git(path, "rev-parse", "HEAD") == original_head
-
-
 def test_a_foreign_clone_is_not_adopted_or_removed(repo):
     worktrees = Worktrees(str(repo))
     path = worktrees.ensure(703, "fix/703-new")
     git(path, "checkout", "-q", "-b", "fix/704-other")  # a leg moved its clone to another issue's branch
 
     with pytest.raises(WorktreeUnavailable):
-        worktrees.branch_for_issue(703, "fix/703-fallback")
+        worktrees.branch_for_issue(703)
     with pytest.raises(WorktreeUnavailable, match="requires branch"):
         worktrees.ensure(703, "fix/703-new")
     with pytest.raises(WorktreeUnavailable, match="unowned"):
         worktrees.remove(703)
     assert git(path, "branch", "--show-current") == "fix/704-other"
-
-
-def test_authoritative_pr_branch_does_not_adopt_another_branch(repo):
-    worktrees = Worktrees(str(repo))
-    path = repo / worktrees.path(703)
-    git(repo, "worktree", "add", "-b", "test/703-retained", str(path))
-
-    with pytest.raises(WorktreeUnavailable, match="requires branch"):
-        worktrees.ensure(703, "fix/703-published-pr")
-    assert git(path, "branch", "--show-current") == "test/703-retained"
 
 
 def test_same_directory_basename_outside_configured_root_is_not_reused(repo):
@@ -266,11 +215,26 @@ def test_same_directory_basename_outside_configured_root_is_not_reused(repo):
     assert git(foreign, "branch", "--show-current") == "fix/704-other"
 
 
-@pytest.mark.parametrize("prefix", BRANCH_PREFIXES)
-def test_retained_branch_recovery_uses_the_shared_issue_policy(repo, prefix):
-    branch = f"{prefix}/703-retained"
-    git(repo, "branch", branch)
-    git(repo, "branch", f"{prefix}/7030-unrelated")
+def test_a_lost_clone_resumes_on_the_commits_already_pushed_to_its_branch(tmp_path, repo, upstream):
+    git(repo, "checkout", "-q", "-b", "fix/703-new")
+    git(repo, "commit", "--allow-empty", "-m", "pushed before the PR opened")
+    git(repo, "push", "-q", "origin", "fix/703-new")
+    git(repo, "checkout", "-q", "dev")
+    git(repo, "branch", "-D", "fix/703-new")
 
-    assert Worktrees(str(repo)).branch_for_issue(703, "fix/703-fallback") == branch
-    assert issue_from_branch(branch) == 703
+    path = Worktrees(str(repo)).ensure(703, "fix/703-new")
+
+    assert git(path, "branch", "--show-current") == "fix/703-new"
+    assert git(path, "log", "-1", "--format=%s") == "pushed before the PR opened"
+
+
+def test_a_legacy_worktree_is_refused_with_its_cleanup_command_and_left_untouched(repo):
+    worktrees = Worktrees(str(repo))
+    legacy = repo / worktrees.path(703)
+    git(repo, "worktree", "add", "-q", "-b", "fix/703-old", str(legacy))
+
+    with pytest.raises(WorktreeUnavailable, match=r"legacy git worktree.*worktree remove --force"):
+        worktrees.ensure(703, "fix/703-old")
+
+    assert (legacy / ".git").is_file()
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 2

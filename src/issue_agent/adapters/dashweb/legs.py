@@ -38,8 +38,7 @@ def parse_leg(row: sqlite3.Row) -> LegRow | None:
     verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
     issue = row["issue"]
     triage = parse_triage(result.get("triage")) if row["kind"] == "TRIAGE" else None
-    steward = steward_from_record(result.get("steward" if row["kind"] == "STEWARD" else "triage")
-                                  ) if row["kind"] in ("STEWARD", "TRIAGE") else None
+    steward = steward_from_record(result.get("steward")) if row["kind"] == "STEWARD" else None
     return LegRow(
         leg_id=str(row["leg_id"]),
         role=str(row["role"] or ""),

@@ -193,12 +193,9 @@ class FakeWorktrees:
     def remove(self, issue):
         pass
 
-    def branch_for_issue(self, issue, fallback):
+    def branch_for_issue(self, issue):
         del issue
-        return fallback
-
-    def prune_validate(self):
-        return 0
+        return ""
 
     def remote_head(self, branch):
         return ""

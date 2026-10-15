@@ -11,7 +11,6 @@ from issue_agent.adapters.journal import Journal
 from issue_agent.adapters.process_supervisor import ProcessSupervisor as DurableProcessSupervisor
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.app.dashweb.ports import GitHubQueries
-from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.recovery import RecoveryCoordinator
 from issue_agent.domain.ports import (
     EventSink,
@@ -22,7 +21,6 @@ from issue_agent.domain.ports import (
     RecoveryRelease,
     SpendReconciler,
     StaleReservationReconciler,
-    WorktreeRecovery,
 )
 
 # An AST contract requires every Protocol in domain/ports.py to appear here
@@ -37,7 +35,6 @@ COVERED_PORTS = frozenset(
         "RecoveryRelease",
         "SpendReconciler",
         "StaleReservationReconciler",
-        "WorktreeRecovery",
     }
 )
 
@@ -63,10 +60,6 @@ def stale_reservation_reconciler(reconciler: RecoveryCoordinator) -> StaleReserv
 
 def event_sink(journal: Journal) -> EventSink:
     return journal
-
-
-def worktree_recovery(recovery: Worktrees) -> WorktreeRecovery:
-    return recovery
 
 
 def recovery_lease(lease: Lease) -> RecoveryLease:

@@ -30,8 +30,7 @@ Precedence, the single place it is defined (first match wins, per item):
 6. Publication an issue with a pushed `fix/<issue>-` branch ahead of base and
                owed a PR -> OpenPR (free; the agent pushes, the harness
                opens, Q11).
-6a. Stewardship an issue with no agent-ended STEWARD leg (a legacy combined
-               TRIAGE result counts as one) -> STEWARD (gated as in step 8).
+6a. Stewardship an issue with no agent-ended STEWARD leg -> STEWARD (gated as in step 8).
                Stewarded: a laundered `duplicate_of` with no released
                duplicate stop -> NeedsHuman(DUPLICATE). Then a laundered
                `blocked_by` and no harness blocker comment yet -> LinkBlocker
@@ -593,12 +592,11 @@ def _latest_triage(legs: tuple[LegEnd, ...]) -> LegEnd | None:
 
 
 def latest_steward(legs: tuple[LegEnd, ...]) -> LegEnd | None:
-    """The issue's newest agent-ended leg that did the steward's work: a
-    STEWARD leg, or a legacy combined TRIAGE leg whose result carries the
-    steward's fields. An agent end whose output did not parse still counts
-    (it ran; the issue proceeds with no criteria and no duplicate stop)."""
+    """The issue's newest agent-ended STEWARD leg. An agent end whose output
+    did not parse still counts (it ran; the issue proceeds with no criteria
+    and no duplicate stop)."""
     return next((leg for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at))
-                 if not leg.machine and (leg.kind is AgentKind.STEWARD or leg.steward is not None)), None)
+                 if not leg.machine and leg.kind is AgentKind.STEWARD), None)
 
 
 def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str) -> NeedsHuman | None:

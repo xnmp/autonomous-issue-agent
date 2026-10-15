@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from ..adapters.process_supervisor import ProcessSupervisor as DurableProcessSupervisor
 from ..domain.contracts import RunId
-from ..domain.ports import ProcessSupervisor, RecoveryControl, SpendReconciler, WorktreeRecovery
+from ..domain.ports import ProcessSupervisor, RecoveryControl, SpendReconciler
 from ..domain.recovery import RecoveryTrigger
 
 
@@ -17,7 +17,6 @@ class RecoveryReport:
     trigger: RecoveryTrigger
     killed_orphans: tuple[RunId, ...]
     reclaimed_leases: tuple[RunId, ...]
-    validated_worktrees: int
     spend_unknown: tuple[RunId, ...]
 
 
@@ -25,21 +24,17 @@ class RecoveryReport:
 class RecoveryCoordinator:
     supervisor: ProcessSupervisor
     control: RecoveryControl
-    worktrees: WorktreeRecovery | None
     spend: SpendReconciler
     owner_id: str
     reservation_grace: timedelta = timedelta(minutes=2)
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
     def reconcile(self, trigger: RecoveryTrigger) -> RecoveryReport:
-        """Fixed order: kill orphans, reclaim dead leases, validate worktrees,
-        then settle or release stale reservations."""
+        """Fixed order: kill orphans, reclaim dead leases, then settle or release stale reservations."""
         killed = self.supervisor.recover_abandoned_orphans() if trigger is RecoveryTrigger.WAKE else ()
         reclaimed = self.control.reclaim_dead_leases(self.owner_id, _pid_alive)
-        validated = (self.worktrees.prune_validate()
-                     if self.worktrees is not None and trigger is not RecoveryTrigger.PERIODIC else 0)
         grace = timedelta(0) if trigger is RecoveryTrigger.BOOT else self.reservation_grace
-        return RecoveryReport(trigger, killed, reclaimed, validated, self._sweep(grace))
+        return RecoveryReport(trigger, killed, reclaimed, self._sweep(grace))
 
     def reconcile_stale_reservations(self) -> int:
         """Admission's on-demand sweep (keifu #34): the periodic plan, which

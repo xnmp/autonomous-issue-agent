@@ -597,17 +597,19 @@ def test_a_refresh_waits_for_the_slowest_github_read_not_the_sum(deployment):
 
 def test_triage_is_the_first_stage_and_the_issue_page_shows_its_tier_criteria_and_duplicate(deployment, tmp_path):
     backend, *_ = deployment
-    triage = {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": 2,
-              "duplicate_reason": "Same dialog", "rationale": "One handler."}
+    steward = {"acceptance_criteria": ["Esc closes it"], "duplicate_of": 2, "duplicate_reason": "Same dialog"}
+    triage = {"tier": "low", "rationale": "One handler."}
     db = sqlite3.connect(tmp_path / "control.db")
-    db.execute(
-        "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, reserved_at, "
-        "started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, provider_receipt_id, "
-        "settled_at, leg_class, session_id, result_json) VALUES ('T1', 'o/r', 'fix', 'TRIAGE', 1, 1, '', 'o/r:fix', "
-        "'claude', 'ended', ?, ?, ?, 'USD', 2000000, 10000, 'provider_reported', 'normal_return', 'rt1', ?, 'agent', "
-        "'t', ?)",
-        (store_ts(-30), store_ts(-30), store_ts(-29), store_ts(-29), json.dumps({"triage": triage, "summary": ""})),
-    )
+    for leg_id, kind, offset, result in (("S1", "STEWARD", -32, {"steward": steward}), ("T1", "TRIAGE", -30, {"triage": triage})):
+        db.execute(
+            "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, reserved_at, "
+            "started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, provider_receipt_id, "
+            "settled_at, leg_class, session_id, result_json) VALUES (?, 'o/r', 'fix', ?, 1, 1, '', 'o/r:fix', "
+            "'claude', 'ended', ?, ?, ?, 'USD', 2000000, 10000, 'provider_reported', 'normal_return', ?, ?, 'agent', "
+            "'t', ?)",
+            (leg_id, kind, store_ts(offset), store_ts(offset), store_ts(offset + 1), "rt" + leg_id,
+             store_ts(offset + 1), json.dumps({**result, "summary": ""})),
+        )
     db.commit()
     db.close()
 
@@ -617,7 +619,7 @@ def test_triage_is_the_first_stage_and_the_issue_page_shows_its_tier_criteria_an
     detail = backend.issue("demo", 1)
     assert detail["triage"] == {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": 2,
                                 "duplicate_reason": "Same dialog", "rationale": "One handler."}
-    assert [(s["kind"], s["tier"]) for s in detail["steps"]] == [("TRIAGE", "low")]
+    assert [(s["kind"], s["tier"]) for s in detail["steps"]] == [("STEWARD", None), ("TRIAGE", "low")]
     assert [visit["stage"] for visit in detail["history"]] == ["triage"]
 
 
