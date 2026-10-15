@@ -379,7 +379,7 @@ def compose_fix_daemon(
 
     def make_act(dispatch, control) -> GitHubAct:
         return GitHubAct(gateway, control, repository=cfg.repo, base_branch=cfg.base_branch,
-                         merge_method=cfg.merge_method, marker=settings.harness.marker, dispatch=dispatch,
+                         merge_method=cfg.merge_method, marker=settings.harness.marker, bot=cfg.fix_bot, dispatch=dispatch,
                          remove_worktree=worktrees.remove, log=log)
 
     role = compose_role(cfg, "fix", gateway, runner, make_legs=make_legs, make_act=make_act,

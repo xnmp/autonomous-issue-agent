@@ -871,15 +871,16 @@ class GitHubGateway:
         return isinstance(data, dict) and any(isinstance(item, dict) and item.get("name") == label
                                               for item in (data.get("labels") or []))
 
-    def has_comment(self, kind: str, number: int, body: str) -> bool:
-        """Whether this exact comment exists: probed after an ambiguous failed
+    def has_comment(self, kind: str, number: int, body: str, author: str) -> bool:
+        """Whether this exact comment exists under `author`: probed after an ambiguous failed
         write, since a timeout can arrive after GitHub accepted the POST, and
         before a settled comment is posted again. A reply that is not a comment
         list is no answer: absent would post a duplicate."""
         data = self._view(kind, number, "comments")
         if not isinstance(data, dict) or not isinstance(data.get("comments"), list):
             raise FixObservationIncomplete(f"{kind} #{number}: comments were not answered")
-        return any(isinstance(item, dict) and item.get("body") == body for item in data["comments"])
+        return any(isinstance(item, dict) and item.get("body") == body
+                   and login_eq(_login(item.get("author")), author) for item in data["comments"])
 
     def is_issue_closed(self, issue: int) -> bool:
         data = self._view("issue", issue, "state")

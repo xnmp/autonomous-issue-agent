@@ -143,8 +143,8 @@ class FakeGitHub:
     def has_label(self, kind: str, number: int, label: str) -> bool:
         return any(lab.value == label for lab in self._subject(kind, number).labels)
 
-    def has_comment(self, kind: str, number: int, body: str) -> bool:
-        return any(c.body == body for c in self._subject(kind, number).comments)
+    def has_comment(self, kind: str, number: int, body: str, author: str) -> bool:
+        return any(c.body == body and c.author == author for c in self._subject(kind, number).comments)
 
     def is_issue_closed(self, issue: int) -> bool:
         return self.issues[issue].state != "open"
