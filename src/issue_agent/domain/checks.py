@@ -73,14 +73,14 @@ CIObservation = Unavailable | Observed
 
 @dataclass(frozen=True)
 class BaseRun:
-    """A push run on the base branch, completed or being re-run. `completed_at`
+    """A push run on the base branch, completed or running. `completed_at`
     is the run's last update, which a completed run makes when it finishes."""
 
     workflow: str
     run_id: int
     url: str
     head_sha: str
-    conclusion: str  # GitHub's, lowercased; "" while the run is being re-run
+    conclusion: str  # GitHub's, lowercased; "" while it runs (or is re-run)
     created_at: str
     completed_at: str
 
@@ -98,7 +98,6 @@ class BaseIssue:
     number: int
     title: str
     closed_at: str = ""  # "" while open
-    created_at: str = ""
     closed_by: str = ""  # the commit that closed it: a merged PR's merge commit, or a pushed commit
 
 
@@ -107,7 +106,7 @@ class BaseHealth:
     """The base branch's health, one observation per tick (#442) in parts
     read apart. `reports`: its tip's checks (#313); None unread, and a red PR
     check is then the PR's. For the fixer (#402): its push `runs`, completed
-    or being re-run, and the fixer's base-CI `issues` (the newest 100); None
+    or running, and the fixer's base-CI `issues` (the newest 100); None
     unread or not asked for, and nothing is then filed, closed or readied.
     `required`: the workflows with a check the branch requires; `workflows`:
     the repository's active ones (#449). None unread: nothing readied, or

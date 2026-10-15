@@ -353,7 +353,7 @@ _BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid sta
              + _BASE_CONTEXTS.format(after="") + "}}}}")
 
 _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount "
-                "nodes{... on Issue{number title state createdAt closedAt author{login} "
+                "nodes{... on Issue{number title state closedAt author{login} "
                 "timelineItems(itemTypes:[CLOSED_EVENT],last:1){nodes{... on ClosedEvent{createdAt "
                 "closer{... on PullRequest{mergeCommit{oid}} ... on Commit{oid}}}}}}}}}")
 
@@ -918,8 +918,8 @@ class GitHubGateway:
         try:
             workflows = active_workflows(self._gh_json(["api", f"repos/{self.repo}/actions/workflows?per_page=100"]),
                                          listing)
-        except (ValueError, GhUnavailable) as exc:  # an optional read: an unread listing closes nothing
-            sys.stderr.write(f"workflows unread this poll ({exc})\n")
+        except Exception as exc:  # noqa: BLE001 - an optional read: an unread listing closes nothing
+            sys.stderr.write(f"workflows unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
             workflows = None
         return BaseHealth(base, reports, runs, issues, required, workflows)
 

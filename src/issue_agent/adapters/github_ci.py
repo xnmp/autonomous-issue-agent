@@ -122,15 +122,14 @@ def _the_bases(node) -> bool:
 
 
 def base_runs(payload, base: str) -> tuple[BaseRun, ...]:
-    """One page of the base branch's push runs that completed or are being
-    re-run (no conclusion: the re-run's is the run's verdict, #442). A
+    """One page of the base branch's push runs, completed or running (no
+    conclusion: a newer run still running holds a green close, #442). A
     malformed row makes the page unread: dropping it could make an older run
     the latest."""
     rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
         raise ValueError("base run listing is absent or malformed")
-    rows = [r for r in rows if (r.get("head_branch"), r.get("event")) == (base, "push") and (
-        r.get("status") == "completed" or type(r.get("run_attempt")) is int and r["run_attempt"] > 1)]
+    rows = [r for r in rows if (r.get("head_branch"), r.get("event")) == (base, "push")]
     if any(parse_timestamp(str(r.get("created_at"))) is None or parse_timestamp(str(r.get("updated_at"))) is None
            or not isinstance(r.get("conclusion") or "", str) for r in rows):
         raise ValueError("base run conclusion or times are malformed")
@@ -150,8 +149,7 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                    or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
                    for n in nodes)):
         raise ValueError("issue search is absent, malformed or short")
-    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
-                           n["createdAt"] if isinstance(n.get("createdAt"), str) else "", _closer(n))
+    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"], _closer(n))
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 

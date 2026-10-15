@@ -24,9 +24,8 @@ def run_row(name="macOS Smoke", run=1, conclusion="failure", *, branch="dev", ev
             "updated_at": at, **extra}
 
 
-def found(number, title, state="OPEN", author="fix-bot", closed=None, created=None) -> dict:
-    return {"number": number, "title": title, "state": state, "closedAt": closed, "createdAt": created,
-            "author": {"login": author}}
+def found(number, title, state="OPEN", author="fix-bot", closed=None) -> dict:
+    return {"number": number, "title": title, "state": state, "closedAt": closed, "author": {"login": author}}
 
 
 def job(name, workflow, *, event="push", run="FAILURE", status="COMPLETED", conclusion="FAILURE") -> dict:
@@ -90,14 +89,13 @@ def observe(github: GitHub, filed_by="fix-bot"):
 def test_the_read_composes_the_bases_completed_push_runs_and_the_fixers_issues():
     github = GitHub(
         runs={"total_count": 9_999, "workflow_runs": [run_row("macOS Smoke", 3), run_row("Lint", 7, "success")]},
-        issues=search(found(40, "CI: Docs failing on dev", created="2026-10-12T00:00:00Z"), found(41, "CI: Lint failing on dev", "CLOSED",
+        issues=search(found(40, "CI: Docs failing on dev"), found(41, "CI: Lint failing on dev", "CLOSED",
                                                                     closed="2026-10-13T00:00:00Z"),
                       found(42, "CI: macOS Smoke failing on dev", author="someone-else")),
     )
     base = observe(github).base
     assert base is not None and base.runs is not None and [r.run_id for r in base.runs] == [3, 7]
     assert [(i.number, i.closed_at) for i in base.issues] == [(40, ""), (41, "2026-10-13T00:00:00Z")]
-    assert [i.created_at for i in base.issues] == ["2026-10-12T00:00:00Z", ""]  # unread: judged at the close
     listing = github.rest("/actions/runs?")[0][2]
     assert "branch=dev" in listing and "event=push" in listing
     query = next(a for c in github.calls for a in c if a.startswith("q="))
@@ -110,12 +108,12 @@ def test_without_a_filer_base_ci_is_not_read_at_all():
     assert not github.rest("/actions/runs?") and not github.rest("search(")
 
 
-def test_rows_of_another_branch_event_or_status_are_not_the_bases():
+def test_rows_of_another_branch_or_event_are_not_the_bases_and_a_running_one_has_no_verdict():
     github = GitHub(runs={"total_count": 3, "workflow_runs": [
         run_row(run=9, branch="fix/5-x"), run_row(run=8, event="schedule"), run_row(run=7, conclusion=None,
                                                                                  status="in_progress"),
         run_row(run=1, conclusion="success")]})
-    assert [r.run_id for r in observe(github).base.runs] == [1]
+    assert [(r.run_id, r.conclusion) for r in observe(github).base.runs] == [(7, ""), (1, "success")]
 
 
 def test_a_completed_run_with_no_conclusion_is_no_verdict_not_a_malformed_page():
@@ -219,12 +217,12 @@ def test_a_commit_status_or_another_apps_check_is_still_the_bases_evidence():
     assert [(c.name, c.kind) for c in base_reports([other, status])] == [("vercel", "check"), ("ci/x", "status")]
 
 
-def test_a_run_being_re_run_is_listed_without_a_verdict_and_a_first_attempt_running_is_not():
-    rows = [run_row(run=3, conclusion=None, status="in_progress", run_attempt=2),
+def test_a_run_queued_running_or_being_re_run_is_listed_without_a_verdict():
+    rows = [run_row(run=3, conclusion="failure", status="in_progress", run_attempt=2),  # the earlier attempt's
             run_row(run=2, conclusion=None, status="queued", run_attempt=1),
             run_row(run=1, conclusion="failure", run_attempt=3)]
-    assert [(r.run_id, r.conclusion) for r in base_runs({"workflow_runs": rows}, "dev")] == [(3, ""), (1, "failure")]
-    assert base_runs({"workflow_runs": [run_row(conclusion=None, status="queued", run_attempt="2")]}, "dev") == ()
+    assert [(r.run_id, r.conclusion) for r in base_runs({"workflow_runs": rows}, "dev")] == [
+        (3, ""), (2, ""), (1, "failure")]
 
 
 # ── #449: the repository's workflows ─────────────────────────────────────────
@@ -273,3 +271,11 @@ def test_the_commit_that_closed_an_issue_is_read_with_it_and_unreadable_is_none(
              {**closed(None), "timelineItems": None}, found(2, "t")]
     assert [i.closed_by for i in base_issues(search(*nodes), "fix-bot")] == ["d20c058", "abc", "", "", "", "", "", "",
                                                                              ""]
+
+
+@pytest.mark.parametrize("path", [["x"], {"p": 1}])
+def test_a_workflow_listing_with_an_unhashable_path_is_unread_and_the_tick_goes_on(path):
+    github = GitHub(workflows={"total_count": 1, "workflows": [{"name": "CI", "path": path, "state": "active"}]},
+                    runs={"total_count": 1, "workflow_runs": [run_row()]})
+    base = observe(github).base
+    assert base.workflows is None and base.runs is not None

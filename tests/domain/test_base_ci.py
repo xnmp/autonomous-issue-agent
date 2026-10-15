@@ -84,24 +84,28 @@ def _run(run: int, conclusion: str, created: str, completed: str) -> BaseRun:
                    f"2026-10-14T{created}Z", f"2026-10-14T{completed}Z")
 
 
-def test_a_green_close_never_holds_back_a_red_run_that_overlapped_it():
-    # Green G (10:00) finishes 10:20 and closes the old streak's issue at 10:21; red R, created 10:05
-    # while G ran, finishes 10:40: the base is red and must have an issue.
-    green, red = _run(1, "success", "10:00:00", "10:20:00"), _run(2, "failure", "10:05:00", "10:40:00")
-    for old in (f"{PREFIX} since sha0", PREFIX):
-        (filed,) = _act(green, red, issues=[BaseIssue(40, old, "2026-10-14T10:21:00Z")])
+def test_green_closes_only_once_no_newer_run_of_the_workflow_is_still_running():
+    # Green G (10:00) finishes 10:20 while red R, created 10:05, still runs: G may not be the base's verdict.
+    green, issue = _run(1, "success", "10:00:00", "10:20:00"), [BaseIssue(40, f"{PREFIX} since sha0")]
+    assert _act(green, _run(2, "", "10:05:00", "10:21:00"), issues=issue) == ()
+    assert _act(green, _run(2, "failure", "10:05:00", "10:40:00"), issues=issue) == ()  # R failed: it stays open
+    (closed,) = _act(green, _run(2, "success", "10:05:00", "10:40:00"), issues=issue)
+    assert _closes([closed]) == [40]
+    # G (09:30) completed 09:59 while R3, created 09:40, runs on at 10:01: no close.
+    assert _act(_run(1, "success", "09:30:00", "09:59:00"), _run(3, "", "09:40:00", "10:01:00"), issues=issue) == ()
+    # An older run still running (or re-run) does not hold it.
+    (closed,) = _act(_run(3, "", "09:00:00", "10:01:00"), green, issues=issue)
+    assert _closes([closed]) == [40]
+
+
+def test_after_any_close_only_a_failure_created_at_or_after_the_last_close_files():
+    # Closed on green at 10:00, reopened, closed by a human at 11:00 (a legacy title or a streak's): the last close rules.
+    for title in (PREFIX, f"{PREFIX} since sha0"):
+        issues = [BaseIssue(40, title, "2026-10-14T11:00:00Z")]
+        assert _act(_run(1, "failure", "10:30:00", "11:20:00"), issues=issues) == ()
+        (filed,) = _act(_run(1, "failure", "10:30:00", "11:20:00"), _run(2, "failure", "11:00:00", "11:30:00"),
+                        issues=issues)
         assert filed.title == f"{PREFIX} since sha2"
-
-
-def test_a_green_close_landing_after_an_overlapping_red_run_completed_still_files_it():
-    # The tick read G green and closed at 10:23; red R, created 10:05 while G ran, completed 10:22 in between.
-    green, red = _run(1, "success", "10:00:00", "10:20:00"), _run(2, "failure", "10:05:00", "10:22:00")
-    old = _run(9, "failure", "08:00:00", "08:30:00")
-    issue = [BaseIssue(40, f"{PREFIX} since sha9", "2026-10-14T10:23:00Z", "2026-10-14T08:31:00Z")]
-    (filed,) = _act(old, green, red, issues=issue)
-    assert filed.title == f"{PREFIX} since sha2"
-    # No green while it was open: the close ended it, and the run created before it never files.
-    assert _act(old, _run(3, "failure", "09:00:00", "10:00:00"), red, issues=issue) == ()
 
 
 def test_after_a_close_mid_streak_only_a_failure_created_at_or_after_it_files():
@@ -130,8 +134,8 @@ MERGE_RUN = "11:55:47"  # the merge commit's own run
 
 
 def test_a_merge_closing_the_streaks_issue_files_nothing_until_the_merges_own_run_fails():
-    for title, opened in ((PREFIX, ""), (PREFIX, "2026-10-14T20:00:00Z"), (f"{PREFIX} since sha1", "")):
-        issues = [BaseIssue(40, title, MERGE_CLOSED, opened)]  # the incident's legacy title, and a streak title
+    for title in (PREFIX, f"{PREFIX} since sha1"):  # the incident's legacy title, and a streak title
+        issues = [BaseIssue(40, title, MERGE_CLOSED)]
         assert _act(*OLD_RED, issues=issues) == ()
         assert _act(*OLD_RED, IN_FLIGHT, issues=issues) == ()
         (filed,) = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", MERGE_RUN, "12:30:00"), issues=issues)
@@ -143,12 +147,12 @@ def test_the_closing_commits_own_run_files_even_if_github_dated_it_before_the_cl
     # The merge commit's run created 11:55:45, a second before GitHub recorded `Closes #` at 11:55:46.
     merge_run = "11:55:45"
     for closer, files in (("sha4", True), ("", False), ("shaX", False)):  # absent or another commit: the close rules
-        issues = [BaseIssue(40, PREFIX, MERGE_CLOSED, "", closer)]
+        issues = [BaseIssue(40, PREFIX, MERGE_CLOSED, closer)]
         actions = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", merge_run, "12:30:00"), issues=issues)
         assert [a.title for a in _filed(actions)] == ([f"{PREFIX} since sha4"] if files else [])
         assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", merge_run, "12:30:00"), issues=issues) == ()
     # A run of the pre-merge code never files, closer or not.
-    assert _act(*OLD_RED, IN_FLIGHT, issues=[BaseIssue(40, PREFIX, MERGE_CLOSED, "", "sha4")]) == ()
+    assert _act(*OLD_RED, IN_FLIGHT, issues=[BaseIssue(40, PREFIX, MERGE_CLOSED, "sha4")]) == ()
 
 
 MERGED_AT = "2026-10-14T10:00:00Z"
@@ -229,16 +233,16 @@ def test_a_hostile_or_huge_workflow_name_is_bounded_in_the_title_and_inert_in_th
 # ── a run being re-run (#442) ────────────────────────────────────────────────
 
 
-def test_a_run_being_re_run_withholds_its_workflows_verdict_until_the_re_run_ends():
-    # Red run 2 has its issue; a human re-runs it. The older green must neither close the issue nor
-    # hold back the filing: while it was closed, the re-run's failure (the same run) would file nothing.
+def test_a_run_being_re_run_holds_the_green_close_of_an_older_run_until_it_ends():
+    # Red run 2 has its issue; a human re-runs it. The older green must not close the issue: once
+    # closed, the re-run's failure (a run created before the close) would file nothing.
     rerun = _br(2, "", hour=1)
     issue = [BaseIssue(40, f"{PREFIX} since sha2")]
     assert _act(_br(1, "success"), rerun, issues=issue) == ()
     assert _act(_br(1, "success"), _br(2, "failure", hour=1), issues=issue) == ()  # it failed again
     (closed,) = _act(_br(1, "success"), _br(2, "success", hour=1), issues=issue)  # it was a flake
     assert _closes([closed]) == [40]
-    assert _act(_br(1, "failure"), rerun) == ()  # nothing filed against a verdict being replaced
+    assert [a.title for a in _filed(_act(_br(1, "failure"), rerun))] == [f"{PREFIX} since sha1"]  # red regardless
 
 
 def test_an_older_run_being_re_run_leaves_the_latest_verdict_and_its_streak_alone():

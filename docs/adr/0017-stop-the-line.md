@@ -98,27 +98,25 @@ identify a failure the same way:
   before its run was cancelled is the PR's, and a repair may be paid for it.
   Commit statuses and other apps' checks are charged as before and have no
   issue.
-- A run being **re-run** has no conclusion and dropped out of the completed
-  listing, so the older run read as the latest: a green one closed the
-  streak's issue, and the re-run's failure filed nothing. The listing keeps
-  a run being re-run, and its workflow has no verdict until the re-run ends
-  or a newer run of the workflow completes.
-- **Refiling is anchored on creation, not completion.** Superseding the
-  completion-time rule above: after the workflow's last issue closed (any
-  title, a legacy one too), the next issue is filed by the first failing run
-  created at or after what ended it. A close by green is anchored on that
-  green run's creation, so a red run overlapping it still files: a close is
-  by green when, at some run's completion while the issue was open, the
-  workflow's latest verdict was green (the harness's close can land after a
-  later red run completed). Any other close (a human, `Closes #` on a merge
-  into the default branch) is anchored on the close, so a run that tested
-  pre-fix code never files. Incident: tauri #1150, a legacy issue closed by
+- **Rule 1: green closes only when settled.** The harness closes a streak
+  issue on green only when that green run is the workflow's newest-created
+  run on the base: no run created after it is queued, running or being
+  re-run (the listing keeps those, without a verdict). Otherwise it waits
+  for the newer run. Before, a re-run dropped out of the completed listing
+  and an older green closed the issue; and a green finishing before an
+  overlapping, newer red run closed it too.
+- **Rule 2: every close anchors the same way.** After any close of a streak
+  issue (the harness's green close, `Closes #`, a human, the merged-fix
+  close; a legacy title too), a red run files the next issue only if it was
+  created at or after the last close, or its head is the commit that closed
+  the issue (a merged PR's merge commit, or a pushed commit, read inside the
+  issue search: GitHub may date the close after that commit's run was
+  created). Rule 1 means no newer run existed at a green close, so the close
+  time is the right anchor for every kind; this supersedes the
+  completion-time rule above. Incident: tauri #1150, a legacy issue closed by
   #1178's merge at 11:55:46Z; the next tick refiled the streak as #1179 from
-  a run of `e6daf55`. A run of the commit that closed the issue (a merged
-  PR's merge commit, or a pushed commit, read with the issue search) also
-  files, however GitHub dates the close against that run's creation. A
-  human's close of a red streak waits for a run created after it, not a
-  re-run of an older one.
+  a run of `e6daf55`. A human's close of a red streak waits for a run created
+  after it, not a re-run of an older one.
 - An open base-CI issue whose workflow is neither in the listed runs nor
   among the repository's active workflows is **closed** (renamed, removed or
   disabled), unless it carries `needs-human`. The 100 listed runs span hours,

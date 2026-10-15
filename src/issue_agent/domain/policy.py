@@ -19,7 +19,7 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
-from .checks import BaseHealth, BaseIssue, BaseRun
+from .checks import BaseHealth, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
@@ -135,10 +135,10 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     """One issue per workflow per red streak on the base branch, required or
     not (#402, ADR 0017). Green closes the workflow's open issues. A red
     verdict with none open files one, named and keyed by the streak's first
-    failing run created at or after whatever ended the workflow's last closed
-    issue (legacy titles too, `_ended`): a green run, or else the close (a
-    human, a fix's merge), so a run that tested pre-fix code never files. An
-    open issue whose harness PR merged (`merged`: issue -> merged at;
+    failing run created at or after the close of the workflow's last closed
+    issue (any close, legacy titles too), or of the commit that closed it: a
+    run that tested pre-fix code never files. Green closes only when settled:
+    no newer run of the workflow is still running (#442). An open issue whose harness PR merged (`merged`: issue -> merged at;
     a fix into a non-default base that `Closes #` does not close) has ended
     once a failing run created at or after the merge has completed: that run
     files the next issue, and the ended issue is closed only once another
@@ -159,8 +159,11 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
         issues, name = workflow_issues(health, latest.workflow), _inert(" ".join(latest.workflow.split())[:200])
         opened = [i for i in issues if not i.closed_at]
         if latest.conclusion in GREEN_CONCLUSIONS:
+            settled = not any(r.workflow == latest.workflow and not r.conclusion and _created(r) > _created(latest)
+                              for r in health.runs)  # a newer run still running may yet fail
             out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
-                                                      f"{latest.url} (head `{latest.head_sha}`).") for i in opened)
+                                                      f"{latest.url} (head `{latest.head_sha}`).")
+                       for i in opened if settled)
             continue
         streak = sorted((r for r in health.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
                          and _created(r) >= _created(since)), key=_created)
@@ -175,8 +178,8 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
                        for n, r in sorted(ended.items()))
             continue
         # The commit whose merge or push closed the last issue tested the fix, whenever GitHub dates the close.
-        after, closer = max(((_ended(i, at, latest.workflow, health.runs), i.closed_by) for i in issues
-                             if (at := parse_timestamp(i.closed_at))), default=(None, ""))
+        after, closer = max(((at, i.closed_by) for i in issues if (at := parse_timestamp(i.closed_at))),
+                            default=(None, ""))
         first = min(ended.values(), key=_created) if ended else next((
             r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
             and (after is None or _created(r)[0] >= after or closer and r.head_sha == closer)), None)
@@ -200,23 +203,6 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
                for n in sorted(base_fix(health) - admitted))
     return tuple(out)
-
-
-def _ended(issue: BaseIssue, closed_at: datetime, workflow: str, runs: Iterable[BaseRun]) -> datetime:
-    """How new the code was that ended `issue`, closed at `closed_at`: the
-    newest green run that was the workflow's latest verdict when a run
-    completed while the issue was open (its creation unread: at the close),
-    since the harness closes on green and its write can land after a later
-    red run completes (a red run overlapping that green still files);
-    otherwise the close itself (a human, `Closes #` on a merge), so a run
-    created before a merged fix never files (tauri #1150 -> #1179)."""
-    done = [(at, r) for r in runs if r.workflow == workflow and r.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS
-            and (at := parse_timestamp(r.completed_at)) is not None and at <= closed_at]
-    opened = parse_timestamp(issue.created_at)
-    moments = {at for at, _ in done if at >= opened} if opened else {closed_at}
-    latest = (max((r for at, r in done if at <= t), key=_created, default=None) for t in moments)
-    return max((_created(r)[0] for r in latest if r is not None and r.conclusion in GREEN_CONCLUSIONS),
-               default=closed_at)
 
 
 def _created(run: BaseRun) -> tuple[datetime, int]:
