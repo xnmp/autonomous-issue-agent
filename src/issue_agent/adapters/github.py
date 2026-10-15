@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..domain.checks import BaseHealth, Unavailable
+from ..domain.architecture import ArchitectureObservation, LEDGER_PATH, LedgerAbsent, LedgerPresent
 from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
@@ -317,7 +318,7 @@ _LABELED = ("labeled:timelineItems(itemTypes:[LABELED_EVENT],last:100){pageInfo{
 # per-issue round-trip). One page: GitHub caps a relationship well below 100.
 _BLOCKED_BY = "blockedBy(first:100){totalCount nodes{number state repository{nameWithOwner}}}"
 _FIX_ISSUE = (
-    "id number title state author{login} " + _LABELS + " " + _LABELED + " "
+    "id number title body state author{login} " + _LABELS + " " + _LABELED + " "
     + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="") + " " + _BLOCKED_BY
 )
 _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
@@ -357,6 +358,13 @@ _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCo
                 "timelineItems(itemTypes:[ISSUE_COMMENT,CLOSED_EVENT,REOPENED_EVENT],last:2){nodes{__typename "
                 "... on IssueComment{author{login} body} "
                 "... on ClosedEvent{closer{... on PullRequest{mergeCommit{oid}} ... on Commit{oid}}}}}}}}}")
+
+_LEDGER = ('ledgerTip:ref(qualifiedName:$base){name target{... on Commit{oid '
+           'history(first:1,path:"' + LEDGER_PATH + '"){nodes{oid committedDate}}}}}'
+           ' ledgerFile:object(expression:$ledger){__typename}')
+_PASS_ISSUES = ('query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount nodes{... on Issue{'
+                'number title body state author{login} ' + _LABELS + ' ' + _LABELED + '}}}}')
+_MERGED_COUNT = 'query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}'
 
 
 def _escaped(fields: str) -> str:
@@ -534,7 +542,7 @@ def parse_fix_issue(node: object, comments: list, blocked_by: tuple[BlockerRef, 
         raise FixObservationIncomplete("issue state is malformed")
     labels = _complete_labels(node)
     return IssueView(
-        number=node["number"], title=node.get("title") or "", labels=labels,
+        number=node["number"], title=node.get("title") or "", body=node.get("body") or "", labels=labels,
         comments=_comments(comments), author=_login(node.get("author")), state=state.lower(),
         needs_human_labeled_at=_needs_human_labeled_at(node, labels), blocked_by=blocked_by,
         ai_ready_labeled_at=_ai_ready_labeled_at(node, labels),
@@ -868,7 +876,48 @@ class GitHubGateway:
         for number, why in sorted(unknown.items()):
             self._skip_item("issue", number, FixObservationIncomplete(why))
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches, base=self._base_health(base, filed_by), pickup=pickup)
+                          branches=branches, base=self._base_health(base, filed_by), pickup=pickup,
+                          architecture=self._architecture(base, filed_by) if filed_by else None)
+
+    def _architecture(self, base: str, filer: str) -> ArchitectureObservation | None:
+        """Optional, bounded GitHub facts; an unread file is never an absent one (ADR 0017)."""
+        try:
+            search = self._graphql(_PASS_ISSUES, q=(
+                f'repo:{self.repo} is:issue is:open author:{filer} in:title "Architecture pass:"')).get("search")
+            if (not isinstance(search, dict) or not isinstance(search.get("nodes"), list)
+                    or type(search.get("issueCount")) is not int or search["issueCount"] != len(search["nodes"])
+                    or len(search["nodes"]) > 100):
+                return None
+            if any(not isinstance(n, dict) or not isinstance(n.get("title"), str) or len(n["title"]) > 256
+                   or not isinstance(n.get("body"), str) or len(n["body"]) > 65536 for n in search["nodes"]):
+                return None
+            issues = tuple(parse_fix_issue(n, []) for n in search["nodes"])
+            page = self._repository_page(_LEDGER, base=base, ledger=f"{base}:{LEDGER_PATH}")
+            tip = page["ledgerTip"]
+            if tip["name"] != base:
+                return None
+            head, file = tip["target"]["oid"], page["ledgerFile"]
+            if file is None:
+                return ArchitectureObservation(LedgerAbsent(head), issues)
+            if not isinstance(file, dict) or file.get("__typename") != "Blob":
+                return None
+            (last,) = tip["target"]["history"]["nodes"]
+            stamp = last["committedDate"]
+            if not isinstance(stamp, str) or len(stamp) > 64:
+                return None
+            history = LedgerPresent(head, last["oid"], datetime.fromisoformat(stamp.replace("Z", "+00:00")), None)
+            if head != history.ledger_head:
+                try:
+                    count = self._graphql(_MERGED_COUNT, q=(
+                        f'repo:{self.repo} is:pr is:merged base:{json.dumps(base)} merged:>{history.updated_at.isoformat()}'
+                    )).get("search", {}).get("issueCount")
+                    history = replace(history, merged_prs=count)
+                except (ValueError, TypeError, AttributeError, GhUnavailable):
+                    pass  # The age rule still has all its facts when the count is unavailable.
+            return ArchitectureObservation(history, issues)
+        except (ValueError, TypeError, KeyError, AttributeError, GhUnavailable) as exc:
+            sys.stderr.write(f"architecture unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
+            return None
 
     def _top_level(self, name: str, base: str, template: str) -> list:
         """One top-level connection, its own request per page (#425), read in

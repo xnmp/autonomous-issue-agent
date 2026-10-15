@@ -28,7 +28,7 @@ from ..domain.evidence import ChangeRequest, CiFailures
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.gaps import GapTarget
-from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order, gap_actions
+from ..domain.policy import actions as policy_actions, architecture_actions, base_ci_actions, dispatch_order, gap_actions
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, ModelRoute, Tier
 from ..domain.state import (DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key,
@@ -329,7 +329,7 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
         gaps = gap_actions(local.legs, states, GapTarget(settings.repository, settings.target_public),
                            settings.harness_repo, settings.harness.marker, local.reported)
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
-                           light=slots.light, waiting_since=waiting, first=first) + base + gaps
+                           light=slots.light, waiting_since=waiting, first=first) + base + architecture_actions(world, settings.harness) + gaps
     return choose
 
 

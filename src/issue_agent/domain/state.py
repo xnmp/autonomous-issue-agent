@@ -109,6 +109,7 @@ from .evidence import ChangeRequest, CiFailures, began, new_failures
 from .identity import login_eq
 from .labels import Label
 from .refs import harness_branch_issue
+from .architecture import architecture_pass
 from .routing import DEFAULT_TIER, Tier, escalate
 from .triage import Steward, Triage
 from .world import (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, BlockerRef, Branch, Comment, IssueView, Pickup, PRView,
@@ -439,12 +440,12 @@ DerivedState = (Dispatch | Merge | Refresh | Rerun | OpenPR | TriageNote | LinkB
 
 
 class Origin(Enum):
-    """Who put the item on the harness: a human's `ai-ready`, or the harness
-    for a red required base workflow (#402): no STEWARD or TRIAGE, no blocker,
-    and its PR is charged the base's failures."""
+    """Harness-written issues skip STEWARD and TRIAGE (ADR 0017). Only a
+    required base fix bypasses blockers and is charged the base's failures."""
 
     HUMAN = "human"
     BASE_FIX = "base-fix"
+    ARCHITECTURE = "architecture"
 
 
 @dataclass(frozen=True)
@@ -475,18 +476,19 @@ def harness_gap(issue: IssueView, harness: Harness) -> bool:
     leg (which holds FIX_BOT_TOKEN) opening an issue under another title,
     which open pickup takes up: ADR 0007's amendment accepts that, bounded by
     the spend caps."""
-    return login_eq(issue.author, harness.fix_bot) and issue.title.startswith(HARNESS_GAP_PREFIX)
+    return (isinstance(issue.author, str) and login_eq(issue.author, harness.fix_bot)
+            and isinstance(issue.title, str) and issue.title.startswith(HARNESS_GAP_PREFIX))
 
 
 def picked_up(issue: IssueView, harness: Harness, pickup: Pickup) -> bool:
     """Whether an issue is the harness's to work: open and marked `ai-ready`,
-    or, when every open issue is picked up, open and not a `harness_gap`.
+    or, with open pickup, neither a `harness_gap` nor `tech-debt` (ADR 0017).
     A `needs-human` issue stays an item: step 3 parks it, a reply releases it."""
     if issue.state != "open" or issue.number <= 0:
         return False
     if issue.has(Label.AI_READY):
         return True
-    return pickup is Pickup.OPEN and not harness_gap(issue, harness)
+    return pickup is Pickup.OPEN and Label.TECH_DEBT not in issue.labels and not harness_gap(issue, harness)
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
@@ -507,16 +509,18 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
         if (n := harness_branch_issue(b.name)) is not None:
             pushed.setdefault(n, []).append(b)
     fixing, held = base_fix(world.base), base_held(world.base)
+    architecture = {i.number for i in world.issues if architecture_pass(i, harness.fix_bot, harness.marker)}
     items = [
         _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
               labeled_at=i.needs_human_labeled_at, blocked_by=() if i.number in fixing else i.blocked_by,
-              origin=Origin.BASE_FIX if i.number in fixing else Origin.HUMAN)
+              origin=(Origin.BASE_FIX if i.number in fixing else Origin.ARCHITECTURE
+                      if i.number in architecture else Origin.HUMAN))
         for i in world.issues
         if picked_up(i, harness, world.pickup) and i.number not in shadowed | held
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
                # A base-fix PR must fix the base's failures: none of them is the base's to it.
                base=world.base.reports if world.base and world.base.ref == p.base_ref_name and n not in fixing
-               else None)
+               else None, origin=Origin.ARCHITECTURE if n in architecture else Origin.HUMAN)
          for p, n in prs if p.number > 0]
     observed = parse_timestamp(world.now)
     return {item.key: _decide(item, local, harness, observed) for item in items}
@@ -587,8 +591,8 @@ def _proceed(
     if pr is None:
         # STEWARD first: a duplicate stops before any grading is bought.
         steward = latest_steward(issue_legs)
-        if item.origin is Origin.BASE_FIX:
-            step = Dispatch(AgentKind.RESOLVE)  # filed from CI evidence: nothing to steward or grade
+        if item.origin is not Origin.HUMAN:
+            step = Dispatch(AgentKind.RESOLVE)  # harness-written scope needs no steward or grade
         elif steward is None:
             step = Dispatch(AgentKind.STEWARD)
         elif (stop := _duplicate_stop(steward, stops, anchor)) is not None:
@@ -631,6 +635,8 @@ def _proceed(
     if not local.headroom:
         return Wait(WaitReason.HEADROOM)
     triaged = triage.triage.tier if triage is not None and triage.triage is not None else None
+    if item.origin is Origin.ARCHITECTURE:
+        triaged = Tier.HIGH
     if step.act in ROUTED_ACTS:
         return Dispatch(step.act, step.head, escalate(triaged or DEFAULT_TIER, attempts), step.evidence)
     if step.act is AgentKind.REVIEW and pr is not None:

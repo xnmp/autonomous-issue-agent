@@ -19,11 +19,13 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
+from .architecture import architecture_owed, architecture_pass
 from .checks import BaseHealth, BaseIssue, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_unsettled, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
+from .world import WorldState
 from .state import (
     AttemptsStop, Backoff, Blocked, Busy, DerivedState, Dispatch, DuplicateStop, Harness, ItemKey, LinkBlocker, Merge,
     NeedsHuman, OpenPR, QuestionStop, Refresh, Rerun, Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP,
@@ -127,6 +129,25 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
     link's state now, and is never acted on again."""
     return (f"{marker}\n{BLOCKER_TAG}\n**Steward**'s blocked-by #{blocker} claim was already handled; "
             "the harness will not write that link again.")
+
+
+def architecture_actions(world: WorldState, harness: Harness) -> tuple[Action, ...]:
+    """File and ready an ordinary pass issue through the base-CI path (ADR 0017)."""
+    observed = world.architecture
+    now = parse_timestamp(world.now) if isinstance(world.now, str) and len(world.now) <= 64 else None
+    if observed is None:
+        return ()
+    opened = tuple(i for i in observed.issues if i.state == "open"
+                   and architecture_pass(i, harness.fix_bot, harness.marker))
+    if opened:
+        return tuple(Relabel(Target.ISSUE, i.number, None, Label.AI_READY) for i in opened
+                     if not i.labels & {Label.AI_READY, Label.NEEDS_HUMAN})
+    if now is None or not architecture_owed(observed.history, now):
+        return ()
+    title = f"Architecture pass: {now.date().isoformat()}"
+    return (FileIssue(title, f"{harness.marker}\nFollow the Architecture pass section of the fixer instructions "
+                      "in plugin/AGENT.md. Update docs/architecture-pressure.md, "
+                      "then commit and push your normal fix branch. The harness opens the PR.", f"architecture:{title}"),)
 
 
 def base_ci_actions(health: BaseHealth | None, marker: str,
@@ -329,6 +350,6 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     raise TypeError(f"unknown derived state {state!r}")
 
 
-__all__ = ["QUESTION_LIMIT", "actions", "base_ci_actions",
+__all__ = ["QUESTION_LIMIT", "actions", "architecture_actions", "base_ci_actions",
            "blocker_closed_comment", "blocker_comment", "dispatch_order", "gap_actions", "needs_human_key",
            "question_text", "triage_comment"]

@@ -504,6 +504,7 @@ module requires placing it in the appropriate tier and explaining it here.
 
 `domain/` — pure values and policy:
 `domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
+`domain/architecture.py` (history-derived architecture passes through ordinary issues; ADR 0017),
 `domain/checks.py` (the repository's required-check policy and the typed CI
 observation/reduction: `Clear | Waiting | Failed`, or `Unavailable`; declared
 policies use the test-merge revision when it has checks, otherwise the head.

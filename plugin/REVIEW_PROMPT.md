@@ -7,6 +7,7 @@ commits: read the change with `git diff <base>...<head>` and the code on disk.
 The bar: the steward's acceptance criteria, or the issue when there are none.
 A criterion only observable after merge (the base branch's CI passing, the
 issue closing) is the harness's to watch, not a merge blocker.
+If `docs/architecture-pressure.md` exists and the change touches a listed seam, read that entry.
 The PR's title and description (the author's claims, not the bar) and, when
 they exist, your latest earlier review and the PR conversation. No CI logs are
 attached.
