@@ -13,13 +13,11 @@ other act's attempt run).
 drive. Cheap actions execute before it returns; paid dispatches continue in a
 bounded pool. `run_forever()` wraps it with the wait and heartbeat (a periodic
 alive line plus the suspend-stall warning when wall-clock elapsed far exceeds
-the interval). The wait ends early when an injected `wait_for_change` reports
-one (a leg of the repository ending in either role, read from the control
-store); the poll interval stays the ceiling that picks up GitHub-side events.
-A tick that changed GitHub waits only the re-tick gap, to act on its result.
-The clock, sleep and wait are injected so the loop is testable without real
-time; with a `wait_for_change` it owns the whole interval and `sleep` serves
-only the back-off after GitHub refused a tick.
+the interval). The wait ends early on a wake trigger (a GitHub change the tick
+made, a leg of this role leaving the pool, an item the other role freed in the
+control store); the poll interval stays the ceiling that picks up GitHub-side
+events. The clock and sleep are injected so the loop is testable without real
+time.
 """
 
 from __future__ import annotations
@@ -43,7 +41,7 @@ from zoneinfo import ZoneInfo
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
 from ..adapters.atomic_file import atomic_write
 from ..adapters.control_path import control_store_path
-from ..adapters.control_store import WAKE_MIN_GAP_SECONDS, ControlStoreError, LegRun, SQLiteControlStore
+from ..adapters.control_store import ControlStoreError, LegRun, SQLiteControlStore
 from ..adapters.github import GhUnavailable
 from ..adapters.journal import Journal, JournalingRuntime
 from ..adapters.leg_sandbox import LegSandbox
@@ -249,12 +247,21 @@ class ActionExecutor(Protocol):
 
 
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
-# Requeue after mutation (controller-runtime): a tick that changed GitHub (a
-# comment, label, merge, PR) observes its own result after the store wake's
-# gap, not a full poll: the next act in the lifecycle (RESOLVE after the
-# triage comment) is waiting on it (#1096: 83 s from comment to dispatch).
-_RETICK_SECONDS = int(WAKE_MIN_GAP_SECONDS)
+# The inter-tick wait checks its wake triggers once a second, and ends no
+# sooner than the gap after it began: one GitHub observation per 5 s however
+# busy the triggers are (the GraphQL budget is shared with the sibling role and
+# the dashboard). The poll interval is the ceiling. A trigger is an event whose
+# effects have already landed, so none waits for anything to settle.
+WAKE_CHECK_SECONDS = 1
+WAKE_MIN_GAP_SECONDS = 5
+# Requeue after mutation (controller-runtime): the next act in the lifecycle
+# waits on the tick's own GitHub change (#1096: 83 s from the triage comment
+# to the RESOLVE dispatch).
 RETICK = "re-tick after a GitHub change"
+# A leg of this role left the pool: its slot and item are free to the next tick.
+LEG_ENDED = "a leg of this role ended"
+# The other role handed back a claim, after its leg's GitHub effects landed.
+ITEM_FREED = "the other role freed an item"
 DEFAULT_RESERVATION_SWEEP_POLLS = 30
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
 _SHUTDOWN_PREPARE_RESERVE_SECONDS = 2.0
@@ -298,10 +305,9 @@ class Daemon:
     reconcile: Callable[[RecoveryTrigger], object] | None = None
     # Elapsed (monotonic) time in poll intervals: early wakes add ticks, not sweeps.
     reservation_sweep_polls: int = DEFAULT_RESERVATION_SWEEP_POLLS
-    # Waits up to its argument in seconds, feeding the scheduler watchdog
-    # itself; returns the wake reason, or None on timeout. One call spans the
-    # interval, so its baseline is the tick's. None means the timed sleep.
-    wait_for_change: Callable[[float], str | None] | None = None
+    # Opened for one inter-tick wait (`StoreWake.watch`): its probe reports
+    # whether the other role freed an item since the tick began.
+    watch_store: Callable[[], AbstractContextManager[Callable[[], bool]]] | None = None
     prepare_shutdown: Callable[[], object] | None = None
     terminalize: Callable[[], object] | None = None
     _state: DaemonState = field(default=DaemonState.STARTING, init=False, repr=False)
@@ -311,6 +317,8 @@ class Daemon:
                                                 init=False, repr=False)
     _shutdown_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _dispatches: dict[Future[None], tuple[RunAgent, Hashable]] = field(default_factory=dict, init=False, repr=False)
+    # Dispatches that have left `_dispatches`; the wait compares it with the tick's.
+    _dispatches_ended: int = field(default=0, init=False, repr=False)
     # A hot reload waits for paid work to drain (`_admitting`).
     _reload_pending: bool = field(default=False, init=False, repr=False)
     _dispatch_closed: bool = field(default=False, init=False, repr=False)
@@ -406,6 +414,8 @@ class Daemon:
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
             entry = self._dispatches.pop(future, None)
+            if entry is not None:
+                self._dispatches_ended += 1
             self._dispatch_lock.notify_all()
         if entry is None:
             return
@@ -619,7 +629,7 @@ class Daemon:
         self._transition(DaemonState.RUNNING)
         last, last_active = now(), active_now()
         last_logged, last_swept, ticks = last, last_active, 0
-        retick = False
+        own_wakes = True
         try:
             while max_ticks is None or ticks < max_ticks:
                 cur, cur_active = now(), active_now()
@@ -639,12 +649,8 @@ class Daemon:
                 elif cur - last_logged >= heartbeat_seconds:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
                     last_logged = cur
-                # A tick after a re-tick gap never re-ticks, however that gap
-                # ended (a store wake too): a mutation every tick repeats (an
-                # idempotent re-post, a merge GitHub has not taken yet) costs
-                # at most one extra observe per interval, never a loop.
+                ended = self._dispatches_ended
                 taken = self.tick(scheduler_progress)
-                retick = not retick and any(not isinstance(action, RunAgent) for action in taken)
                 self._write_heartbeat()
                 if scheduler_progress is not None:
                     scheduler_progress()
@@ -669,7 +675,16 @@ class Daemon:
 
                     self.log(f"{self.name}: hot-reload — harness source changed; restarting with no session in flight")
                     raise SystemExit(RELOAD_EXIT_CODE)
-                reason = self._sleep_interval(sleep, scheduler_progress, retick=retick)
+                reason = self._sleep_interval(
+                    sleep, scheduler_progress, ended=ended, own_wakes=own_wakes,
+                    retick=any(not isinstance(action, RunAgent) for action in taken))
+                # A tick woken by its own trigger is never woken by its own
+                # trigger again: a mutation every tick repeats (an idempotent
+                # re-post, a merge GitHub has not taken yet) or a dispatch that
+                # ends at once every tick (a skip before its claim, a refused
+                # read in the worker: no leg recorded, so no back-off) costs
+                # at most one extra observe per interval, never a loop.
+                own_wakes = reason not in (RETICK, LEG_ENDED)
                 if reason:
                     self.log(f"{self.name}: woke: {reason}")
             self._transition(DaemonState.DRAINING, "loop completed")
@@ -693,31 +708,37 @@ class Daemon:
             raise
 
     def _sleep_interval(self, sleep: Callable[[int], None], scheduler_progress: Callable[[], None] | None = None,
-                        *, retick: bool = False) -> str | None:
-        """One poll interval, or the re-tick gap after a tick changed GitHub,
-        the timed sleep sliced to keep a systemd watchdog fed when a notifier
-        is present; returns why it ended early (`RETICK`, or the reason
-        `wait_for_change` gave). After GitHub refused a tick the interval is
-        never cut short: neither may turn its back-off into another request."""
-        retick = retick and self._retry_after_seconds is None
-        interval = (min(_RETICK_SECONDS, self.poll_seconds) if retick
-                    else max(self.poll_seconds, int(self._retry_after_seconds or 0)))
-        wake = None if self._retry_after_seconds is not None else self.wait_for_change
+                        *, retick: bool, ended: int, own_wakes: bool) -> str | None:
+        """One poll interval, checked once a second (feeding the watchdog);
+        returns the wake trigger that ended it early: the tick's own GitHub
+        change (`retick`) or a dispatch leaving the pool since `ended` was
+        read at the tick's start (both only with `own_wakes`), or an item the
+        other role freed. After GitHub refused a tick the back-off runs in
+        full: no trigger may turn it into another request."""
+        wakeable = self._retry_after_seconds is None
+        own_wakes = own_wakes and wakeable
+        interval = max(self.poll_seconds, int(self._retry_after_seconds or 0))
         self._retry_after_seconds = None
-        reason = None
-        if wake is not None:
-            reason = wake(interval)
-            if scheduler_progress is not None:
-                scheduler_progress()
-        else:
-            remaining = interval
-            while remaining > 0:
-                step = remaining if scheduler_progress is None else min(30, remaining)
+        reason, elapsed = (RETICK if retick and own_wakes else None), 0
+        # Opened even for a back-off, so the claims it frees are spent on it.
+        with (self.watch_store or _nothing_freed)() as freed_elsewhere:
+            while elapsed < interval:
+                step = min(WAKE_CHECK_SECONDS, interval - elapsed)
                 sleep(step)
-                remaining -= step
+                elapsed += step
                 if scheduler_progress is not None:
                     scheduler_progress()
-        return reason or (RETICK if retick else None)
+                if not wakeable:
+                    continue
+                reason = (reason or (LEG_ENDED if own_wakes and self._dispatches_ended != ended else None)
+                          or (ITEM_FREED if freed_elsewhere() else None))
+                if reason is not None and elapsed >= WAKE_MIN_GAP_SECONDS:
+                    return reason
+        return None
+
+
+def _nothing_freed() -> AbstractContextManager[Callable[[], bool]]:
+    return contextlib.nullcontext(lambda: False)
 
 
 async def run_leg(
