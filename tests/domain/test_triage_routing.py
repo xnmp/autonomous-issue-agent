@@ -19,8 +19,8 @@ from issue_agent.domain.policy import actions
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import DEFAULT_TIER, ModelRoute, Tier, escalate, parse_model_route, parse_tier
 from issue_agent.domain.state import (
-    TRIAGE_TAG, Backoff, Dispatch, Harness, Local, NeedsHuman, Release, StopReason, TriageNote, Wait, WaitReason,
-    derive, issue_key, pr_key, stop_tag,
+    TRIAGE_TAG, Backoff, Dispatch, DuplicateStop, Harness, Local, PlainStop, Release, StopReason,
+    TriageNote, Wait, WaitReason, derive, issue_key, pr_key, stop_tag,
 )
 from issue_agent.domain.triage import (
     states_criteria,
@@ -112,7 +112,7 @@ def test_a_stewarded_issue_dispatches_triage_then_comment_then_resolve_in_order(
 def test_a_duplicate_stops_the_issue_before_triage_is_bought():
     legs = {issue_key(3): (steward_leg(-1, duplicate_of=2, duplicate_reason="Same Esc bug"),)}
     world = WorldState(issues=(ready(),))
-    assert state_of(world, legs) == NeedsHuman(StopReason.DUPLICATE, iso(-1), duplicate_of=2, detail="Same Esc bug")
+    assert state_of(world, legs) == DuplicateStop(2, "Same Esc bug", iso(-1))
     assert not any(isinstance(a, RunAgent) for a in actions(derive(world, Local(now=NOW, legs=legs), H), H))
 
 
@@ -154,7 +154,7 @@ def test_a_failed_grade_still_posts_the_stewards_criteria_at_the_default_tier():
 def test_light_acts_wait_under_the_same_gates_as_any_paid_act():
     world = WorldState(issues=(ready(),))
     assert state_of(world, headroom=False) == Wait(WaitReason.HEADROOM)
-    assert state_of(world, lifetime_capped=frozenset({3})) == NeedsHuman(StopReason.LIFETIME_CAP, "-")
+    assert state_of(world, lifetime_capped=frozenset({3})) == PlainStop(StopReason.LIFETIME_CAP, "-")
     assert state_of(world, {issue_key(3): (steward_leg(-1),)}, headroom=False) == Wait(WaitReason.HEADROOM)
 
 
@@ -341,9 +341,7 @@ def test_tiers_are_carried_exactly_where_routing_applies():
     with pytest.raises(ValueError):
         Dispatch(AgentKind.TRIAGE, head="h")
     with pytest.raises(ValueError):
-        NeedsHuman(StopReason.DUPLICATE, "-")  # no target
-    with pytest.raises(ValueError):
-        NeedsHuman(StopReason.ATTEMPTS, "-", AgentKind.RESOLVE, duplicate_of=2)
+        DuplicateStop(0, "", "-")  # no target
 
 
 def test_escalate_clamps_absurd_attempt_counts():

@@ -31,8 +31,9 @@ from .actions import ISSUE_ACTS, AgentKind
 from .checks import Observed
 from .ci import Clear, Executing, Failed, Queued, Waiting as CiWaiting, parse_timestamp, reduce_ci
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Release, Rerun,
-    StopReason, TriageNote, Wait, WaitReason, stop_tag,
+    AttemptsStop, Backoff, Blocked, Busy, DerivedState, Dispatch, DuplicateStop, Harness, ItemKey, LinkBlocker, Merge,
+    NeedsHuman, OpenPR, PlainStop, QuestionStop, Refresh, Release, Rerun, StopReason, TriageNote, Wait, WaitReason,
+    stop_tag,
 )
 from .triage import Steward, Triage
 from .world import BlockerRef, Comment, PRView
@@ -347,9 +348,9 @@ def board_status(
     running = next((leg for leg in reversed(legs) if leg.running), None)
     if isinstance(state, NeedsHuman):
         # About to be stopped this tick: policy adds the label and the comment.
-        detail = (state.question if state.reason is StopReason.QUESTION
+        detail = (state.question if isinstance(state, QuestionStop)
                   else f"Duplicate of #{state.duplicate_of}: {state.detail}".rstrip(": ")
-                  if state.reason is StopReason.DUPLICATE else None)
+                  if isinstance(state, DuplicateStop) else None)
         return _needs_you(state.reason.value, target, last_end, detail)
     if isinstance(state, Wait) and state.reason is WaitReason.NEEDS_HUMAN:
         stop = latest_stop(comments, harness)
@@ -403,7 +404,7 @@ def board_status(
         return Waiting("backoff", f"{_ACT_WORDS[act]} backing off",
                        "The last leg ended on a machine failure; it retries after the backoff.",
                        _iso(last_end), _iso(state.until))
-    if isinstance(state, Wait):
+    if isinstance(state, (Wait, Blocked)):
         return _wait_status(state, pr, last_end, ended, now)
     raise TypeError(f"unknown derived state {state!r}")
 
@@ -438,15 +439,16 @@ def _ci_start(pr: PRView | None, now: datetime) -> datetime | None:
 
 
 def _wait_status(
-    wait: Wait, pr: PRView | None, last_end: datetime | None, ended: datetime | None, now: datetime,
+    wait: Wait | Blocked, pr: PRView | None, last_end: datetime | None, ended: datetime | None, now: datetime,
 ) -> BoardStatus:
-    reason, since = wait.reason, _iso(last_end)
-    if reason is WaitReason.BLOCKED:
+    since = _iso(last_end)
+    if isinstance(wait, Blocked):
         first = min(wait.blocked_by, key=lambda b: b.sort_key)
         rest = len(wait.blocked_by) - 1
         why = (f"Also blocked by {rest} more; it starts by itself when all close." if rest
                else "It starts by itself when that issue closes.")
         return Waiting("blocked", f"Blocked by {first}", why, since, blocker=first)
+    reason = wait.reason
     if reason is WaitReason.CI_PENDING:
         return _ci_pending_status(pr, _iso(_ci_start(pr, now) or ended))
     if reason is WaitReason.BASE_RED:
@@ -572,12 +574,11 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
     fallback = last or (Stage.CI if has_pr else Stage.RESOLVE)
     if isinstance(state, (Dispatch, Backoff)):
         return _STAGE_OF_KIND[state.act.name]
-    if isinstance(state, NeedsHuman) and state.act is not None:
+    if isinstance(state, AttemptsStop):
         return _STAGE_OF_KIND[state.act.name]
-    if isinstance(state, NeedsHuman) and state.reason is StopReason.REVIEW_ROUNDS:
+    if isinstance(state, PlainStop) and state.reason is StopReason.REVIEW_ROUNDS:
         return Stage.REVIEW
-    if (isinstance(state, (TriageNote, LinkBlocker))
-            or isinstance(state, NeedsHuman) and state.reason is StopReason.DUPLICATE):
+    if isinstance(state, (TriageNote, LinkBlocker, DuplicateStop)):
         return Stage.TRIAGE
     if isinstance(state, Merge):
         return Stage.MERGE
@@ -587,9 +588,9 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
         return Stage.RESOLVE
     if isinstance(state, Busy) and running is not None:
         return stage_of_kind(running.kind) or fallback
+    if isinstance(state, Blocked):
+        return last or Stage.TRIAGE  # held before its first act
     if isinstance(state, Wait):
-        if state.reason is WaitReason.BLOCKED:
-            return last or Stage.TRIAGE  # held before its first act
         if state.reason is WaitReason.MERGEABILITY_UNKNOWN:
             return Stage.MERGE
         if state.reason is WaitReason.HUMAN_CHANGES_REQUESTED:

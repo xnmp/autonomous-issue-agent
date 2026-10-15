@@ -16,7 +16,7 @@ from issue_agent.domain.gaps import MAX_GAP_BODY, MAX_GAP_TITLE, GapTarget, Harn
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import gap_actions
 from issue_agent.domain.state import (
-    HARNESS_GAP_PREFIX, Harness, Local, NeedsHuman, StopReason, derive, issue_key, pr_key,
+    HARNESS_GAP_PREFIX, Harness, Local, QuestionStop, derive, issue_key, pr_key,
 )
 from issue_agent.domain.world import IssueView, WorldState
 
@@ -128,7 +128,7 @@ def test_a_question_with_a_report_files_the_report_and_still_stops_the_item_for_
     assert "Release this once" not in filed.body + filed.recurrence
     world = WorldState(issues=(IssueView(5, labels=frozenset({Label.AI_READY})),))
     (state,) = derive(world, Local(now=at(10), legs={issue_key(5): (leg,)}), H).values()
-    assert state == NeedsHuman(StopReason.QUESTION, leg.ended_at.isoformat(), question=leg.question)
+    assert state == QuestionStop(leg.question, leg.ended_at.isoformat())
 
 
 # ── a stall the harness observes ────────────────────────────────────────────

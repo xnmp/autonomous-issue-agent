@@ -16,7 +16,7 @@ from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.routing import DEFAULT_TIER, escalate
 from issue_agent.domain.state import (
-    ATTEMPT_CAP, Backoff, Dispatch, Harness, Local, NeedsHuman, StopReason, derive, issue_key, pr_key,
+    ATTEMPT_CAP, Backoff, Dispatch, Harness, Local, NeedsHuman, QuestionStop, StopReason, derive, issue_key, pr_key,
 )
 from issue_agent.domain.world import IssueView, PRView, WorldState
 
@@ -117,7 +117,7 @@ def test_an_agent_end_is_one_attempt_and_a_question_stops_for_a_human():
     assert resolve_state(leg("RESOLVE", 0, agent())) == Dispatch(AgentKind.RESOLVE, tier=escalate(DEFAULT_TIER, 1))
     state = resolve_state(leg("RESOLVE", 0, {"leg": "asked", "question": "404 or 410?", "session": "s-q",
                                              "runtime": "claude"}))
-    assert isinstance(state, NeedsHuman) and state.reason is StopReason.QUESTION and state.question == "404 or 410?"
+    assert isinstance(state, QuestionStop) and state.question == "404 or 410?"
 
 
 def test_a_cut_off_answer_is_continued_with_the_question_still_answered():

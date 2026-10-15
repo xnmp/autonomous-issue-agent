@@ -58,8 +58,8 @@ Precedence, the single place it is defined (first match wins, per item):
                open or merged harness PR, triaged -> RESOLVE.
 8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh/open are
                free): an issue act (no PR yet) whose issue GitHub marks
-               "blocked by" an open issue, in any repository -> Wait (BLOCKED;
-               the observation that shows every blocker closed lets it start;
+               "blocked by" an open issue, in any repository -> Blocked
+               (the observation that shows every blocker closed lets it start;
                an item with a PR is never gated, nor a base-fix issue, #402); bot review rounds >= cap
                (ADDRESS_REVIEW on a bot verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
                issue's lifetime cap cannot afford a leg -> NeedsHuman; machine
@@ -98,6 +98,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
+from typing import ClassVar
 
 from .actions import ISSUE_ACTS, ROUTED_ACTS, AgentKind, Evidence, Target, check_evidence, check_tier
 from .backoff import LegEnd, machine_backoff_until
@@ -224,7 +225,6 @@ class WaitReason(str, Enum):
     MERGEABILITY_UNKNOWN = "mergeability-unknown"  # or reported BLOCKED
     HUMAN_CHANGES_REQUESTED = "human-changes-requested"
     HEADROOM = "headroom"
-    BLOCKED = "blocked"  # GitHub's "blocked by" names an open issue
 
 
 class StopReason(str, Enum):
@@ -351,44 +351,71 @@ class Release:
 
 @dataclass(frozen=True)
 class Wait:
-    """`blocked_by` names the open blockers, carried exactly by a BLOCKED wait."""
-
     reason: WaitReason
-    blocked_by: tuple[BlockerRef, ...] = ()
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.blocked_by, tuple) or any(not isinstance(b, BlockerRef) for b in self.blocked_by)
-                or bool(self.blocked_by) != (self.reason is WaitReason.BLOCKED)):
-            raise ValueError("blockers are carried exactly by a blocked wait")
 
 
 @dataclass(frozen=True)
-class NeedsHuman:
-    """A judgment stop. `anchor` (the item's last leg end, or "-") makes the
-    comment's idempotency key unique per episode and stable within one.
-    `question` is the agent's question, carried exactly by a QUESTION stop;
-    `duplicate_of` (with triage's one-line `detail`) exactly by a DUPLICATE stop."""
+class Blocked:
+    """GitHub's "blocked by" names these open issues."""
 
-    reason: StopReason
-    anchor: str
-    act: AgentKind | None = None
-    question: str = ""
-    duplicate_of: int = 0
-    detail: str = ""
+    blocked_by: tuple[BlockerRef, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.reason, StopReason) or not isinstance(self.anchor, str) or not self.anchor:
-            raise ValueError("needs-human requires a reason and an anchor")
-        if (self.act is not None) != (self.reason is StopReason.ATTEMPTS) or (
-            self.act is not None and self.act not in DISPATCHABLE
-        ):
-            raise ValueError("an act is named exactly for an attempts stop")
-        if not isinstance(self.question, str) or bool(self.question) != (self.reason is StopReason.QUESTION):
-            raise ValueError("a question is carried exactly by a question stop")
-        if (type(self.duplicate_of) is not int or self.duplicate_of < 0
-                or (self.duplicate_of > 0) != (self.reason is StopReason.DUPLICATE)
-                or not isinstance(self.detail, str) or (self.detail and self.reason is not StopReason.DUPLICATE)):
-            raise ValueError("a duplicate target is carried exactly by a duplicate stop")
+        if not isinstance(self.blocked_by, tuple) or not self.blocked_by or any(
+                not isinstance(b, BlockerRef) for b in self.blocked_by):
+            raise ValueError("a blocked wait names its open blockers")
+
+
+def _need_stop(stop: object, anchor: object, carried: bool) -> None:
+    if not isinstance(anchor, str) or not anchor or not carried:
+        raise ValueError(f"{type(stop).__name__} requires an anchor and what its reason carries")
+
+
+@dataclass(frozen=True)
+class PlainStop:
+    reason: StopReason
+    anchor: str
+
+    def __post_init__(self) -> None:
+        _need_stop(self, self.anchor, isinstance(self.reason, StopReason) and self.reason in _PLAIN_STOPS)
+
+
+@dataclass(frozen=True)
+class AttemptsStop:
+    act: AgentKind
+    anchor: str
+    reason: ClassVar[StopReason] = StopReason.ATTEMPTS
+
+    def __post_init__(self) -> None:
+        _need_stop(self, self.anchor, self.act in DISPATCHABLE)
+
+
+@dataclass(frozen=True)
+class QuestionStop:
+    question: str  # the agent's (`LegEnd.question`)
+    anchor: str
+    reason: ClassVar[StopReason] = StopReason.QUESTION
+
+    def __post_init__(self) -> None:
+        _need_stop(self, self.anchor, isinstance(self.question, str) and bool(self.question))
+
+
+@dataclass(frozen=True)
+class DuplicateStop:
+    duplicate_of: int
+    detail: str  # triage's one line
+    anchor: str
+    reason: ClassVar[StopReason] = StopReason.DUPLICATE
+
+    def __post_init__(self) -> None:
+        _need_stop(self, self.anchor,
+                   type(self.duplicate_of) is int and self.duplicate_of > 0 and isinstance(self.detail, str))
+
+
+# A judgment stop, one variant per what it carries. `anchor` (the item's last
+# leg end, or "-") makes the comment's idempotency key unique per episode and stable within one.
+NeedsHuman = PlainStop | AttemptsStop | QuestionStop | DuplicateStop
+_PLAIN_STOPS = frozenset({StopReason.WORKFLOW_PATH, StopReason.LIFETIME_CAP, StopReason.REVIEW_ROUNDS})
 
 
 @dataclass(frozen=True)
@@ -406,8 +433,8 @@ class Backoff:
             raise ValueError("backoff requires a dispatchable act and an aware time")
 
 
-DerivedState = (Dispatch | Merge | Refresh | Rerun | OpenPR | TriageNote | LinkBlocker | Release | Wait | NeedsHuman
-                | Busy | Backoff)
+DerivedState = (Dispatch | Merge | Refresh | Rerun | OpenPR | TriageNote | LinkBlocker | Release | Wait | Blocked
+                | NeedsHuman | Busy | Backoff)
 
 
 class Origin(Enum):
@@ -543,12 +570,12 @@ def _proceed(
     last_agent = next((leg for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at)) if not leg.machine), None)
     if (last_agent is not None and last_agent.question is not None
             and not any(at > last_agent.ended_at for at, _ in stops)):
-        return NeedsHuman(StopReason.QUESTION, anchor, question=last_agent.question)
+        return QuestionStop(last_agent.question, anchor)
 
     pr = item.pr
     released_workflow = any(code == StopReason.WORKFLOW_PATH.value for _, code in stops)
     if pr is not None and touches_github(pr.changed_files) and not released_workflow:
-        return NeedsHuman(StopReason.WORKFLOW_PATH, anchor)
+        return PlainStop(StopReason.WORKFLOW_PATH, anchor)
     if pr is None and item.branches:
         return OpenPR(max(item.branches, key=lambda b: (parse_timestamp(b.committed_at) is not None,
                                                         b.committed_at, b.name)).name)
@@ -587,16 +614,16 @@ def _proceed(
         return step
     # Before the gates: nothing is spent, and a stop would ask a human to act on an issue that is only waiting.
     if step.act in ISSUE_ACTS and item.blocked_by:
-        return Wait(WaitReason.BLOCKED, item.blocked_by)
+        return Blocked(item.blocked_by)
     if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
             and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
             and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
-        return NeedsHuman(StopReason.REVIEW_ROUNDS, anchor)
+        return PlainStop(StopReason.REVIEW_ROUNDS, anchor)
     attempts = _attempts(legs, step, floor)
     if attempts >= ATTEMPT_CAP:
-        return NeedsHuman(StopReason.ATTEMPTS, anchor, step.act)
+        return AttemptsStop(step.act, anchor)
     if item.issue in local.lifetime_capped:
-        return NeedsHuman(StopReason.LIFETIME_CAP, anchor)
+        return PlainStop(StopReason.LIFETIME_CAP, anchor)
     until = machine_backoff_until(legs, step.act)
     if until is not None and until > local.now:
         return Backoff(step.act, until)
@@ -639,7 +666,7 @@ def latest_steward(legs: tuple[LegEnd, ...]) -> LegEnd | None:
                  if not leg.machine and leg.kind is AgentKind.STEWARD), None)
 
 
-def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str) -> NeedsHuman | None:
+def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str) -> DuplicateStop | None:
     """The duplicate stop a steward result owes, until a human released one.
 
     Kept deliberately (#369, #450): the steward judges duplication, but closing
@@ -650,7 +677,7 @@ def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str)
     steward = leg.steward
     if steward is None or steward.duplicate_of is None or any(code == StopReason.DUPLICATE.value for _, code in stops):
         return None
-    return NeedsHuman(StopReason.DUPLICATE, anchor, duplicate_of=steward.duplicate_of, detail=steward.duplicate_reason)
+    return DuplicateStop(steward.duplicate_of, steward.duplicate_reason, anchor)
 
 
 def _blocker_link(leg: LegEnd, issue: int, comments: tuple[Comment, ...], harness: Harness) -> LinkBlocker | None:
@@ -701,7 +728,7 @@ def _pr_step(
         # flake gets one harness re-run per head; a run past attempt 1 was re-run already.
         if runs and all((c.run_attempt or 1) == 1 for c in pr.ci.reports):
             return Rerun(head, tuple(sorted(runs)))
-        return NeedsHuman(StopReason.ATTEMPTS, anchor, AgentKind.FIX_CI)
+        return AttemptsStop(AgentKind.FIX_CI, anchor)
     # The base is the repo's to fix (Q13: flakes are the repo's). The PR
     # waits uncharged and resumes when the base tip stops failing.
     if isinstance(ci, BaseRed):
@@ -855,6 +882,6 @@ __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
     "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "Rerun", "OpenPR", "TriageNote", "TRIAGE_TAG",
     "BLOCKER_TAG", "LinkBlocker",
-    "Release", "Wait", "NeedsHuman",
+    "Release", "Wait", "Blocked", "NeedsHuman", "PlainStop", "AttemptsStop", "QuestionStop", "DuplicateStop",
     "Busy", "Backoff", "DerivedState", "derive", "human_comments", "latest_steward", "touches_github",
 ]

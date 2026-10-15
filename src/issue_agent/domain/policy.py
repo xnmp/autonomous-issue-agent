@@ -25,9 +25,9 @@ from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Rerun,
-    Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP, BLOCKER_TAG, HARNESS_GAP_PREFIX, REVIEW_ROUND_CAP,
-    TRIAGE_TAG,
+    AttemptsStop, Backoff, Blocked, Busy, DerivedState, Dispatch, DuplicateStop, Harness, ItemKey, LinkBlocker, Merge,
+    NeedsHuman, OpenPR, QuestionStop, Refresh, Rerun, Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP,
+    BLOCKER_TAG, HARNESS_GAP_PREFIX, REVIEW_ROUND_CAP, TRIAGE_TAG,
 )
 
 _WHY = {
@@ -84,7 +84,7 @@ def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, date
 
 
 def needs_human_key(key: ItemKey, stop: NeedsHuman) -> str:
-    act = f"-{stop.act.name.lower()}" if stop.act is not None else ""
+    act = f"-{stop.act.name.lower()}" if isinstance(stop, AttemptsStop) else ""
     return f"needs-human:{key.target.name.lower()}:{key.number}:{stop.reason.value}{act}:{stop.anchor}"
 
 
@@ -314,16 +314,17 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     if isinstance(state, Release):
         return (Relabel(key.target, key.number, remove=Label.NEEDS_HUMAN, add=None),)
     if isinstance(state, NeedsHuman):
-        why = _WHY[state.reason].format(act=state.act.name if state.act else "", dup=state.duplicate_of)
-        asked = (f"\n\n{question_text(state.question)}" if state.reason is StopReason.QUESTION
-                 else f" {_code_span(state.detail)}" if state.reason is StopReason.DUPLICATE and state.detail else "")
+        why = _WHY[state.reason].format(act=state.act.name if isinstance(state, AttemptsStop) else "",
+                                        dup=state.duplicate_of if isinstance(state, DuplicateStop) else 0)
+        asked = (f"\n\n{question_text(state.question)}" if isinstance(state, QuestionStop)
+                 else f" {_code_span(state.detail)}" if isinstance(state, DuplicateStop) and state.detail else "")
         body = (f"{harness.marker}\n{stop_tag(state.reason)}\n"
                 f"**needs-human**: {why}{asked}\n\n{_HOW.get(state.reason, _DEFAULT_HOW)}")
         return (
             Relabel(key.target, key.number, remove=None, add=Label.NEEDS_HUMAN),
             PostComment(key.target, key.number, body, key=needs_human_key(key, state)),
         )
-    if isinstance(state, (Wait, Busy, Backoff)):
+    if isinstance(state, (Wait, Blocked, Busy, Backoff)):
         return ()
     raise TypeError(f"unknown derived state {state!r}")
 

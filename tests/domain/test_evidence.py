@@ -17,7 +17,7 @@ from issue_agent.domain.evidence import (
 )
 from issue_agent.domain.routing import DEFAULT_TIER, Tier, escalate
 from issue_agent.domain.state import (
-    Backoff, Dispatch, Harness, Local, NeedsHuman, Rerun, StopReason, Wait, WaitReason, derive, pr_key,
+    AttemptsStop, Backoff, Dispatch, Harness, Local, NeedsHuman, Rerun, Wait, WaitReason, derive, pr_key,
 )
 from issue_agent.domain.world import Comment, PRView, Review, WorldState
 
@@ -67,7 +67,7 @@ def state(view: PRView, *ends: LegEnd, now: float = 60):
 
 
 def stop(minute: float) -> NeedsHuman:
-    return NeedsHuman(StopReason.ATTEMPTS, at(minute).isoformat(), AgentKind.FIX_CI)
+    return AttemptsStop(AgentKind.FIX_CI, at(minute).isoformat())
 
 
 # ── the #1078 run, end to end in derive ─────────────────────────────────────

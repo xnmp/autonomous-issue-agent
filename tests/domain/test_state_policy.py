@@ -30,9 +30,12 @@ from issue_agent.domain.policy import (
 from issue_agent.domain.refs import harness_branch_issue
 from issue_agent.domain.state import (
     BLOCKER_TAG,
+    AttemptsStop,
     Backoff,
+    Blocked,
     Busy,
     Dispatch,
+    DuplicateStop,
     Harness,
     ItemKey,
     LinkBlocker,
@@ -40,6 +43,8 @@ from issue_agent.domain.state import (
     Merge,
     NeedsHuman,
     OpenPR,
+    PlainStop,
+    QuestionStop,
     Refresh,
     Release,
     StopReason,
@@ -302,7 +307,7 @@ def test_unsettled_pr_waits(view, reason):
 @pytest.mark.parametrize("path", [".github/workflows/ci.yml", "./.github/CODEOWNERS", ".github/actions/a/x.yml"])
 def test_pr_touching_github_paths_needs_a_human(path):
     states = derive(WorldState(prs=(pr(changed_files=frozenset({"src/a.py", path})),)), local(), H)
-    assert states == {pr_key(7): NeedsHuman(StopReason.WORKFLOW_PATH, "-")}
+    assert states == {pr_key(7): PlainStop(StopReason.WORKFLOW_PATH, "-")}
     label, comment = actions(states, H)
     assert label == Relabel(Target.PR, 7, remove=None, add=Label.NEEDS_HUMAN)
     assert isinstance(comment, PostComment) and H.marker in comment.body and comment.key
@@ -408,7 +413,7 @@ def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
     view = pr(ci=RED)
     assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2)))) == fixing(Tier.XHIGH)
     states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 1, 2, 3))), H)
-    assert states == {pr_key(7): NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)}
+    assert states == {pr_key(7): AttemptsStop(FIX, iso(3))}
     label, comment = actions(states, H)
     assert label.add is Label.NEEDS_HUMAN
     assert "FIX_CI" in comment.body and stop_tag(StopReason.ATTEMPTS) in comment.body
@@ -416,7 +421,7 @@ def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
 
 def test_resolve_attempts_cap_on_the_issue():
     states = derive(WorldState(issues=(issue(3),)), local({issue_key(3): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
-    assert states == {issue_key(3): NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)}
+    assert states == {issue_key(3): AttemptsStop(AgentKind.RESOLVE, iso(3))}
 
 
 def test_machine_failures_never_count_as_attempts():
@@ -458,12 +463,12 @@ def test_a_non_harness_comment_review_or_push_resets_attempts(change):
 )
 def test_harness_bot_or_untimed_events_do_not_reset(change):
     loc = local(pr_legs(*legs(FIX, 1, 2, 3)))
-    assert pr_state(pr(ci=RED, **change), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)
+    assert pr_state(pr(ci=RED, **change), loc) == AttemptsStop(FIX, iso(3))
 
 
 def test_attempts_after_the_latest_reset_still_reach_the_cap():
     loc = local(pr_legs(*legs(FIX, 1, 2, 11, 12, 13)))
-    assert pr_state(pr(ci=RED, comments=(human(10),)), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(13), FIX)
+    assert pr_state(pr(ci=RED, comments=(human(10),)), loc) == AttemptsStop(FIX, iso(13))
 
 
 # ── Attempt runs (Q21) ───────────────────────────────────────────────────────
@@ -476,7 +481,7 @@ def seq(*steps: tuple[AgentKind, str] | tuple[AgentKind, str, bool]) -> dict:
 
 def test_fix_ci_red_fix_red_three_times_caps():
     loc = local(seq((FIX, "a"), (FIX, "b"), (FIX, "c")))  # three pushes, each red again
-    assert pr_state(pr(ci=RED), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(2), FIX)
+    assert pr_state(pr(ci=RED), loc) == AttemptsStop(FIX, iso(2))
 
 
 def test_alternating_successful_rebases_and_reviews_never_cap():
@@ -493,12 +498,12 @@ def test_reviews_of_four_different_heads_never_cap():
 
 def test_three_reviews_of_the_same_head_cap():
     loc = local(seq((REVIEW, "a"), (REVIEW, HEAD), (REVIEW, HEAD), (REVIEW, HEAD)))
-    assert pr_state(pr(), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), REVIEW)
+    assert pr_state(pr(), loc) == AttemptsStop(REVIEW, iso(3))
 
 
 def test_machine_legs_inside_a_run_neither_break_nor_count():
     loc = local(seq((FIX, "a"), (FIX, "a", True), (REVIEW, "a", True), (FIX, "b"), (FIX, "b", True), (FIX, "c")))
-    assert pr_state(pr(ci=RED), local(loc.legs, now=at(100))) == NeedsHuman(StopReason.ATTEMPTS, iso(5), FIX)
+    assert pr_state(pr(ci=RED), local(loc.legs, now=at(100))) == AttemptsStop(FIX, iso(5))
     two = local(seq((FIX, "a"), (FIX, "a", True), (FIX, "b")), now=at(100))
     assert pr_state(pr(ci=RED), two) == fixing(Tier.XHIGH)
 
@@ -530,7 +535,7 @@ def test_human_change_request_driven_address_review_counts_attempts_not_bot_roun
     view = pr(reviews=(*bot_rounds, review("CHANGES_REQUESTED", 4, author="alice")))
     assert pr_state(view) == addressing("alice")  # three bot rounds, yet no rounds stop
     after_review = local({pr_key(7): tuple(LegEnd(ADDR, at(10 + m), False, head=HEAD) for m in range(3))})
-    assert pr_state(view, after_review) == NeedsHuman(StopReason.ATTEMPTS, iso(12), ADDR)
+    assert pr_state(view, after_review) == AttemptsStop(ADDR, iso(12))
 
 
 def test_human_change_request_on_an_older_head_blocks_merge():
@@ -578,7 +583,7 @@ def test_harness_reviewers_are_not_humans():
 def test_third_bot_change_request_stops_instead_of_addressing():
     rounds = tuple(review("CHANGES_REQUESTED", m, head=h) for m, h in ((1, "a"), (2, "b"), (3, HEAD)))
     assert pr_state(pr(reviews=rounds[1:])) == addressing()
-    assert pr_state(pr(reviews=rounds)) == NeedsHuman(StopReason.REVIEW_ROUNDS, "-")
+    assert pr_state(pr(reviews=rounds)) == PlainStop(StopReason.REVIEW_ROUNDS, "-")
 
 
 def test_rounds_do_not_block_an_approved_head():
@@ -593,7 +598,7 @@ def test_human_engagement_resets_review_rounds():
 
 def test_untimed_bot_change_requests_still_count_as_rounds():
     rounds = tuple(Review("CHANGES_REQUESTED", "review-bot", submitted_at="garbage", commit_id=HEAD) for _ in range(3))
-    assert pr_state(pr(reviews=rounds, comments=(human(10),))) == NeedsHuman(StopReason.REVIEW_ROUNDS, "-")
+    assert pr_state(pr(reviews=rounds, comments=(human(10),))) == PlainStop(StopReason.REVIEW_ROUNDS, "-")
 
 
 # ── Backoff (Q16), lease, caps (Q7) ──────────────────────────────────────────
@@ -619,7 +624,7 @@ def test_short_daily_headroom_is_a_silent_wait_for_paid_legs_only():
 
 
 def test_lifetime_cap_needs_a_human_on_the_pr_stage_too():
-    assert pr_state(pr(), local(lifetime_capped=frozenset({3}))) == NeedsHuman(StopReason.LIFETIME_CAP, "-")
+    assert pr_state(pr(), local(lifetime_capped=frozenset({3}))) == PlainStop(StopReason.LIFETIME_CAP, "-")
 
 
 def test_a_reply_cannot_release_a_lifetime_cap():
@@ -657,25 +662,25 @@ WF = frozenset({".github/workflows/ci.yml"})
     ("view", "loc", "expected"),
     [
         (labelled(changed_files=WF), local(leases=frozenset({pr_key(7)}), lifetime_capped=frozenset({3})), Busy()),
-        (pr(changed_files=WF), local(lifetime_capped=frozenset({3})), NeedsHuman(StopReason.WORKFLOW_PATH, "-")),
+        (pr(changed_files=WF), local(lifetime_capped=frozenset({3})), PlainStop(StopReason.WORKFLOW_PATH, "-")),
         (labelled([stop(StopReason.ATTEMPTS, 1)], changed_files=WF), local(), Wait(WaitReason.NEEDS_HUMAN)),
         (
             pr(ci=RED),
             local(pr_legs(*legs(FIX, 1, 2, 3)), lifetime_capped=frozenset({3})),
-            NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX),
+            AttemptsStop(FIX, iso(3)),
         ),
-        (pr(ci=RED), local(lifetime_capped=frozenset({3})), NeedsHuman(StopReason.LIFETIME_CAP, "-")),
+        (pr(ci=RED), local(lifetime_capped=frozenset({3})), PlainStop(StopReason.LIFETIME_CAP, "-")),
         (
             pr(ci=RED, changed_files=WF),
             local(pr_legs(*legs(FIX, 1, 2, 3))),
-            NeedsHuman(StopReason.WORKFLOW_PATH, iso(3)),
+            PlainStop(StopReason.WORKFLOW_PATH, iso(3)),
         ),
         (
             pr(ci=RED),
             local(pr_legs(*legs(FIX, 1, 2, 3) + legs(FIX, 4, machine=True)), now=at(4.5)),
-            NeedsHuman(StopReason.ATTEMPTS, iso(4), FIX),
+            AttemptsStop(FIX, iso(4)),
         ),
-        (pr(ci=RED), local(pr_legs(*legs(FIX, 1, 2, 3)), headroom=False), NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)),
+        (pr(ci=RED), local(pr_legs(*legs(FIX, 1, 2, 3)), headroom=False), AttemptsStop(FIX, iso(3))),
         (pr(ci=RED), local(pr_legs(*legs(FIX, 0, machine=True)), now=at(0.5), headroom=False), Backoff(FIX, at(1))),
         (
             pr(ci=RED, mergeable="CONFLICTING", reviews=(review("APPROVED", 1),)),
@@ -743,11 +748,15 @@ def test_policy_refuses_resolve_on_a_pr():
         lambda: Dispatch(AgentKind.RESOLVE, "h"),
         lambda: Dispatch(FIX, ""),
         lambda: Merge(""),
-        lambda: NeedsHuman(StopReason.ATTEMPTS, "-"),
-        lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", FIX),
-        lambda: NeedsHuman(StopReason.WORKFLOW_PATH, ""),
-        lambda: NeedsHuman(StopReason.QUESTION, "-"),
-        lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", question="why?"),
+        lambda: PlainStop(StopReason.ATTEMPTS, "-"),
+        lambda: PlainStop(StopReason.WORKFLOW_PATH, ""),
+        lambda: PlainStop(StopReason.QUESTION, "-"),
+        lambda: PlainStop("workflow-path", "-"),  # type: ignore[arg-type]
+        lambda: QuestionStop("", "-"),
+        lambda: AttemptsStop(None, "-"),  # type: ignore[arg-type]
+        lambda: AttemptsStop(FIX, ""),
+        lambda: DuplicateStop(-1, "", "-"),
+        lambda: DuplicateStop(True, "", "-"),
         lambda: Backoff(FIX, datetime(2026, 10, 1)),
         lambda: MergePullRequest(7, ""),
     ],
@@ -784,7 +793,7 @@ def test_many_items_derive_independently():
     world = WorldState(issues=tuple(issue(n) for n in range(1, 2001)))
     states = derive(world, local({issue_key(5): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
     assert len(states) == 2000
-    assert states[issue_key(5)] == NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)
+    assert states[issue_key(5)] == AttemptsStop(AgentKind.RESOLVE, iso(3))
     assert states[issue_key(6)] == Dispatch(AgentKind.STEWARD)
 
 
@@ -798,7 +807,7 @@ def asked(kind: AgentKind, minute: float, question: str = "404 or 410?") -> LegE
 def test_an_agent_question_stops_the_item_and_the_stop_comment_carries_it():
     loc = local({issue_key(3): (asked(AgentKind.RESOLVE, 5),)})
     states = derive(WorldState(issues=(issue(3),)), loc, H)
-    assert states == {issue_key(3): NeedsHuman(StopReason.QUESTION, iso(5), question="404 or 410?")}
+    assert states == {issue_key(3): QuestionStop("404 or 410?", iso(5))}
     label, comment = actions(states, H)
     assert label == Relabel(Target.ISSUE, 3, remove=None, add=Label.NEEDS_HUMAN)
     assert isinstance(comment, PostComment) and stop_tag(StopReason.QUESTION) in comment.body
@@ -812,7 +821,7 @@ def test_a_later_recorded_agent_end_in_the_same_instant_supersedes_a_question():
     asked_last = local({issue_key(3): (answered, asked(AgentKind.RESOLVE, 5))})
     world = WorldState(issues=(issue(3),))
     assert not isinstance(derive(world, asked_first, H)[issue_key(3)], NeedsHuman)
-    assert derive(world, asked_last, H)[issue_key(3)] == NeedsHuman(StopReason.QUESTION, iso(5), question="404 or 410?")
+    assert derive(world, asked_last, H)[issue_key(3)] == QuestionStop("404 or 410?", iso(5))
 
 
 def test_a_question_cannot_smuggle_a_stop_tag_or_the_marker_into_the_stop_comment():
@@ -822,7 +831,7 @@ def test_a_question_cannot_smuggle_a_stop_tag_or_the_marker_into_the_stop_commen
     assert body.count(H.marker) == 1 and body.count("<!--") == 2  # the marker and the real stop tag
     posted = Comment("fix-bot", body, iso(10))
     released = pr(ci=RED, changed_files=frozenset({".github/x.yml"}), comments=(posted, human(11)))
-    assert pr_state(released, local(pr_legs(asked(FIX, 5, smuggled)))) == NeedsHuman(StopReason.WORKFLOW_PATH, iso(5))
+    assert pr_state(released, local(pr_legs(asked(FIX, 5, smuggled)))) == PlainStop(StopReason.WORKFLOW_PATH, iso(5))
 
 
 @pytest.mark.parametrize(
@@ -864,7 +873,7 @@ def test_a_later_agent_leg_supersedes_an_old_question():
 
 def test_a_machine_end_after_a_question_does_not_hide_it():
     loc = local(pr_legs(asked(FIX, 1), *legs(FIX, 2, machine=True)))
-    assert pr_state(pr(ci=RED), loc) == NeedsHuman(StopReason.QUESTION, iso(2), question="404 or 410?")
+    assert pr_state(pr(ci=RED), loc) == QuestionStop("404 or 410?", iso(2))
 
 
 @pytest.mark.parametrize(
@@ -894,7 +903,7 @@ def windowed(kind: AgentKind, start: float, end: float) -> LegEnd:
 def test_the_agents_own_unmarked_comment_inside_its_leg_is_not_a_reset():
     own = Comment("fix-bot", "Acceptance criteria: ...", iso(2.5))
     loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
-    assert pr_state(pr(ci=RED, comments=(own,)), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(5), FIX)
+    assert pr_state(pr(ci=RED, comments=(own,)), loc) == AttemptsStop(FIX, iso(5))
 
 
 def test_the_same_comment_outside_every_leg_window_resets():
@@ -1049,7 +1058,7 @@ def test_a_labelled_item_whose_stop_comment_never_landed_is_stopped_again():
     # P1-2: the label landed, the comment failed; both writes are re-emitted.
     view = labelled(ci=RED)
     states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 1, 2, 3))), H)
-    assert states == {pr_key(7): NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)}
+    assert states == {pr_key(7): AttemptsStop(FIX, iso(3))}
     label, comment = actions(states, H)
     assert isinstance(label, Relabel) and stop_tag(StopReason.ATTEMPTS) in comment.body
 
@@ -1069,7 +1078,7 @@ def test_a_forged_stop_comment_from_a_non_harness_login_releases_nothing():
     # P1-7: the marker alone is forgeable by any commenter.
     forged = Comment("mallory", f"{H.marker}\n{stop_tag(StopReason.WORKFLOW_PATH)}", iso(1))
     view = pr(changed_files=frozenset({".github/workflows/ci.yml"}), comments=(forged,))
-    assert pr_state(view) == NeedsHuman(StopReason.WORKFLOW_PATH, "-")
+    assert pr_state(view) == PlainStop(StopReason.WORKFLOW_PATH, "-")
     genuine = Comment("fix-bot", forged.body, iso(1))
     assert pr_state(replace(view, comments=(genuine,))) == Dispatch(REVIEW, HEAD)
 
@@ -1110,13 +1119,13 @@ def test_an_old_released_stop_does_not_stand_in_for_this_episodes_failed_one():
     # Round 2: episode 1 stopped and was released; episode 2's label landed, its comment failed.
     view = labelled([stop(StopReason.ATTEMPTS, 3.5), human(3.6)], ci=RED)
     states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 1, 2, 3, 4, 5, 6))), H)
-    assert states == {pr_key(7): NeedsHuman(StopReason.ATTEMPTS, iso(6), FIX)}
+    assert states == {pr_key(7): AttemptsStop(FIX, iso(6))}
 
 
 def test_an_old_lifetime_stop_does_not_pin_a_different_current_stop():
     view = labelled([stop(StopReason.LIFETIME_CAP, 0.5), human(0.6)], ci=RED)
     loc = local(pr_legs(*legs(FIX, 1, 2, 3)), lifetime_capped=frozenset({3}))
-    assert pr_state(view, loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)
+    assert pr_state(view, loc) == AttemptsStop(FIX, iso(3))
 
 
 # ── "blocked by": an open blocker holds new work, never a PR ─────────────────
@@ -1130,7 +1139,7 @@ def test_an_open_blocker_holds_every_issue_act_with_no_action(legs_by, act):
     world = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),))
     assert one(WorldState(issues=(issue(3),)), local(legs_by)) == Dispatch(act)  # the act it would start
     states = derive(world, local(legs_by), H)
-    assert states == {issue_key(3): Wait(WaitReason.BLOCKED, (BlockerRef(9),))}
+    assert states == {issue_key(3): Blocked((BlockerRef(9),))}
     assert actions(states, H) == ()
 
 
@@ -1138,18 +1147,18 @@ def test_the_issue_starts_by_itself_once_the_observation_shows_its_blockers_clos
     # Closed blockers are dropped at the boundary: the next world carries none.
     blocked = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),))
     freed = WorldState(issues=(issue(3, blocked_by=()),))
-    assert one(blocked, local(TRIAGED)) == Wait(WaitReason.BLOCKED, (BlockerRef(9),))
+    assert one(blocked, local(TRIAGED)) == Blocked((BlockerRef(9),))
     assert actions(derive(freed, local(TRIAGED), H), H) == (RunAgent(AgentKind.RESOLVE, 3, head="", tier=Tier.MED),)
 
 
 def test_mixed_and_cross_repository_blockers_all_ride_on_the_wait():
     refs = (BlockerRef(4), BlockerRef(12, "other/lib"))
-    assert one(WorldState(issues=(issue(3, blocked_by=refs),)), local(TRIAGED)) == Wait(WaitReason.BLOCKED, refs)
+    assert one(WorldState(issues=(issue(3, blocked_by=refs),)), local(TRIAGED)) == Blocked(refs)
 
 
 def test_a_cross_repository_blocker_alone_still_blocks():
     ref = (BlockerRef(1, "other/lib"),)
-    assert one(WorldState(issues=(issue(3, blocked_by=ref),)), local(TRIAGED)) == Wait(WaitReason.BLOCKED, ref)
+    assert one(WorldState(issues=(issue(3, blocked_by=ref),)), local(TRIAGED)) == Blocked(ref)
 
 
 def test_an_issue_with_an_open_pr_keeps_flowing_whatever_its_blockers():
@@ -1166,7 +1175,7 @@ def test_a_blocked_issue_waits_rather_than_tripping_a_dispatch_gate():
     # Lifetime-capped and out of headroom: the blocker is the reason it waits; nothing asks a human.
     world = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),))
     loc = local(TRIAGED, headroom=False, lifetime_capped=frozenset({3}))
-    assert one(world, loc) == Wait(WaitReason.BLOCKED, (BlockerRef(9),))
+    assert one(world, loc) == Blocked((BlockerRef(9),))
 
 
 def test_a_needs_human_stop_still_wins_over_a_blocker():
@@ -1176,7 +1185,7 @@ def test_a_needs_human_stop_still_wins_over_a_blocker():
 
 def test_a_huge_blocker_list_is_one_wait():
     refs = tuple(BlockerRef(n) for n in range(1, 10_001))
-    assert one(WorldState(issues=(issue(3, blocked_by=refs),)), local(TRIAGED)) == Wait(WaitReason.BLOCKED, refs)
+    assert one(WorldState(issues=(issue(3, blocked_by=refs),)), local(TRIAGED)) == Blocked(refs)
 
 
 def test_no_blockers_is_unblocked():
@@ -1194,11 +1203,9 @@ def test_a_malformed_blocker_ref_is_unconstructible(args):
 
 def test_blockers_ride_exactly_on_a_blocked_wait():
     with pytest.raises(ValueError):
-        Wait(WaitReason.BLOCKED)
+        Blocked(())
     with pytest.raises(ValueError):
-        Wait(WaitReason.HEADROOM, (BlockerRef(1),))
-    with pytest.raises(ValueError):
-        Wait(WaitReason.BLOCKED, [BlockerRef(1)])  # type: ignore[arg-type]
+        Blocked([BlockerRef(1)])  # type: ignore[arg-type]
     assert str(BlockerRef(4)) == "#4" and str(BlockerRef(4, "o/lib")) == "o/lib#4"
 
 
@@ -1237,7 +1244,7 @@ def test_a_claim_on_the_issue_itself_is_never_linked():
 
 def test_a_linked_issue_then_waits_on_its_blocker():
     world = WorldState(issues=(issue(3, comments=(blocker_said(),), blocked_by=(BlockerRef(4),)),))
-    assert one(world, local({issue_key(3): (CLAIMING,)})) == Wait(WaitReason.BLOCKED, (BlockerRef(4),))
+    assert one(world, local({issue_key(3): (CLAIMING,)})) == Blocked((BlockerRef(4),))
 
 
 def test_a_suspected_duplicate_stops_before_any_link():
