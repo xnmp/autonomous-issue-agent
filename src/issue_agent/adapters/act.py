@@ -190,15 +190,14 @@ class GitHubAct:
                      + (f"; first failure {failed[0]}" if failed else ""))
 
     def rerun(self, action: RerunFailedJobs) -> None:
-        """The harness's one re-run of a head's failed jobs, read back by each
-        run's attempt so a replay posts nothing. A refusal raises and repeats
-        each poll, as update-branch's does, until a push or a human."""
+        """The harness's one re-run of a head's failed jobs. A run's attempt,
+        read before the POST, is the replay guard; the POST's own 2xx answer
+        is the receipt (GET /runs lags the POST, #433). A refusal raises and
+        repeats each poll, as update-branch's does, until a push or a human."""
         for run_id, observed in action.runs:
             if self.gateway.run_attempt(run_id) > observed:
                 continue
             self.gateway.rerun_failed_checks(run_id)
-            if self.gateway.run_attempt(run_id) <= observed:
-                raise RuntimeError(f"PR #{action.pr}: re-run of run {run_id} was refused or did not land")
             self.log(f"PR #{action.pr}: re-ran the failed jobs of run {run_id} on {action.head[:12]} "
                      "(the harness's one re-run of this head)")
 

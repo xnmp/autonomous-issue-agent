@@ -485,5 +485,10 @@ def test_an_unreadable_run_raises(answer):
 
 def test_a_rerun_posts_the_failed_jobs_rerun():
     fr = FakeRunner({"api --method POST": "{}"})
-    GitHubGateway("o/r", runner=fr).rerun_failed_checks(900)  # the act layer reads the attempt back
+    GitHubGateway("o/r", runner=fr).rerun_failed_checks(900)
     assert fr.calls[0][0][1:] == ["api", "--method", "POST", "repos/o/r/actions/runs/900/rerun-failed-jobs"]
+
+
+def test_a_refused_rerun_post_raises():
+    with pytest.raises(RuntimeError, match="refused"):
+        GitHubGateway("o/r", runner=FakeRunner({"api --method POST": ""})).rerun_failed_checks(900)
