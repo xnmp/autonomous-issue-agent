@@ -22,18 +22,18 @@ STOP = PostComment(Target.ISSUE, 5, "stopped: attempts exhausted", key="needs-hu
 class Gateway:
     def __init__(self, labels=(), lose_reply=False):
         self.labels, self.lose_reply = set(labels), lose_reply
-        self.comments: list[str] = []
+        self.comments: list[tuple[str, str]] = []
         self.posted: list[str] = []
 
     def has_label(self, kind, number, label):
         return label in self.labels
 
-    def has_comment(self, kind, number, body):
-        return body in self.comments
+    def has_comment(self, kind, number, body, author):
+        return (author, body) in self.comments
 
     def comment(self, kind, number, body):
         self.posted.append(body)
-        self.comments.append(body)
+        self.comments.append(("fixer", body))
         if self.lose_reply:
             self.lose_reply = False
             raise RuntimeError("the comment landed; its reply was lost")
@@ -49,6 +49,7 @@ def _act(tmp_path, gateway) -> GitHubAct:
         base_branch="dev",
         merge_method="squash",
         marker="m",
+        bot="fixer",
         dispatch=lambda _a: None,
         remove_worktree=lambda _i: None,
         log=lambda _m: None,
@@ -85,10 +86,10 @@ def test_a_comment_whose_presence_cannot_be_read_is_not_posted_again(tmp_path):
     class Unreadable(Gateway):
         reply: object = "readable"
 
-        def has_comment(self, kind, number, body):
+        def has_comment(self, kind, number, body, author):
             if self.reply == "readable":
-                return super().has_comment(kind, number, body)
-            return GitHubGateway.has_comment(SimpleNamespace(_view=lambda *a: self.reply), kind, number, body)
+                return super().has_comment(kind, number, body, author)
+            return GitHubGateway.has_comment(SimpleNamespace(_view=lambda *a: self.reply), kind, number, body, author)
 
     gh = Unreadable(labels={Label.NEEDS_HUMAN.value})
     act = _act(tmp_path, gh)
@@ -97,7 +98,7 @@ def test_a_comment_whose_presence_cannot_be_read_is_not_posted_again(tmp_path):
         gh.reply = reply
         with pytest.raises(FixObservationIncomplete):
             act.execute(STOP)
-    gh.reply = {"comments": [None, 7, {"body": STOP.body}]}  # junk entries beside the real one
+    gh.reply = {"comments": [None, 7, {"body": STOP.body, "author": {"login": "fixer"}}]}  # junk entries beside the real one
     act.execute(STOP)
     assert gh.posted == [STOP.body]
 
@@ -142,7 +143,7 @@ def test_a_deleted_triage_comment_is_posted_again_so_the_issue_reaches_resolve(t
     gh.comments.clear()  # a human deletes it; derive keeps returning TriageNote
     act.execute(action)
     act.execute(action)  # present again: nothing more
-    assert gh.posted == [action.body, action.body] and gh.comments == [action.body]
+    assert gh.posted == [action.body, action.body] and gh.comments == [("fixer", action.body)]
 
 
 # ── a steward's "blocked by" claim ───────────────────────────────────────────
@@ -611,3 +612,17 @@ def test_a_refused_rerun_raises_after_journaling_the_runs_that_landed(tmp_path):
         _rerun_act(tmp_path, gh, lines).execute(RerunFailedJobs(7, "h1", ((900, 1), (901, 1))))
     assert [x for x in lines if "re-ran" in x] == [
         "PR #7: re-ran the failed jobs of run 900 on h1 (the harness's one re-run of this head)"]
+
+
+def test_a_stop_comment_left_by_a_previous_bot_login_is_posted_again_under_the_current_one(tmp_path):
+    """#424: FIX_BOT changed after the stop comment landed. The old copy reads
+    as human, so the item would never release; it is posted afresh."""
+    gh = Gateway(labels={Label.NEEDS_HUMAN.value})
+    act = _act(tmp_path, gh)
+    act.execute(STOP)
+    gh.comments = [("old-fixer", STOP.body)]  # the login changed between ticks
+    act.execute(STOP)
+    act.execute(STOP)
+
+    assert gh.posted == [STOP.body, STOP.body]
+    assert ("fixer", STOP.body) in gh.comments

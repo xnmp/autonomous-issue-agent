@@ -97,6 +97,7 @@ class GitHubAct:
         base_branch: str,
         merge_method: str,
         marker: str,
+        bot: str,
         dispatch: Callable[[RunAgent], None],
         remove_worktree: Callable[[int], None],
         log: Callable[[str], None],
@@ -107,6 +108,7 @@ class GitHubAct:
         self.base_branch = base_branch
         self.merge_method = merge_method
         self.marker = marker
+        self.bot = bot
         self.dispatch = dispatch
         self.remove_worktree = remove_worktree
         self.log = log
@@ -216,19 +218,22 @@ class GitHubAct:
             raise RuntimeError(f"{kind} #{action.number}: stop comment withheld until needs-human is applied")
         key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
         state = self.control.claim_key(key) if action.key else "new"
-        # GitHub, not the key, says whether the comment is there. A confirmed
+        # GitHub, not the key, says whether the comment is there, under the
+        # current FIX_BOT: a copy under a previous login reads as human
+        # (Harness.wrote), so it is posted again rather than trusted (#424).
+        # A confirmed
         # key is a read-back that once saw it, so a fresh read that does not is
         # a deletion (derive asks again when its own, possibly stale,
         # observation lacks the comment, and it may lack it while it is there); a claimed key may have landed unseen.
         if state != "new":
-            if self.gateway.has_comment(kind, action.number, action.body):
+            if self.gateway.has_comment(kind, action.number, action.body, self.bot):
                 self.control.confirm_key(key)
                 return
             if state == "done":
                 self.log(f"{kind} #{action.number}: comment {action.key} was deleted; posting it again")
         self.gateway.comment(kind, action.number, action.body)
         if action.key:
-            if not self.gateway.has_comment(kind, action.number, action.body):
+            if not self.gateway.has_comment(kind, action.number, action.body, self.bot):
                 raise RuntimeError(f"{kind} #{action.number}: comment {action.key} not confirmed")
             self.control.confirm_key(key)
 
@@ -275,7 +280,7 @@ class GitHubAct:
             # human deleted it). Say once more that the matter is closed, so
             # derive moves on; the link itself is never touched again.
             closed = blocker_closed_comment(self.marker, action.blocker)
-            if not self.gateway.has_comment("issue", action.issue, closed):
+            if not self.gateway.has_comment("issue", action.issue, closed, self.bot):
                 self.log(f"issue #{action.issue}: closing comment for {action.key} not found; posting it")
                 self.gateway.comment("issue", action.issue, closed)
             return
@@ -290,9 +295,9 @@ class GitHubAct:
         if refusal:
             self.log(f"issue #{action.issue}: steward's blocked-by #{action.blocker} refused: {refusal}")
         body = blocker_comment(self.marker, action.blocker, action.reason, refusal)
-        if not self.gateway.has_comment("issue", action.issue, body):
+        if not self.gateway.has_comment("issue", action.issue, body, self.bot):
             self.gateway.comment("issue", action.issue, body)
-            if not self.gateway.has_comment("issue", action.issue, body):
+            if not self.gateway.has_comment("issue", action.issue, body, self.bot):
                 raise RuntimeError(f"issue #{action.issue}: blocked-by comment not confirmed")
         self.control.confirm_key(key)
 

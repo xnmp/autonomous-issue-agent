@@ -68,6 +68,9 @@ Important fields:
   of that repository runs again. Prefer a different `--name` for another
   repository.
 - `FIX_BOT` must differ from `REVIEW_BOT`.
+  Changing either login re-posts a stop comment under the new login on the next tick (a copy under the old
+  login reads as human); older harness comments under the old login then count as human replies, so
+  prefer draining in-flight items first (#424).
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
 - `FIXER_RUNTIME=claude|codex`;
