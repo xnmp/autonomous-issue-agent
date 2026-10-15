@@ -875,10 +875,10 @@ class GitHubGateway:
         (never a silent wait). A failed request skips the tick, as it did when
         the tip rode the combined read: a timeout answered as GraphQL errors
         must not charge the base's red to every PR. With `filer`: the base's
-        push runs, the repository's workflows and the base-CI issues `filer`
-        opened, open and closed, read together (nothing is filed or changed
-        unless all are read); the required workflows, from the branch policy
-        and the tip's check runs (#402), None when unread."""
+        push runs and the base-CI issues `filer` opened, open and closed, read
+        together (nothing is filed or changed unless both are); the required
+        workflows, from the branch policy and the tip's check runs (#402), and
+        the repository's active workflows (#449), each None when unread."""
         raw = self._repository_page(_BASE_TIP, base=base).get("baseTip")
         try:
             if (not isinstance(raw, dict) or raw.get("name") != base or not isinstance(raw.get("target"), dict)
@@ -897,13 +897,13 @@ class GitHubGateway:
         if not filer:
             return BaseHealth(base, reports)
         try:
-            runs = base_runs(self._gh_json([
+            listing = self._gh_json([
                 "api", f"repos/{self.repo}/actions/runs?branch={quote(base, safe='')}&event=push"
-                       f"&exclude_pull_requests=true&per_page=100"]), base)
+                       f"&exclude_pull_requests=true&per_page=100"])
+            runs = base_runs(listing, base)
             issues = base_issues(self._graphql(_BASE_ISSUES, q=(
                 f'repo:{self.repo} is:issue author:{filer} in:title "failing on {base}" sort:created-desc'))
                 .get("search"), filer)
-            workflows = active_workflows(self._gh_json(["api", f"repos/{self.repo}/actions/workflows?per_page=100"]))
         except (ValueError, KeyError, TypeError, GhUnavailable) as exc:
             # An optional read: GitHub not answering it must not cost the tick its merges and dispatches.
             sys.stderr.write(f"base CI unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
@@ -913,6 +913,12 @@ class GitHubGateway:
         except Exception as exc:  # noqa: BLE001 - an unread policy readies nothing, as in observe_checks
             sys.stderr.write(f"base required workflows unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
             required = None
+        try:
+            workflows = active_workflows(self._gh_json(["api", f"repos/{self.repo}/actions/workflows?per_page=100"]),
+                                         listing)
+        except (ValueError, GhUnavailable) as exc:  # an optional read: an unread listing closes nothing
+            sys.stderr.write(f"workflows unread this poll ({exc})\n")
+            workflows = None
         return BaseHealth(base, reports, runs, issues, required, workflows)
 
     def create_issue(self, title: str, body: str) -> Accepted | Refused:

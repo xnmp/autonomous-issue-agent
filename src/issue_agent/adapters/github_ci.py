@@ -154,13 +154,18 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 
-def active_workflows(payload) -> frozenset[str] | None:
+def active_workflows(payload, listing) -> frozenset[str] | None:
     """The names of the repository's active workflows, from one page of its
     listing; None (no issue is closed as orphaned, #449) when a row is
-    malformed or the page is short of the count."""
+    malformed, the page is short of the count, or a workflow is named apart
+    from its runs in the base's run `listing` (its name may be another
+    branch's: a rename on its way)."""
     rows = payload.get("workflows") if isinstance(payload, dict) else None
     if (not isinstance(rows, list) or type(payload.get("total_count")) is not int or len(rows) != payload["total_count"]
             or any(not isinstance(r, dict) or not isinstance(r.get("name"), str) for r in rows)):
+        return None
+    named = {r.get("path"): r["name"] for r in rows}
+    if any(named.get(r.get("path"), r.get("name")) != r.get("name") for r in listing["workflow_runs"] if r.get("event") == "push"):
         return None
     return frozenset(r["name"] for r in rows if r.get("state") == "active")
 

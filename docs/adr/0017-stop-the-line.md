@@ -90,21 +90,36 @@ identify a failure the same way:
 
 - An Actions job on the tip is base evidence only from a **push** run that is
   running or ended red or green. On a fast-forwarded tip the rollup also
-  lists the PR's `pull_request` runs; and a cancelled run's aggregate jobs
-  report FAILURE where the listing reports no verdict (tauri-explorer
-  `156de47`, 2026-10-15). A PR therefore waits as BaseRed on an Actions job
-  only when a red push run, and so a base-CI issue, stands behind it. Commit
-  statuses and other apps' checks are charged as before and have no issue.
+  lists the PR's `pull_request` runs, and a cancelled run's aggregate jobs
+  report FAILURE where the listing has no verdict (tauri-explorer `156de47`,
+  2026-10-15). A settled BaseRed on an Actions job is so backed by a red
+  push run, hence an issue; while that run (or its re-run) is in flight the
+  issue may not be filed yet. Accepted trade-off: a job that really failed
+  before its run was cancelled is the PR's, and a repair may be paid for it.
+  Commit statuses and other apps' checks are charged as before and have no
+  issue.
 - A run being **re-run** has no conclusion and dropped out of the completed
   listing, so the older run read as the latest: a green one closed the
-  streak's issue, and the re-run's failure (the same run, completed before
-  that close) filed nothing. The listing now keeps a run being re-run, and
-  its workflow has no verdict until the re-run ends.
+  streak's issue, and the re-run's failure filed nothing. The listing keeps
+  a run being re-run, and its workflow has no verdict until the re-run ends
+  or a newer run of the workflow completes.
+- **Refiling is anchored on creation, not completion.** Superseding the
+  completion-time rule above: after the workflow's last issue closed (any
+  title, a legacy one too), the next issue is filed by the first failing run
+  created at or after what ended it. A close by green (the workflow's latest
+  verdict by the close was green) is anchored on that green run's creation,
+  so a red run overlapping it still files; any other close (a human,
+  `Closes #` on a merge into the default branch) is anchored on the close, so
+  a run that tested pre-fix code never files. Incident: tauri #1150, a legacy
+  issue closed by #1178's merge at 11:55:46Z; the next tick refiled the
+  streak as #1179 from a run of `e6daf55`.
 - An open base-CI issue whose workflow is neither in the listed runs nor
   among the repository's active workflows is **closed** (renamed, removed or
-  disabled). The 100 listed runs span hours, so a path-filtered workflow is
-  often absent from them; the workflow listing alone is not enough either, as
-  a run's name is what titles the issue. Unread workflows close nothing.
+  disabled), unless it carries `needs-human`. The 100 listed runs span hours,
+  so a path-filtered workflow is often absent from them. A workflow listing
+  that names a workflow apart from its runs on the base (a rename not yet on
+  the branch the listing reads) is unread, and unread workflows close
+  nothing.
 
 Provenance: the workflow listing (`actions/workflows`) is the repository's
 workflow files, under write access. The close is read back like the green

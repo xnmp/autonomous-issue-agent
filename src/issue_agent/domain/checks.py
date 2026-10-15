@@ -120,6 +120,7 @@ class BaseHealth:
 
     def __post_init__(self) -> None:
         if (not isinstance(self.ref, str) or not self.ref
-                or self.reports is not None and any(not isinstance(c, Check) for c in self.reports)
-                or self.runs is None and (self.issues or self.required is not None or self.workflows is not None)):
+                or self.reports is not None and (not isinstance(self.reports, tuple)
+                                                 or any(not isinstance(c, Check) for c in self.reports))
+                or self.runs is not None and not isinstance(self.runs, tuple) or self.runs is None and (self.issues or self.required is not None or self.workflows is not None)):
             raise ValueError("base health needs a ref, typed reports, and its runs with its issues")

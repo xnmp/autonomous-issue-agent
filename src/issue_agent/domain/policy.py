@@ -135,10 +135,10 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     """One issue per workflow per red streak on the base branch, required or
     not (#402, ADR 0017). Green closes the workflow's open issues. A red
     verdict with none open files one, named and keyed by the streak's first
-    failing run; once an issue filed for this streak is closed while it stays
-    red (a human, a fix's merge), by the first failing run that completed
-    after that close. A close by the green before the streak never holds it
-    back. An open issue whose harness PR merged (`merged`: issue -> merged at;
+    failing run created at or after whatever ended the workflow's last closed
+    issue (legacy titles too, `_ended`): a green run, or else the close (a
+    human, a fix's merge), so a run that tested pre-fix code never files. An
+    open issue whose harness PR merged (`merged`: issue -> merged at;
     a fix into a non-default base that `Closes #` does not close) has ended
     once a failing run created at or after the merge has completed: that run
     files the next issue, and the ended issue is closed only once another
@@ -149,8 +149,8 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     workflow's open issue is readied (`ai-ready`) unless it carries
     `ai-ready` or `needs-human` (`labels`, of the open issues the fix role
     reads). An open issue whose workflow is neither listed in the base's runs
-    nor among the repository's workflows is closed (#449): renamed or removed,
-    it would never pass."""
+    nor among the repository's workflows is closed (#449) unless it carries
+    `needs-human`: renamed or removed, it would never pass."""
     if health is None or health.runs is None:
         return ()
     base = health.ref
@@ -164,7 +164,7 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
             continue
         streak = sorted((r for r in health.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
                          and _created(r) >= _created(since)), key=_created)
-        closed = {i.title: at for i in issues if (at := parse_timestamp(i.closed_at))}
+        closed = {i.title for i in issues if i.closed_at}
         failed = {i.number: next((r for r in streak if _created(r)[0] >= at), None) for i in opened
                   if (at := parse_timestamp(merged.get(i.number, ""))) and Label.NEEDS_HUMAN not in labels.get(
                       i.number, frozenset())}
@@ -174,13 +174,13 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
                                                f"after it: {r.url}. That failure has an issue of its own.")
                        for n, r in sorted(ended.items()))
             continue
-        after = max((closed[t] for r in streak if (t := base_title(latest.workflow, base, r.head_sha)) in closed),
+        after = max((_ended(at, latest.workflow, health.runs) for i in issues if (at := parse_timestamp(i.closed_at))),
                     default=None)
         first = min(ended.values(), key=_created) if ended else next((
-            r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed and (
-                after is None or (parse_timestamp(r.completed_at) or after) >= after)), None)
+            r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
+            and (after is None or _created(r)[0] >= after)), None)
         if first is None:
-            continue  # closed after every listed failure of the streak: the next failing run files
+            continue  # every listed failure predates what ended the last issue: the next failing run files
         title = base_title(latest.workflow, base, first.head_sha)
         lead = "Earliest listed" if first == since and not bounded else "First"
         out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {lead} failing run: {first.url} "
@@ -193,11 +193,23 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
         out.extend(SetIssueState(i.number, False, f"{marker}\nNo workflow of this repository runs under this issue's "
                                                   f"name on `{base}` any more (renamed, removed or disabled), so it "
                                                   "would never pass here.")
-                   for i in health.issues if not i.closed_at and i.number not in live and shape.fullmatch(i.title))
+                   for i in health.issues if not i.closed_at and i.number not in live and shape.fullmatch(i.title)
+                   and Label.NEEDS_HUMAN not in labels.get(i.number, frozenset()))
     admitted = {n for n, held in labels.items() if Label.AI_READY in held or Label.NEEDS_HUMAN in held}
     out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
                for n in sorted(base_fix(health) - admitted))
     return tuple(out)
+
+
+def _ended(closed_at: datetime, workflow: str, runs: Iterable[BaseRun]) -> datetime:
+    """How new the code was that ended a base-CI issue closed at `closed_at`:
+    a green close's run, if the workflow's latest verdict by then was green
+    (a red run created after it, overlapping its close, still files);
+    otherwise the close itself (a human, `Closes #` on a merge), so a run
+    created before a merged fix never files (tauri #1150 -> #1179)."""
+    done = max((r for r in runs if r.workflow == workflow and r.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS
+                and (at := parse_timestamp(r.completed_at)) is not None and at <= closed_at), key=_created, default=None)
+    return _created(done)[0] if done is not None and done.conclusion in GREEN_CONCLUSIONS else closed_at
 
 
 def _created(run: BaseRun) -> tuple[datetime, int]:

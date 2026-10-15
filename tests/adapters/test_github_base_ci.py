@@ -175,17 +175,22 @@ def test_only_the_fixers_issues_count_whatever_the_login_case():
                                           "fix-bot")] == [1]
 
 
-@pytest.mark.parametrize("read", ["/actions/runs?", "/actions/workflows?"])
-def test_github_not_answering_the_base_ci_read_leaves_it_unread_and_the_tick_goes_on(read):
-    github = GitHub()
-
+def _unanswered(github, read):
     def runner(argv, token):
         if any(read in a for a in argv):
             raise GhUnavailable("rate-limit", "API rate limit exceeded", argv=argv)
         return github(argv, token)
+    return GitHubGateway("o/r", runner=runner).build_world("dev", filed_by="fix-bot")
 
-    world = GitHubGateway("o/r", runner=runner).build_world("dev", filed_by="fix-bot")
+
+def test_github_not_answering_the_base_ci_read_leaves_it_unread_and_the_tick_goes_on():
+    world = _unanswered(GitHub(), "/actions/runs?")
     assert world.base.runs is None and world.issues == ()
+
+
+def test_github_not_answering_the_workflow_listing_costs_the_base_ci_read_nothing_else():
+    base = _unanswered(GitHub(runs={"total_count": 1, "workflow_runs": [run_row()]}), "/actions/workflows?").base
+    assert base.workflows is None and base.runs is not None and len(base.runs) == 1
 
 
 # ── #442: the tip's evidence is what base-CI issues are filed from ─────────
@@ -225,7 +230,8 @@ def test_a_run_being_re_run_is_listed_without_a_verdict_and_a_first_attempt_runn
 
 def _workflows(*rows, count=None) -> dict:
     return {"total_count": len(rows) if count is None else count,
-            "workflows": [{"id": i, "name": name, "state": state} for i, (name, state) in enumerate(rows)]}
+            "workflows": [{"id": i, "name": name, "path": f".github/workflows/w{i}.yml", "state": state}
+                          for i, (name, state) in enumerate(rows)]}
 
 
 def test_the_repositorys_active_workflows_are_read_with_the_base():
@@ -245,4 +251,12 @@ def test_an_unusable_workflow_listing_closes_nothing_and_the_rest_of_the_base_st
 
 
 def test_a_workflow_listing_of_any_size_parses_within_its_page():
-    assert len(active_workflows(_workflows(*((f"w{i}", "active") for i in range(100))))) == 100
+    assert len(active_workflows(_workflows(*((f"w{i}", "active") for i in range(100))), _NO_RUNS)) == 100
+
+
+def test_a_workflow_named_apart_from_its_runs_on_the_base_leaves_the_listing_unread():
+    # Renamed on the base before the default branch: the listing's name may be the default branch's.
+    listing = {"workflow_runs": [{**run_row("Smoke2"), "path": ".github/workflows/w0.yml"}]}
+    assert active_workflows(_workflows(("Smoke", "active")), listing) is None
+    assert active_workflows(_workflows(("Smoke2", "active")), listing) == frozenset({"Smoke2"})
+    assert active_workflows(_workflows(("Smoke", "active")), {"workflow_runs": [run_row("Smoke2")]}) == {"Smoke"}

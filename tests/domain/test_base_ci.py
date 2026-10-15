@@ -93,14 +93,39 @@ def test_a_green_close_never_holds_back_a_red_run_that_overlapped_it():
         assert filed.title == f"{PREFIX} since sha2"
 
 
-def test_after_a_close_mid_streak_a_failure_completing_at_or_after_it_files():
+def test_after_a_close_mid_streak_only_a_failure_created_at_or_after_it_files():
     issues = [BaseIssue(40, f"{PREFIX} since sha1", "2026-10-14T10:21:00Z")]  # closed by its fix's merge
     first = _run(1, "failure", "09:00:00", "09:30:00")
     assert _act(first, _run(2, "failure", "10:00:00", "10:20:59"), issues=issues) == ()  # finished before the close
     (filed,) = _act(first, _run(3, "failure", "10:21:00", "10:21:00"), issues=issues)  # same second as the close
     assert filed.title == f"{PREFIX} since sha3"
-    (filed,) = _act(first, _run(4, "failure", "10:00:00", "10:50:00"), issues=issues)  # running across the close
-    assert filed.title == f"{PREFIX} since sha4"
+    # Running across the close, it tested code from before the fix (#442, tauri #1150 -> #1179).
+    assert _act(first, _run(4, "failure", "10:00:00", "10:50:00"), issues=issues) == ()
+
+
+# Tauri, 2026-10-15 (UTC): a legacy issue was fixed by a PR merged at 11:55:45 into the default branch,
+# whose `Closes #` closed it at 11:55:46; 20 s later the harness filed the streak again from an old run.
+MERGE_CLOSED = "2026-10-15T11:55:46Z"
+
+
+def _tauri(run: int, conclusion: str, created: str, completed: str) -> BaseRun:
+    return BaseRun("macOS Smoke", run, f"https://x/runs/{run}", f"sha{run}", conclusion,
+                   f"2026-10-15T{created}Z", f"2026-10-15T{completed}Z")
+
+
+OLD_RED = (_tauri(1, "failure", "01:41:50", "02:39:57"), _tauri(2, "failure", "02:45:40", "03:26:13"))
+IN_FLIGHT = _tauri(3, "failure", "11:50:00", "12:20:00")  # created before the merge, red after the close
+MERGE_RUN = "11:55:47"  # the merge commit's own run
+
+
+def test_a_merge_closing_the_streaks_issue_files_nothing_until_the_merges_own_run_fails():
+    for title in (PREFIX, f"{PREFIX} since sha1"):  # the incident's legacy title, and a streak title
+        issues = [BaseIssue(40, title, MERGE_CLOSED)]
+        assert _act(*OLD_RED, issues=issues) == ()
+        assert _act(*OLD_RED, IN_FLIGHT, issues=issues) == ()
+        (filed,) = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", MERGE_RUN, "12:30:00"), issues=issues)
+        assert filed.title == f"{PREFIX} since sha4"
+        assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", MERGE_RUN, "12:30:00"), issues=issues) == ()
 
 
 MERGED_AT = "2026-10-14T10:00:00Z"
@@ -204,8 +229,9 @@ def test_base_health_reads_issues_and_workflows_only_with_the_runs():
     for part in ({"issues": (BaseIssue(40, PREFIX),)}, {"required": frozenset()}, {"workflows": frozenset()}):
         with pytest.raises(ValueError):
             BaseHealth("dev", **part)
-    with pytest.raises(ValueError):
-        BaseHealth("")
+    for malformed in ({"ref": ""}, {"ref": "dev", "reports": []}, {"ref": "dev", "runs": []}):
+        with pytest.raises(ValueError):
+            BaseHealth(**malformed)
 
 
 # ── a renamed or removed workflow's issue (#449) ─────────────────────────────
@@ -231,6 +257,8 @@ def test_an_issue_is_kept_while_its_workflow_exists_runs_or_cannot_be_read():
     # listed in the base's runs but not by that name in the repository's workflows
     assert _closes(_act(_br(2, "failure"), issues=[smoke], workflows=frozenset())) == []
     assert _act(_br(2, "success", name="Lint"), issues=[OLD]) == ()  # the workflows are unread
+    assert _act(_br(2, "success", name="Lint"), issues=[OLD], workflows=frozenset(),
+                labels={40: frozenset({Label.NEEDS_HUMAN})}) == ()  # a human holds it
 
 
 def test_only_this_bases_open_base_ci_issues_are_closed_as_orphaned():
