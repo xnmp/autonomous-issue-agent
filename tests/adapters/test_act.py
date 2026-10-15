@@ -1,5 +1,6 @@
-"""The act layer's keyed comment: claimed in SQLite before the write and
-confirmed by a read-back after it, so a lost reply or a replay never posts
+"""The act layer's keyed writes: claimed in SQLite before the write and
+settled by GitHub's answer (#440), read back only when the answer was lost
+or a settled write was deleted, so a lost reply or a replay never posts
 twice, and a stop comment never lands on an item that is not yet stopped."""
 
 import uuid
@@ -9,7 +10,7 @@ import pytest
 
 from issue_agent.adapters.act import GitHubAct
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.github import BlockerLinkFacts, FixObservationIncomplete, GhUnavailable
+from issue_agent.adapters.github import Accepted, BlockerLinkFacts, FixObservationIncomplete, GhUnavailable, Refused
 from issue_agent.domain.actions import AgentKind, LinkBlockedBy, OpenPullRequest, PostComment, Target
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.labels import Label
@@ -20,23 +21,32 @@ STOP = PostComment(Target.ISSUE, 5, "stopped: attempts exhausted", key="needs-hu
 
 
 class Gateway:
+    """GitHub's comments. `lose_reply`: the next comment lands but its answer
+    is lost (NoAnswer); `refuse`: GitHub answers every comment with it and
+    writes nothing; `lag`: reads do not show the writes yet."""
+
     def __init__(self, labels=(), lose_reply=False):
         self.labels, self.lose_reply = set(labels), lose_reply
         self.comments: list[tuple[str, str]] = []
         self.posted: list[str] = []
+        self.refuse: Refused | None = None
+        self.lag = False
 
     def has_label(self, kind, number, label):
         return label in self.labels
 
     def has_comment(self, kind, number, body, author):
-        return (author, body) in self.comments
+        return not self.lag and (author, body) in self.comments
 
     def comment(self, kind, number, body):
         self.posted.append(body)
+        if self.refuse is not None:
+            return self.refuse
         self.comments.append(("fixer", body))
         if self.lose_reply:
             self.lose_reply = False
-            raise RuntimeError("the comment landed; its reply was lost")
+            raise GhUnavailable("network", "the comment landed; its reply was lost")
+        return Accepted(len(self.comments))
 
 
 def _act(tmp_path, gateway) -> GitHubAct:
@@ -59,7 +69,7 @@ def _act(tmp_path, gateway) -> GitHubAct:
 def test_a_keyed_comment_lands_once_across_a_lost_reply_and_later_replays(tmp_path):
     gh = Gateway(labels={Label.NEEDS_HUMAN.value}, lose_reply=True)
     act = _act(tmp_path, gh)
-    with pytest.raises(RuntimeError, match="reply was lost"):
+    with pytest.raises(GhUnavailable, match="reply was lost"):
         act.execute(STOP)
     act.execute(STOP)  # the claimed key reads the landed comment back
     act.execute(STOP)  # derive asks again on a stale observation: the comment is there
@@ -110,6 +120,81 @@ def test_a_stop_comment_is_withheld_until_its_needs_human_label_is_on_the_item(t
     assert gh.posted == []
 
 
+def test_an_accepted_comment_is_settled_by_its_answer_however_far_the_read_lags(tmp_path):
+    gh, logs = Gateway(labels={Label.NEEDS_HUMAN.value}), []
+    act = _act(tmp_path, gh)
+    act.log = logs.append
+    gh.lag = True  # #433's class: the comment read lags the POST
+    act.execute(STOP)  # no raise: the 201 is the receipt
+    gh.lag = False
+    act.execute(STOP)  # derive asks again on a stale observation: it is there
+    assert gh.posted == [STOP.body] and logs == []
+
+
+def test_a_refused_comment_is_settled_once_with_one_line_and_not_retried_by_act(tmp_path):
+    gh, logs = Gateway(labels={Label.NEEDS_HUMAN.value}), []
+    gh.refuse = Refused(403, "Unable to create comment because issue is locked.")
+    act = _act(tmp_path, gh)
+    act.log = logs.append
+    act.execute(STOP)  # no raise: GitHub answered, and repeating it changes nothing
+    assert gh.posted == [STOP.body]
+    assert logs == [f"issue #5: comment {STOP.key}: GitHub refused it (HTTP 403), settled: "
+                    "Unable to create comment because issue is locked."]
+
+
+def test_an_unanswered_comment_that_never_landed_is_posted_on_the_next_tick(tmp_path):
+    class Lost(Gateway):
+        def comment(self, kind, number, body):
+            self.posted.append(body)
+            if len(self.posted) == 1:
+                raise GhUnavailable("network", "gh timed out")  # before GitHub saw it
+            return super().comment(kind, number, body)
+
+    gh = Lost(labels={Label.NEEDS_HUMAN.value})
+    act = _act(tmp_path, gh)
+    with pytest.raises(GhUnavailable):
+        act.execute(STOP)
+    act.execute(STOP)
+    act.execute(STOP)
+    assert gh.comments == [("fixer", STOP.body)]
+
+
+def test_a_crash_before_the_post_leaves_a_claim_that_the_next_tick_writes_once(tmp_path):
+    class Crashing(Gateway):
+        crash = True
+
+        def comment(self, kind, number, body):
+            if self.crash:
+                self.crash = False
+                raise KeyboardInterrupt  # the process dies after the claim, before the POST
+            return super().comment(kind, number, body)
+
+    gh = Crashing(labels={Label.NEEDS_HUMAN.value})
+    act = _act(tmp_path, gh)
+    with pytest.raises(KeyboardInterrupt):
+        act.execute(STOP)
+    act.execute(STOP)
+    act.execute(STOP)
+    assert gh.posted == [STOP.body]
+
+
+def test_a_crash_between_the_answer_and_the_confirm_is_read_back_not_posted_twice(tmp_path):
+    gh = Gateway(labels={Label.NEEDS_HUMAN.value})
+    act = _act(tmp_path, gh)
+    confirm = act.control.confirm_key
+
+    def crash(key):
+        act.control.confirm_key = confirm
+        raise KeyboardInterrupt  # the POST was answered; the process dies before the confirm
+
+    act.control.confirm_key = crash
+    with pytest.raises(KeyboardInterrupt):
+        act.execute(STOP)
+    act.execute(STOP)
+    act.execute(STOP)
+    assert gh.posted == [STOP.body]
+
+
 def test_the_triage_comment_posts_once_however_often_derive_asks_for_it(tmp_path):
     from issue_agent.domain.policy import triage_comment
     from issue_agent.domain.routing import Tier
@@ -121,7 +206,7 @@ def test_the_triage_comment_posts_once_however_often_derive_asks_for_it(tmp_path
                          key=f"triage:issue:5:{note.anchor}")
     gh = Gateway(lose_reply=True)
     act = _act(tmp_path, gh)
-    with pytest.raises(RuntimeError, match="reply was lost"):
+    with pytest.raises(GhUnavailable, match="reply was lost"):
         act.execute(action)
     act.execute(action)
     act.execute(action)  # an observation that lags the post asks again
@@ -166,6 +251,7 @@ class LinkGateway(Gateway):
     def add_blocked_by(self, issue_id, blocker_id):
         self.mutations.append((issue_id, blocker_id))
         self.linked = not self.drop_link
+        return Accepted()
 
 
 def test_a_valid_claim_is_linked_read_back_and_explained_once(tmp_path):
@@ -207,17 +293,16 @@ def test_a_claim_fresh_reads_refuse_is_never_linked_and_says_why(tmp_path, facts
     assert "did not link" in gh.posted[0]
 
 
-def test_a_link_that_does_not_read_back_raises_and_posts_nothing(tmp_path):
-    gh = LinkGateway(drop_link=True)
-    with pytest.raises(RuntimeError, match="not confirmed"):
-        _act(tmp_path, gh).execute(LINK)
-    assert gh.posted == []
+def test_an_accepted_link_is_explained_as_linked_though_the_link_read_lags(tmp_path):
+    gh = LinkGateway(drop_link=True)  # the mutation's answer is accepted; a read would not show it yet
+    _act(tmp_path, gh).execute(LINK)
+    assert gh.mutations == [("I5", "I4")] and gh.posted == [blocker_comment("m", 4, LINK.reason)]
 
 
 def test_a_lost_comment_reply_is_read_back_on_the_retry_and_the_link_not_rewritten(tmp_path):
     gh = LinkGateway(lose_reply=True)
     act = _act(tmp_path, gh)
-    with pytest.raises(RuntimeError, match="reply was lost"):
+    with pytest.raises(GhUnavailable, match="reply was lost"):
         act.execute(LINK)
     act.execute(LINK)
     assert gh.mutations == [("I5", "I4")] and gh.posted == [blocker_comment("m", 4, LINK.reason)]
@@ -227,7 +312,7 @@ def test_a_link_github_refuses_to_read_or_write_is_explained_once_not_retried_ev
     class Refusing(LinkGateway):
         def add_blocked_by(self, issue_id, blocker_id):
             self.mutations.append((issue_id, blocker_id))
-            raise FixObservationIncomplete("GraphQL answered with errors or no data")
+            return Refused(200, "Could not resolve to a node")
 
     gh = Refusing()
     act = _act(tmp_path, gh)
@@ -263,15 +348,18 @@ def test_an_unreadable_link_read_is_a_refusal_not_a_retry_every_tick(tmp_path):
     assert gh.mutations == [] and len(gh.posted) == 1 and "GitHub would not read or write" in gh.posted[0]
 
 
-def test_a_link_that_lands_before_github_answers_with_an_error_is_reported_as_linked(tmp_path):
-    class LandsThenErrors(LinkGateway):
+def test_an_unanswered_link_that_landed_is_read_back_on_the_next_tick_not_written_again(tmp_path):
+    class LandsUnanswered(LinkGateway):
         def add_blocked_by(self, issue_id, blocker_id):
             super().add_blocked_by(issue_id, blocker_id)
-            raise FixObservationIncomplete("GraphQL answered with errors or no data")
+            raise GhUnavailable("network", "gh timed out")
 
-    gh = LandsThenErrors()
-    _act(tmp_path, gh).execute(LINK)
-    assert gh.linked and gh.posted == [blocker_comment("m", 4, LINK.reason)]
+    gh = LandsUnanswered()
+    act = _act(tmp_path, gh)
+    with pytest.raises(GhUnavailable):
+        act.execute(LINK)
+    act.execute(LINK)
+    assert gh.mutations == [("I5", "I4")] and gh.posted == [blocker_comment("m", 4, LINK.reason)]
 
 
 # --- cancelling the workflow runs a merge left running ---------------------
@@ -283,9 +371,13 @@ from issue_agent.adapters.github import GhUnavailable, GitHubGateway  # noqa: E4
 CUTOFF = "2026-10-14T10:00:00Z"
 
 
+def _http(status: int, body: str = "{}") -> str:
+    return f"HTTP/2.0 {status} X\r\nContent-Type: application/json\r\n\r\n{body}"
+
+
 class _Gh:
-    """A fake `gh` at the runner seam, answering the way the real runner does:
-    a refused cancel (403/409) is an EMPTY answer, an accepted one `{}`."""
+    """A fake `gh` at the runner seam, answering `gh api --include` the way
+    GitHub does: a refused cancel is a 409, an accepted one a 202."""
 
     def __init__(self, runs, *, refused=()):
         self.runs, self.refused = runs, set(refused)
@@ -296,12 +388,12 @@ class _Gh:
         if argv[1] == "api" and "/actions/runs?" in argv[2]:
             self.listed = argv[2]
             return self.runs if isinstance(self.runs, str) else json.dumps({"workflow_runs": self.runs})
-        if argv[1:3] == ["api", "--method"] and argv[4].endswith("/cancel"):
-            run_id = int(argv[4].split("/")[-2])
+        if argv[1:4] == ["api", "--include", "--method"] and argv[5].endswith("/cancel"):
+            run_id = int(argv[5].split("/")[-2])
             if run_id in self.refused:
-                return ""
+                return _http(409, '{"message": "Cannot cancel a workflow run that is completed."}')
             self.cancelled.append(run_id)
-            return "{}"
+            return _http(202)
         raise AssertionError(argv)
 
 
@@ -333,7 +425,7 @@ def test_a_fork_run_on_a_same_named_branch_is_never_cancelled(tmp_path):
     assert gh.cancelled == [2, 3]
 
 
-def test_a_braces_body_is_a_successful_cancel_and_an_empty_answer_a_refusal(tmp_path):
+def test_a_202_is_a_successful_cancel_and_a_409_a_refusal(tmp_path):
     assert _cancel(tmp_path, _Gh([_run(1, "queued")])) == ["PR #7: cancelled 1/1 workflow runs left on the merged branch"]
     assert "0/1" in _cancel(tmp_path, _Gh([_run(1, "queued")], refused={1}))[0]
 
@@ -347,7 +439,7 @@ def test_a_refused_cancel_is_logged_once_and_the_rest_still_cancel(tmp_path):
 def test_a_throttled_github_stops_the_cancel_loop(tmp_path):
     class Throttled(_Gh):
         def __call__(self, argv, token):
-            if argv[1:3] == ["api", "--method"]:
+            if argv[1:4] == ["api", "--include", "--method"]:
                 self.cancelled.append(-1)
                 raise GhUnavailable("rate-limit", "slow down")
             return super().__call__(argv, token)
@@ -404,7 +496,7 @@ class IssueGateway(Gateway):
         self.issues[number] = IssueView(number, title, body, author="fix-bot")
         if self.lose_reply:
             raise GhUnavailable("timeout", "gh timed out", argv=["gh", "issue", "create"])
-        return number
+        return Accepted(number)
 
     def issue_index(self, limit=300, author=""):
         assert author == "@me"  # only the token's own issues can be the harness's
@@ -436,6 +528,36 @@ def test_a_filed_issue_is_confirmed_once_and_a_lagging_search_never_files_it_aga
     assert [(i.title, i.body, i.labels) for i in gh.issues.values()] == [(FILE.title, FILE.body, frozenset())]
 
 
+def test_a_filing_is_settled_by_its_answer_though_the_listing_lags_and_logged_with_its_number(tmp_path):
+    class Lagging(IssueGateway):
+        lag = True
+
+        def issue_index(self, limit=300, author=""):
+            return () if self.lag else super().issue_index(limit, author)
+
+    gh, logs = Lagging(), []
+    act = _act(tmp_path, gh)
+    act.log = logs.append
+    act.execute(FILE)  # nothing read after the create: the 201 carries #100
+    gh.lag = False
+    act.execute(FILE)
+    assert list(gh.issues) == [100] and logs == [f"issue #100: filed {FILE.title!r}"]
+
+
+def test_a_filing_github_refuses_is_settled_with_one_line(tmp_path):
+    class Refusing(IssueGateway):
+        def create_issue(self, title, body):
+            self.writes.append(("create", 0, title))
+            return Refused(410, "Issues are disabled for this repo")
+
+    gh, logs = Refusing(), []
+    act = _act(tmp_path, gh)
+    act.log = logs.append
+    act.execute(FILE)  # no raise
+    assert gh.writes == [("create", 0, FILE.title)] and gh.issues == {}
+    assert logs == [f"issue {FILE.title!r}: GitHub refused it (HTTP 410), settled: Issues are disabled for this repo"]
+
+
 def test_a_filed_issue_a_human_deleted_or_retitled_is_filed_again_once_and_logged(tmp_path):
     for gone in ("deleted", "retitled"):
         gh, logs = IssueGateway(), []
@@ -451,8 +573,7 @@ def test_a_filed_issue_a_human_deleted_or_retitled_is_filed_again_once_and_logge
         act.execute(FILE)  # derive no longer finds the issue under its title and asks again
         act.execute(FILE)  # its search lags the new filing
         assert [i.author for i in gh.issues.values() if i.title == FILE.title] == ["alice", "fix-bot"]
-        assert [m for m in logs if "filing again" in m] == [
-            f"issue for {FILE.title!r} was deleted or retitled; filing again"]
+        assert [m for m in logs if "deleted" in m] == [f"issue {FILE.title!r} was settled but absent (deleted, or refused before); written again"]
 
 
 def test_a_filing_whose_reply_was_lost_is_found_in_the_issue_listing_not_filed_again(tmp_path):
@@ -511,6 +632,7 @@ class PrGateway:
 
     def open_pull_request(self, branch, base, title, body):
         self.opened.append((branch, base, title, body))
+        return Accepted(100)
 
 
 def _opened_body(tmp_path, *results) -> str:
@@ -549,6 +671,15 @@ def test_without_a_written_description_the_pr_still_names_its_issue(tmp_path, re
     assert _opened_body(tmp_path, *results) == "Closes #5"
 
 
+def test_a_refused_pr_open_raises_with_githubs_reason_and_opens_nothing(tmp_path):
+    class Refusing(PrGateway):
+        def open_pull_request(self, branch, base, title, body):
+            return Refused(422, "No commits between dev and fix/5-null-token")
+
+    with pytest.raises(RuntimeError, match="refused \\(HTTP 422\\) No commits between"):
+        _act(tmp_path, Refusing()).execute(OpenPullRequest(5, "fix/5-null-token"))
+
+
 # ── the harness's one re-run of a head (owner, PR #403) ─────────────────────
 class RunGateway(Gateway):
     """Workflow runs by id -> current attempt; a POST re-run bumps it, but the
@@ -567,9 +698,10 @@ class RunGateway(Gateway):
     def rerun_failed_checks(self, run_id):
         self.reruns.append(run_id)
         if run_id in self.inert_runs:
-            raise RuntimeError(f"run {run_id}: re-run refused")
+            return Refused(403, "Must have admin rights to Repository.")
         if run_id not in self.lagging:
             self.attempts[run_id] += 1
+        return Accepted()
 
 
 def _rerun_act(tmp_path, gh, lines):
@@ -608,10 +740,26 @@ def test_a_refused_rerun_raises_after_journaling_the_runs_that_landed(tmp_path):
 
     gh, lines = RunGateway({900: 1, 901: 1}), []
     gh.inert_runs = {901}
-    with pytest.raises(RuntimeError, match="run 901"):
+    with pytest.raises(RuntimeError, match="run 901: re-run refused \\(HTTP 403\\)"):
         _rerun_act(tmp_path, gh, lines).execute(RerunFailedJobs(7, "h1", ((900, 1), (901, 1))))
     assert [x for x in lines if "re-ran" in x] == [
         "PR #7: re-ran the failed jobs of run 900 on h1 (the harness's one re-run of this head)"]
+
+
+def test_an_unanswered_rerun_raises_and_the_next_tick_rereads_the_attempt_before_posting(tmp_path):
+    from issue_agent.domain.actions import RerunFailedJobs
+
+    class Unanswered(RunGateway):
+        def rerun_failed_checks(self, run_id):
+            super().rerun_failed_checks(run_id)  # GitHub took it
+            raise GhUnavailable("network", "gh timed out")
+
+    gh = Unanswered({900: 1})
+    action = RerunFailedJobs(7, "h1", ((900, 1),))
+    with pytest.raises(GhUnavailable):
+        _rerun_act(tmp_path, gh, []).execute(action)
+    _rerun_act(tmp_path, gh, []).execute(action)  # the new attempt reads back: not posted again
+    assert gh.reruns == [900]
 
 
 def test_a_stop_comment_left_by_a_previous_bot_login_is_posted_again_under_the_current_one(tmp_path):
@@ -660,6 +808,7 @@ class HarnessRepo(IssueGateway):
         if self.lose_reply:
             self.lose_reply = False
             raise GhUnavailable("timeout", "gh timed out", argv=["gh", "issue", "comment"])
+        return Accepted(len(self.comments))
 
 
 class TargetRepo(Gateway):
@@ -768,24 +917,24 @@ def test_a_report_github_refuses_is_settled_with_one_line_and_never_retried(tmp_
 
         def create_issue(self, title, body):
             self.attempts += 1
-            raise FixObservationIncomplete("issue creation answered no issue link")
+            return Refused(410, "Issues are disabled for this repo")
 
     harness, logs = Refusing(), []
     act = _gap_act(tmp_path, harness, logs)
     for _ in range(3):
         act.execute(_gap(5))
     assert harness.attempts == 1 and harness.issues == {}
-    assert [line for line in logs if "not retried" in line] == [
-        f"harness gap {_gap(5).title!r} not reported to {HARNESS}: GitHub refused it, not retried: "
-        "issue creation answered no issue link"]
+    assert logs == [f"harness gap {_gap(5).title!r} in {HARNESS}: GitHub refused it (HTTP 410), settled: "
+                    "Issues are disabled for this repo"]
 
 
 def test_a_recurrence_comment_github_refuses_is_settled_with_one_line_and_never_retried(tmp_path):
-    """A locked issue: `gh` answers, nothing is written, and only the read-back
-    sees it. Retrying would list the harness's issues on every tick forever."""
+    """A locked issue: GitHub answers 403 and writes nothing. Retrying would
+    list the harness's issues on every tick forever."""
     class Locked(HarnessRepo):
         def comment(self, kind, number, body):
             self.posted.append(body)  # attempted, never written
+            return Refused(403, "Unable to create comment because issue is locked.")
 
     harness, logs = Locked(), []
     act = _gap_act(tmp_path, harness, logs)
@@ -794,7 +943,7 @@ def test_a_recurrence_comment_github_refuses_is_settled_with_one_line_and_never_
     for _ in range(3):
         act.execute(_gap(6))
     assert harness.posted == ["m\nseen again on o/r#6"] and harness.reads == reads + 1
-    assert len([line for line in logs if "not retried" in line and "did not read back" in line]) == 1
+    assert len([line for line in logs if "settled" in line and "locked" in line]) == 1
 
 
 def test_a_report_github_does_not_answer_is_retried_next_tick(tmp_path):
@@ -854,3 +1003,10 @@ def test_a_confirmed_gap_report_is_never_derived_again(tmp_path):
     act.execute(asked)
     assert gap_actions(legs, (), target, HARNESS, "m", reported_gaps(act.control)) == ()
     assert len(harness.issues) == 1
+
+
+def test_a_comment_without_an_idempotency_key_cannot_be_asked_for():
+    """Every keyless comment of a repository would share one namespaced key and
+    dedupe the others away, so a keyless comment is unrepresentable."""
+    with pytest.raises(ValueError, match="key is required"):
+        PostComment(Target.ISSUE, 5, "body", key="")

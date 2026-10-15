@@ -10,6 +10,7 @@ import pytest
 
 from issue_agent.adapters import github as gh
 from issue_agent.adapters.github import (
+    Accepted,
     FixObservationIncomplete,
     GhUnavailable,
     GitHubGateway,
@@ -879,12 +880,13 @@ def test_the_link_is_read_in_one_query_and_written_with_add_blocked_by():
         calls.append(argv)
         query = next(a for a in argv if a.startswith("query="))
         if query.startswith("query=mutation"):
-            return json.dumps({"data": {"addBlockedBy": {"issue": {"number": 5}}}})
+            assert argv[1:4] == ["api", "--include", "graphql"]
+            return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps({"data": {"addBlockedBy": {"issue": {"number": 5}}}})
         return json.dumps({"data": {"repository": link_page()}})
 
     gateway = GitHubGateway("o/r", runner=runner)
     assert gateway.blocker_link(5, 4).linked is False
-    gateway.add_blocked_by("I5", "I4")
+    assert gateway.add_blocked_by("I5", "I4") == Accepted()
     read, write = (next(a for a in argv if a.startswith("query=")) for argv in calls)
     assert "subject:issue(number:5)" in read and "blocker:issue(number:4)" in read
     assert "addBlockedBy(input:{issueId:$issue,blockingIssueId:$blocker})" in write

@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/domain/gaps.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
+Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/adapters/github.py src/issue_agent/domain/gaps.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
 
 ## Decision
 
@@ -10,9 +10,9 @@ Agent prompts, repository text, CI output, and agent-written files are
 untrusted claims. They are encoded through `domain/trust.py`; they never
 directly authorize publication. GitHub mutations go through the idempotent act
 layer (`adapters/act.py`): each write is either naturally idempotent and read
-back, or claims an idempotency key in SQLite before writing and confirms it
-after a GitHub read-back. An unknown remote outcome is read back before any
-retry, never blindly repeated.
+back, or claims an idempotency key in SQLite before writing and settles it on
+GitHub's answer (as amended by #440 below). An unknown remote outcome is read
+back before any retry, never blindly repeated.
 
 The shell governor and hooks were deleted in slice 6a (2026-10). Credential
 placement and read-back are the authority. Until agents run without
@@ -104,7 +104,7 @@ repository: the fix role reports a harness defect into the harness's own
 repository (its checkout's GitHub origin) with `FIX_BOT_TOKEN`, through the
 same act layer (`ReportGap`). The key,
 `fix-report:gap:<harness repo>:<target>:<item>:<gap>`, is claimed in SQLite
-before the write and confirmed after a read-back of this token's own issues; a
+before the write and settled by GitHub's answer (#440); a
 confirmed key reaches policy as a local fact and is never asked for again, and
 a new key is refused past `GAP_REPORTS_PER_DAY` claims in a UTC day. No
 agent-written text is published (owner, 2026-10-15): an agent's
@@ -122,9 +122,32 @@ leg's output must not dispatch more legs; a human's `ai-ready` is a deliberate
 act and is honoured. Filing is off, read at each daemon start, when the
 checkout has no GitHub origin or the fix credential cannot file issues there
 (no push, issues off, archived: a clone of someone else's harness files
-nothing upstream); unreadable facts mean off. A report GitHub refuses (an
-answer without the write, or a write that does not read back, as on a locked
-issue) settles its key with one log line; no answer stays
-retryable. Crash points: `tests/adapters/test_act.py` (a claim that never
-landed files; a lost filing reply is found by its body; a lost comment reply
-is read back).
+nothing upstream); unreadable facts mean off. A report GitHub refuses (a 4xx,
+as on a locked issue or with issues disabled) settles its key with one log
+line; no answer stays retryable. Crash points: `tests/adapters/test_act.py` (a
+claim that never landed files; a lost filing reply is found by its body; a
+lost comment reply is read back).
+
+Typed write answers (#440, 2026-10-15) make GitHub's answer to a write its
+receipt. The gateway sends each act-layer write that creates or requests
+something (comment, issue, review, blocked-by link, run cancel and re-run,
+update-branch) as `gh api --include` and reads the HTTP status and headers,
+not gh's error text: a 2xx is `Accepted`, carrying the created object's id
+(comment id, issue number, review id); a 4xx, or a GraphQL answer with
+errors, is `Refused(status, message)`; no status line, a 5xx, a 401 or a rate
+limit raises `GhUnavailable`, the NoAnswer outcome. The comment, issue, gap
+report and blocked-by comment share one `GitHubAct.keyed_write(key, present,
+write)`: claim the key; for a key claimed but never settled (a crash or no
+answer) or settled but since deleted (#395), read GitHub through `present`
+and write only if absent; then settle on the answer. No read follows an
+answer, so a read that lags the write (#433) cannot fail it. A refusal settles
+the key with one log line, and act does not retry it; derive may ask again
+when its observation lacks the effect, and then the settled-but-absent path
+writes once per ask. The naturally idempotent writes (labels, merge,
+close/reopen, PR open) keep their read-backs, and keys and the store are
+unchanged (ADR 0003). Crash points, each a test in
+`tests/adapters/test_act.py`: before the POST (the claim stands and the next
+tick writes once), POST answered but not confirmed (the next tick reads it
+back and does not write), POST unanswered (landed: read back and not written
+again; not landed: written on the next tick), and confirm (a replay of a
+settled key that GitHub still shows writes nothing).

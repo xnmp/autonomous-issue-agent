@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from issue_agent.adapters.github import FixObservationIncomplete, GhUnavailable, GitHubGateway
+from issue_agent.adapters.github import GhUnavailable, GitHubGateway
 from issue_agent.adapters.github_ci import base_issues, base_runs
 
 
@@ -182,17 +182,3 @@ def test_github_not_answering_the_base_ci_read_leaves_it_unread_and_the_tick_goe
 
     world = GitHubGateway("o/r", runner=runner).build_world("dev", filed_by="fix-bot")
     assert world.base_ci is None and world.issues == ()
-
-
-def test_create_issue_returns_the_number_gh_prints_and_refuses_no_link():
-    calls = []
-
-    def runner(argv, _token):
-        calls.append(argv)
-        return "https://github.com/o/r/issues/1234\n" if len(calls) == 1 else ""
-
-    gateway = GitHubGateway("o/r", runner=runner)
-    assert gateway.create_issue("CI: x failing on dev", "body") == 1234
-    assert calls[0][:3] == ["gh", "issue", "create"] and "--label" not in calls[0]
-    with pytest.raises(FixObservationIncomplete):
-        gateway.create_issue("CI: x failing on dev", "body")

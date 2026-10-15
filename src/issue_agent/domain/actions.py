@@ -57,8 +57,11 @@ class PostComment:
     target: Target
     number: int
     body: str
-    # Idempotency key: act posts at most one comment per key. Empty = no dedupe.
-    key: str = ""
+    key: str  # act posts at most one comment per key (#440: every comment is keyed)
+
+    def __post_init__(self) -> None:
+        if not self.key:
+            raise ValueError("a comment's idempotency key is required")
 
 
 @dataclass(frozen=True)
