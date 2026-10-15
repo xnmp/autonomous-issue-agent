@@ -2895,6 +2895,17 @@
             ],
             "title": "Outcome",
             "type": "string"
+          },
+          "question": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Question"
           }
         },
         "required": [

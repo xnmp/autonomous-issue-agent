@@ -560,6 +560,8 @@ class TrackChip:
     kind: str
     outcome: str
     count: int
+    # The agent's own words behind an `asked` leg (untrusted, bounded); None otherwise.
+    question: str | None = None
 
 
 @dataclass(frozen=True)
@@ -628,10 +630,12 @@ def history(legs: tuple[LegRow, ...]) -> tuple[StageVisit, ...]:
         if not visits or visits[-1][0] is not stage:
             visits.append((stage, []))
         chips = visits[-1][1]
-        if chips and chips[-1].kind == leg.kind and chips[-1].outcome == leg.outcome:
-            chips[-1] = TrackChip(leg.kind, leg.outcome, chips[-1].count + 1)
+        question = bounded(leg.question, MESSAGE_CHARS) or None if leg.outcome == "asked" else None
+        last = chips[-1] if chips else None
+        if last and (last.kind, last.outcome, last.question) == (leg.kind, leg.outcome, question):
+            chips[-1] = TrackChip(leg.kind, leg.outcome, last.count + 1, question)
         else:
-            chips.append(TrackChip(leg.kind, leg.outcome, 1))
+            chips.append(TrackChip(leg.kind, leg.outcome, 1, question))
     return tuple(StageVisit(stage.value, tuple(chips)) for stage, chips in visits)
 
 

@@ -347,6 +347,51 @@ describe("issues board drawer", () => {
     expect(within(drawer).getByRole("button", { name: "Show 1 earlier step" })).toBeVisible();
   });
 
+  it.each([
+    ["a short question", "Which API should I use?"],
+    ["markup, rendered inert", "<img src=x onerror=alert(1)> **bold**"],
+    ["a very long question", "why? ".repeat(800)],
+  ])("expands an asked leg to its question as plain text: %s", async (_name, question) => {
+    stubFetch();
+    const visits: StageVisit[] = [{ stage: "resolve", steps: [{ kind: "RESOLVE", outcome: "asked", count: 1, question }] }];
+    renderBoard({ in_flight: [card(190, needs("question", null), { history: visits })] });
+    await userEvent.click(row("Issue 190 title"));
+    const drawer = document.getElementById("board-drawer-190") as HTMLElement;
+
+    const ask = drawer.querySelector("details.board-ask") as HTMLDetailsElement;
+    expect(ask.open).toBe(false);
+    expect(within(ask).getByLabelText("asked a question")).toHaveTextContent("?");
+    await userEvent.click(ask.querySelector("summary") as HTMLElement);
+
+    expect(ask.open).toBe(true);
+    expect(ask.querySelector(".board-ask-text")?.textContent).toBe(question);
+    expect(ask.querySelector("img")).toBeNull();
+  });
+
+  it.each([null, undefined, ""])("offers no expander for an asked leg whose question is %j", async (question) => {
+    stubFetch();
+    const visits: StageVisit[] = [{ stage: "resolve", steps: [{ kind: "RESOLVE", outcome: "asked", count: 1, question }] }];
+    renderBoard({ in_flight: [card(191, needs("question", null), { history: visits })] });
+    await userEvent.click(row("Issue 191 title"));
+    const drawer = document.getElementById("board-drawer-191") as HTMLElement;
+
+    expect(drawer.querySelector("details")).toBeNull();
+    expect(within(drawer).getByLabelText("asked a question")).toHaveTextContent("?");
+  });
+
+  it.each([
+    ["done", "✓"], ["passed", "✓"], ["asked", "?"], ["running", "…"], ["failed", "✕"], ["changes_requested", "±"],
+  ] as const)("marks a %s leg with %s, never the neutral dot", async (outcome, glyph) => {
+    stubFetch();
+    const visits: StageVisit[] = [{ stage: "resolve", steps: [{ kind: "RESOLVE", outcome, count: 1 }] }];
+    renderBoard({ in_flight: [card(192, needs("attempts", null), { history: visits })] });
+    await userEvent.click(row("Issue 192 title"));
+
+    const mark = document.querySelector("#board-drawer-192 .board-step-glyph");
+    expect(mark).toHaveTextContent(glyph);
+    expect(mark?.textContent).not.toBe("•");
+  });
+
   it("says when there is no agent work yet", async () => {
     stubFetch();
     renderBoard({ in_flight: [card(182, { status: "waiting", group: "slot", on: "slot", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null }, { rail: rail({ steps: 0 }), history: [] })] });

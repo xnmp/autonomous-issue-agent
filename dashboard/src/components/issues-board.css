@@ -433,7 +433,8 @@
   font-size: var(--text-sm);
   white-space: nowrap;
 }
-.board-step-passed { --step-tone: var(--ok); }
+.board-step-passed,
+.board-step-done { --step-tone: var(--ok); }
 .board-step-failed { --step-tone: var(--fail); }
 .board-step-changes_requested { --step-tone: var(--running); }
 .board-step-running { --step-tone: var(--info); }
@@ -448,6 +449,18 @@
   color: var(--step-tone);
   font-size: var(--text-xs);
   font-weight: var(--weight-bold);
+}
+.board-step-asked { --step-tone: var(--fail); }
+.board-ask > summary { display: inline-block; cursor: pointer; list-style: none; }
+.board-ask > summary::-webkit-details-marker { display: none; }
+.board-ask-text {
+  max-width: 60ch;
+  max-height: 14em;
+  margin: var(--space-3) 0 0;
+  overflow: auto;
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .board-step-rep {
   color: var(--ink-muted);

@@ -134,6 +134,7 @@ const TrackChip = z
       "failed",
       "done",
     ]),
+    question: z.union([z.string(), z.null()]).optional(),
   })
   .passthrough();
 const StageVisit = z

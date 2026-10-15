@@ -60,6 +60,7 @@ def leg(
     basis: str = "provider_reported",
     leg_id: str | None = None,
     role: str | None = None,
+    question: str = "",
 ) -> dash.LegRow:
     running = state in ("reserved", "running")
     ended = minutes + 1 if ended is None else ended
@@ -80,6 +81,7 @@ def leg(
         basis="" if running or state == "released" else basis,
         leg_class="" if running else cls,
         verdict=verdict,
+        question=question,
     )
 
 
@@ -356,6 +358,21 @@ def test_history_folds_identical_consecutive_legs_per_stage_visit():
         ("review", [("REVIEW", "passed", 1)]),
         ("ci", [("FIX_CI", "running", 1)]),
     ]
+
+
+def test_history_carries_an_asked_legs_question_and_no_other_leg_does():
+    legs = (
+        leg("RESOLVE", 0, cls="asked", question="  Which API?  "),
+        leg("RESOLVE", 1, cls="asked", question="Which DB?"),
+        leg("RESOLVE", 2, cls="agent", question="stale text on a done leg"),
+        leg("RESOLVE", 3, cls="asked", question=""),
+        leg("RESOLVE", 4, cls="asked", question="x" * 100_000),
+    )
+    chips = dash.history(legs)[0].steps
+    assert [(c.outcome, c.count) for c in chips] == [("asked", 1), ("asked", 1), ("done", 1), ("asked", 1), ("asked", 1)]
+    assert [c.question for c in chips[:4]] == ["Which API?", "Which DB?", None, None]
+    huge = chips[4].question
+    assert huge is not None and len(huge) == dash.MESSAGE_CHARS and huge.endswith("…")
 
 
 def test_carried_legs_are_money_history_not_attempts_failures_or_toasts():

@@ -237,6 +237,16 @@ def test_the_board_shows_each_items_derived_state(deployment):
     assert payload["slots"] == {"capacity": backend.deployment("demo").cfg.dispatch_slots, "heavy": 1, "light": 0}
 
 
+def test_board_history_carries_the_question_of_an_asked_leg_and_of_no_other(deployment):
+    backend, *_ = deployment
+    chips = {c["issue"]: [chip for v in c["history"] for chip in v["steps"]] for c in backend.issues("demo")["in_flight"]}
+
+    assert [(chip["outcome"], chip["question"]) for chip in chips[2]] == [("asked", "Which API?")]
+    assert [chip["question"] for n, steps in chips.items() if n != 2 for chip in steps] == [None] * sum(
+        len(steps) for n, steps in chips.items() if n != 2
+    )
+
+
 def test_the_issue_page_lists_legs_and_the_unblock_control(deployment):
     backend, *_ = deployment
     detail = backend.issue("demo", 5)
