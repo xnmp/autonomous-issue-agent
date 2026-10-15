@@ -69,8 +69,9 @@ have one; keep your context for reasoning, design and code.
    briefed with, else the issue's), and `Closes #<issue>`. On a later leg for an
    open PR whose body is only `Closes #<issue>` (an earlier leg was stopped after
    publishing), write the full description first. Otherwise change it only with
-   `gh pr edit <PR number> --repo $HARNESS_REPO --body '…'`,
-   which replaces the whole body: keep the Acceptance Criteria section and the
+   `gh api -X PATCH repos/$HARNESS_REPO/pulls/<PR number> -F body=@<file>`
+   (not `gh pr edit`, which demands token scopes your credential lacks), which
+   replaces the whole body: keep the Acceptance Criteria section and the
    `Closes #` line.
 
 ## Your sandbox
