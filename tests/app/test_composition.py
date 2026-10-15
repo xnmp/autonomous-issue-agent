@@ -288,12 +288,12 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
 
     composed = compose_review_daemon(cfg, _BuildableGateway(), FakeRunner(AgentResult(is_error=False)))
 
-    assert seen["default_model"] == "gpt-5.6-terra"
+    assert "default_model" not in seen  # the live route carries the model, never a boot default
     assert seen["rate_table"] is not None
     assert seen["sandbox"] == "read-only"
     # #413: the review leg runs in the leg sandbox, read-only, with no GitHub credential.
     assert not seen["leg_sandbox"].writable and not seen["leg_sandbox"].has_credential
-    assert composed.legs.task_config.model == "gpt-5.6-terra"
+    assert composed.legs.route(None).model == "gpt-5.6-terra"
     assert composed.legs.task_config.max_budget_usd == 2.5
 
 

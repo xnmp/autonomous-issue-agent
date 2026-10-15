@@ -23,7 +23,7 @@ from issue_agent.domain.checks import Check, Observed
 from issue_agent.domain.labels import Label
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.state import Dispatch, Harness, StopReason, stop_tag
-from issue_agent.domain.world import BlockerRef, Comment, IssueView, PRView, WorldState
+from issue_agent.domain.world import BlockerRef, Comment, IssueView, Pickup, PRView, WorldState
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
 MARKER = Harness("fixbot", "reviewbot").marker
@@ -324,14 +324,15 @@ def test_an_unresolvable_store_path_still_allows_reads_and_writes(deployment):
     assert backend.promote("demo", 6) == (True, "ok") and log[-1][0] == "labels"
 
 
-def test_the_only_writes_are_label_changes(deployment):
+def test_the_only_writes_are_label_changes_and_live_settings(deployment):
     pytest.importorskip("fastapi")
     from issue_agent.app.dashweb import server
 
     backend, log, *_ = deployment
     app = server.create_app(backend=backend, offload_backend=False)
     posts = sorted(route.path for route in app.routes if "POST" in getattr(route, "methods", set()))
-    assert posts == [f"/api/repos/{{name}}/issues/{{number}}/{verb}" for verb in ("promote", "unblock")]
+    assert posts == [*(f"/api/repos/{{name}}/issues/{{number}}/{verb}" for verb in ("promote", "unblock")),
+                     "/api/repos/{name}/settings"]
 
     assert backend.unblock("demo", 7) == (True, "ok")
     assert backend.promote("demo", 6) == (True, "ok")
@@ -789,7 +790,7 @@ def test_the_overview_lists_red_base_workflows_longest_red_first_with_their_open
         {"workflow": "macOS Smoke", "since_ts": "2026-10-14T03:00:00Z",
          "run_url": "https://github.com/o/r/actions/runs/71", "issue_url": None},  # its issue is closed
     ]
-    assert gateway.observe == {"filed_by": "fixbot"}
+    assert gateway.observe == {"filed_by": "fixbot", "pickup": Pickup.READY}
 
 
 def test_an_unread_base_is_no_base_failure_list_not_an_empty_one(deployment):

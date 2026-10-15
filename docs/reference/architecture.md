@@ -434,7 +434,11 @@ worktree paths, and resume tokens cannot enter domain objects. Operator
 configuration follows the same ownership rule: `HarnessConfig` field metadata
 is the sole env/coercion/choice table, drives `from_env`, and generates
 `config/agent.env.example`. The immutable config snapshot hash is recorded on
-every reservation and run.
+every reservation and run. Knobs marked `live` (routes, dispatch concurrency,
+the issue and daily caps, the issue pickup) are re-read each tick from the
+same composed env file and swapped in as a new immutable snapshot
+(`app/live_config.py`, ADR 0007 amendment); each leg's receipt names the
+snapshot (`config`) it was admitted under.
 
 Untrusted repository, issue, review, and CI text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
@@ -537,6 +541,9 @@ idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`, `adapters/atomic_file.py`,
 `adapters/child_env.py`,
+`adapters/config_files.py` (the dashboard's settings writes: one assignment
+edited in place, `compose-env.sh`, publish to service snapshots; ADR 0007
+amendment),
 `adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
 once per leg; native sub-agents disabled in the isolated profile),
 `adapters/control_path.py`, `adapters/control_store.py`,
@@ -567,6 +574,8 @@ session),
 `app/identity.py` (each role's GitHub credential, verified against its
 configured login at boot; no credential refuses to start, ADR 0001),
 `app/launchd_main.py`,
+`app/live_config.py` (the live knobs' per-tick snapshot: hash-gated re-read,
+validated, previous kept on refusal),
 `app/main.py`,
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict

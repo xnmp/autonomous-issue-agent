@@ -65,15 +65,43 @@ _SUMMARY_LIMIT = 20000
 
 
 @dataclass(frozen=True)
+class AdmissionCaps:
+    """The caps one paid admission reserves under (None: off) and the config
+    snapshot they came from. Read once per leg: live caps (ADR 0007
+    amendment) change between ticks, so the leg's environment and receipt
+    name the snapshot it was admitted under."""
+
+    repository_cap: Money | None
+    global_cap: Money | None
+    issue_cap: Money | None
+    config_version: str
+
+    @property
+    def armed(self) -> bool:
+        return any(cap is not None for cap in (self.repository_cap, self.global_cap, self.issue_cap))
+
+    def limits(self, repository: str, now: datetime, issue: int | None) -> tuple[BudgetLimit, ...]:
+        limits: list[BudgetLimit] = []
+        if self.repository_cap is not None:
+            limits.append(BudgetLimit(_daily_scope(repository, "repository", self.repository_cap.currency, now),
+                                      self.repository_cap))
+        if self.global_cap is not None:
+            limits.append(BudgetLimit(_daily_scope("*", "global", self.global_cap.currency, now), self.global_cap))
+        if self.issue_cap is not None and issue is not None:
+            limits.append(BudgetLimit(issue_budget_scope(repository, issue, self.issue_cap.currency), self.issue_cap))
+        if not limits:
+            limits.append(BudgetLimit(_daily_scope(repository, "repository", "USD", now),
+                                      Money("USD", _UNLIMITED_ACCOUNTING_MICROS)))
+        return tuple(limits)
+
+
+@dataclass(frozen=True)
 class AccountingRuntime(AgentRuntime):
     inner: AgentRuntime
     store: SQLiteControlStore
     repository: str
     role: str
-    repository_cap: Money | None
-    global_cap: Money | None
-    issue_cap: Money | None
-    config_version: str
+    caps: Callable[[], AdmissionCaps]
     runtime_name: str
     budget_policy: BudgetPolicy
     rate_table: RateTable | None = None
@@ -188,11 +216,12 @@ class AccountingRuntime(AgentRuntime):
         )
         # An unpinned plan runs the runtime's default model, known only once it
         # runs: settlement prices the model the runtime names (#389).
-        if self._caps_armed() and (self.rate_table is None or (task.model and not self.rate_table.priceable(task.model))):
+        caps = self.caps()
+        if caps.armed and (self.rate_table is None or (task.model and not self.rate_table.priceable(task.model))):
             return self._blocked(f"{self.runtime_name} has no harness rate for model {task.model!r}")
-        if self.issue_cap is not None and issue is None:
+        if caps.issue_cap is not None and issue is None:
             return self._blocked("issue spend scope is unavailable")
-        limits = list(self._limits(now, issue))
+        limits = list(caps.limits(self.repository, now, issue))
         primary = limits[0]
         budget_kind = kind or ""
         try:
@@ -259,7 +288,7 @@ class AccountingRuntime(AgentRuntime):
             )
         authority = {
             "ISSUE_AGENT_RUN_ID": str(run_id),
-            "ISSUE_AGENT_CONFIG_VERSION": self.config_version,
+            "ISSUE_AGENT_CONFIG_VERSION": caps.config_version,
             **({
                 "ISSUE_AGENT_RATE_CARD_ID": self.rate_table.rate_card_id,
                 "ISSUE_AGENT_RATE_CARD_VERSION": self.rate_table.version,
@@ -313,6 +342,8 @@ class AccountingRuntime(AgentRuntime):
                 # Triage's laundered result: the tier. Steward's: criteria, suspected duplicate.
                 **({"triage": triage.record()} if triage is not None else {}),
                 **({"steward": steward.record()} if steward is not None else {}),
+                # The config snapshot it was admitted under: live knobs change between ticks.
+                "config": caps.config_version,
                 # The routed tier the leg ran at: a REVIEW of the head it pushed runs at the same tier.
                 **({"tier": tier} if tier else {}),
                 # The effort the plan asked for (a runtime may degrade it, e.g. Claude xhigh off Opus); absent when none was set.
@@ -432,16 +463,6 @@ class AccountingRuntime(AgentRuntime):
             remove_spend_evidence(self.spend_evidence_dir, run_id)
         return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis, run_usage=observed)
 
-    def _caps_armed(self) -> bool:
-        return any(
-            cap is not None
-            for cap in (
-                self.repository_cap,
-                self.global_cap,
-                self.issue_cap,
-            )
-        )
-
     def _recover_or_release(self, run_id: RunId) -> None:
         """Give every returned failure path a terminal accounting outcome."""
 
@@ -474,42 +495,6 @@ class AccountingRuntime(AgentRuntime):
             # An unavailable authority remains fail-closed and boot recovery
             # retries the still-active reservation.
             pass
-
-    def _limits(
-        self, now: datetime, issue: int | None
-    ) -> tuple[BudgetLimit, ...]:
-        limits: list[BudgetLimit] = []
-        if self.repository_cap is not None:
-            limits.append(
-                BudgetLimit(
-                    _daily_scope(
-                        self.repository, "repository", self.repository_cap.currency, now
-                    ),
-                    self.repository_cap,
-                )
-            )
-        if self.global_cap is not None:
-            limits.append(
-                BudgetLimit(
-                    _daily_scope("*", "global", self.global_cap.currency, now),
-                    self.global_cap,
-                )
-            )
-        if self.issue_cap is not None and issue is not None:
-            limits.append(
-                BudgetLimit(
-                    issue_budget_scope(self.repository, issue, self.issue_cap.currency),
-                    self.issue_cap,
-                )
-            )
-        if not limits:
-            limits.append(
-                BudgetLimit(
-                    _daily_scope(self.repository, "repository", "USD", now),
-                    Money("USD", _UNLIMITED_ACCOUNTING_MICROS),
-                )
-            )
-        return tuple(limits)
 
 
 def _daily_scope(

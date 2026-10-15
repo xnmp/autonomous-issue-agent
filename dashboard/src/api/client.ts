@@ -14,6 +14,9 @@ import type {
   IssuesPayload,
   OverviewPayload,
   ReposPayload,
+  SettingsPayload,
+  SettingWrite,
+  SettingWriteResult,
   UsagePayload,
   VerificationPayload,
 } from "./types";
@@ -194,6 +197,19 @@ export const api = {
       `/api/repos/${enc(name)}/issues/${n}/unblock`,
       {},
       schemas.ActionResult,
+      s,
+    ),
+
+  /** The deployment's live knobs (ADR 0007 amendment). */
+  settings: (name: string, s?: AbortSignal) =>
+    getJson<SettingsPayload>(`/api/repos/${enc(name)}/settings`, schemas.SettingsPayload, s),
+
+  /** Writes one live knob; a refusal (400) throws with the server's reason. */
+  setSetting: (name: string, write: SettingWrite, s?: AbortSignal) =>
+    postJson<SettingWriteResult>(
+      `/api/repos/${enc(name)}/settings`,
+      write,
+      schemas.SettingWriteResult,
       s,
     ),
 };

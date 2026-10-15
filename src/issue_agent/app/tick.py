@@ -38,7 +38,7 @@ from functools import partial
 from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
-from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
+from ..adapters.accounting_runtime import AccountingRuntime, AdmissionCaps, issue_budget_scope
 from ..adapters.act import reported_gaps
 from ..adapters.atomic_file import atomic_write
 from ..adapters.control_path import control_store_path
@@ -72,7 +72,8 @@ from ..domain.supervision import (
     suspension_between,
 )
 from ..domain.world import WorldState
-from .config import HarnessConfig, budget_policy, owner_identity_for_target, rate_table, supervision_dir
+from .config import MAX_DISPATCH_CONCURRENCY, HarnessConfig, budget_policy, owner_identity_for_target, rate_table, supervision_dir
+from .live_config import LiveConfig
 from .recovery import RecoveryCoordinator
 
 def run_item(run: LegRun) -> ItemKey | None:
@@ -315,8 +316,9 @@ class Daemon:
     executor: ActionExecutor
     poll_seconds: int = 60
     log: Callable[[str], None] = _ignore_log
-    # Paid dispatches run behind the observation loop in this many threads.
-    dispatch_capacity: int = 1
+    # Paid dispatches run behind the observation loop, at most this many at
+    # once; read at each use (FIX_DISPATCH_CONCURRENCY is a live knob).
+    dispatch_capacity: Callable[[], int] = lambda: 1
     # Duplicate suppression: one in-flight dispatch per key.
     dispatch_key: Callable[[RunAgent], Hashable] = lambda action: (action.kind, action.number)
     # Cancels the asyncio tasks under the worker threads before the pool joins.
@@ -359,11 +361,11 @@ class Daemon:
     _wake_recovery_pending: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.dispatch_capacity < 1:
-            raise ValueError("dispatch_capacity must be >= 1")
         # Heavy legs fill `dispatch_capacity`; light ones (STEWARD, TRIAGE) get as many
-        # more, their ceiling, so a queued light leg can never hide in the pool.
-        self._dispatch_pool = ThreadPoolExecutor(max_workers=2 * self.dispatch_capacity,
+        # more, their ceiling. The pool is sized for the largest capacity the
+        # config admits (threads start lazily), so a queued light leg can never
+        # hide in it whatever the capacity becomes.
+        self._dispatch_pool = ThreadPoolExecutor(max_workers=2 * MAX_DISPATCH_CONCURRENCY,
                                                  thread_name_prefix=f"{self.name}-dispatch")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown timeout must be positive")
@@ -425,8 +427,9 @@ class Daemon:
     def available_dispatch_slots(self) -> int:
         """Capacity visible to decide, so it never chooses work this process
         will not start."""
+        capacity = self.dispatch_capacity()
         with self._dispatch_lock:
-            return max(0, self.dispatch_capacity - self._in_flight(heavy=True)) if self._admitting(heavy=True) else 0
+            return max(0, capacity - self._in_flight(heavy=True)) if self._admitting(heavy=True) else 0
 
     def _in_flight(self, *, heavy: bool) -> int:
         # Caller holds _dispatch_lock.
@@ -434,8 +437,9 @@ class Daemon:
 
     @property
     def available_light_slots(self) -> int:
+        capacity = self.dispatch_capacity()
         with self._dispatch_lock:
-            return max(0, self.dispatch_capacity - self._in_flight(heavy=False)) if self._admitting(heavy=False) else 0
+            return max(0, capacity - self._in_flight(heavy=False)) if self._admitting(heavy=False) else 0
 
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
@@ -452,9 +456,10 @@ class Daemon:
 
     def _submit_dispatch(self, action: RunAgent) -> bool:
         key = self.dispatch_key(action)
+        capacity = self.dispatch_capacity()
         with self._dispatch_lock:
             if (not self._admitting(heavy=action.kind.holds_dispatch_slot)
-                    or self._in_flight(heavy=action.kind.holds_dispatch_slot) >= self.dispatch_capacity
+                    or self._in_flight(heavy=action.kind.holds_dispatch_slot) >= capacity
                     or key in {k for _a, k in self._dispatches.values()}):
                 return False
             future = self._dispatch_pool.submit(self.executor.execute, action)
@@ -971,8 +976,9 @@ def bind_runtime(
 
     fix = role == "fix"
     state_dir = cfg.state_dir_for(role)
-    # The runner's default model; every routed leg carries its own.
-    model = ((cfg.fix_model if cfg.fixer_runtime is RuntimeName.CODEX else None) if fix else cfg.review_model) or None
+    # No default model: every leg carries its live route's model, and a route
+    # without one means the runtime's own default (a boot FIX_MODEL baked in
+    # here outlived its unset; ADR 0007 amendment).
     codex = CodexRunner(
         codex_bin=cfg.codex_bin,
         provider=CodexProvider(provider_id=cfg.codex_provider_id, name=cfg.codex_provider_name,
@@ -989,7 +995,6 @@ def bind_runtime(
         spend_evidence_dir=spend_evidence_dir(state_dir),
         rate_table=rate_table(cfg, RuntimeName.CODEX.value),
         leg_sandbox=leg_sandbox(cfg, role),
-        **({"default_model": model} if model else {}),
     )
     reason = codex.preflight()
     log(f"codex: NOT READY at startup — {reason}" if reason is not None
@@ -1046,7 +1051,8 @@ def compose_role(
     make_act: Callable[[CancellableAsyncDispatch, SQLiteControlStore], ActionExecutor],
     choose: Choose,
     worktrees=None,
-    capacity: int = 1,
+    capacity: Callable[[HarnessConfig], int] = lambda _cfg: 1,
+    live: LiveConfig | None = None,
     log: Callable[[str], None],
 ) -> Role:
     """observe -> derive -> policy -> act, with paid legs in a bounded pool.
@@ -1055,7 +1061,12 @@ def compose_role(
     admission that trips a cap can sweep stale reservations (keifu #34);
     every leg reserves before spawn and settles once through the accounting
     runtime; shutdown records cancellation intents, then reconciles killed
-    work."""
+    work.
+
+    `live` (ADR 0007 amendment): each observation refreshes it, and the
+    tick's facts, capacity and pickup, and each leg's caps, read its current
+    snapshot; `cfg` (the boot snapshot) supplies everything else."""
+    live = live or LiveConfig(cfg)
     from ..adapters.process_supervisor import ProcessSupervisor
     from ..adapters.runtime_switch import RuntimeSwitch
 
@@ -1073,6 +1084,11 @@ def compose_role(
     def cap(value: float) -> Money | None:
         return Money.from_major("USD", value) if value > 0 else None
 
+    def admission() -> AdmissionCaps:
+        current = live.current
+        return AdmissionCaps(cap(current.daily_spend_cap_usd), cap(current.global_daily_spend_cap_usd),
+                             cap(current.issue_spend_cap_usd), current.config_version)
+
     posture = leg_sandbox(cfg, role).posture
     chains: dict[RuntimeName, AgentRuntime] = {}
     accountings: dict[RuntimeName, AccountingRuntime] = {}
@@ -1080,8 +1096,7 @@ def compose_role(
     for name in names:
         bound, prepares[name] = bind_runtime(cfg, role, name, runner, log)
         accountings[name] = AccountingRuntime(
-            bound, control, cfg.repo, role, cap(cfg.daily_spend_cap_usd), cap(cfg.global_daily_spend_cap_usd),
-            cap(cfg.issue_spend_cap_usd), cfg.config_version, name.value, budget_policy(cfg),
+            bound, control, cfg.repo, role, admission, name.value, budget_policy(cfg),
             rate_table(cfg, name.value), spend_evidence_dir(state_dir), owner_id=owner_id,
             reservation_reconciler=recovery,
             remote_head=worktrees.remote_head if worktrees is not None else None,
@@ -1102,10 +1117,15 @@ def compose_role(
 
     # Only the fix role files base-CI issues, so only it reads base CI; the
     # review role's token pool is the rate-limited one.
-    observed = {"filed_by": cfg.fix_bot} if role == "fix" else {}
+    def observe() -> WorldState:
+        current = live.refresh()
+        if role == "fix":
+            return gateway.build_world(cfg.base_branch, filed_by=cfg.fix_bot, pickup=current.pickup)
+        return gateway.build_world(cfg.base_branch)
+
     daemon = Daemon(
-        role, lambda: gateway.build_world(cfg.base_branch, **observed), lambda _world: [], act, cfg.poll_seconds, log,
-        dispatch_capacity=capacity,
+        role, observe, lambda _world: [], act, cfg.poll_seconds, log,
+        dispatch_capacity=lambda: capacity(live.current),
         dispatch_key=dispatch_item,
         cancel_active_dispatches=dispatch.cancel_all,
         force_kill_dispatches=supervisor.force_kill_all,
@@ -1115,8 +1135,13 @@ def compose_role(
         terminalize=terminalize,
     )
     leg_usd = cfg.fix_budget_usd if role == "fix" else cfg.review_budget_usd
-    facts = Facts(control, cfg.repo, active=lambda: daemon.active_dispatches,
-                  headroom=headroom(cfg, control, leg_usd), lifetime_capped=lifetime_capped(cfg, control), log=log)
+
+    def facts(world: WorldState) -> Local:
+        current = live.current
+        return Facts(control, cfg.repo, active=lambda: daemon.active_dispatches,
+                     headroom=headroom(current, control, leg_usd), lifetime_capped=lifetime_capped(current, control),
+                     log=log)(world)
+
     harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
     daemon.decide = decide_with(role, facts, harness, choose, lambda: Slots(daemon.available_dispatch_slots, daemon.available_light_slots), log)
     return Role(daemon, control, journal, act, legs, recovery, owner_id)

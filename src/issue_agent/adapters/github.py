@@ -25,7 +25,7 @@ from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
-from ..domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Push, Review, WorldState
+from ..domain.world import BlockerRef, Branch, Comment, IssueView, Pickup, PRView, Push, Review, WorldState
 from .github_ci import base_issues, base_reports, base_runs, observe_checks, required_policy, required_workflows
 
 # Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
@@ -295,8 +295,8 @@ def format_pr_discussion(
 # 5.3s, 10 1.1s; 100 refs 2.2-4.1s (per-ref PR association and compare), 50
 # 1.7s. The item ceilings are those of the old 10 pages of 100.
 _FIX_PAGE_SIZE = {"issues": 25, "pullRequests": 10, "refs": 50}
-_FIX_MAX_ITEMS = 1000
-_FIX_MAX_PAGES = {name: -(-_FIX_MAX_ITEMS // size) for name, size in _FIX_PAGE_SIZE.items()}
+FIX_MAX_ITEMS = 1000
+_FIX_MAX_PAGES = {name: -(-FIX_MAX_ITEMS // size) for name, size in _FIX_PAGE_SIZE.items()}
 _FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500, "contexts": 1000}
 _HARNESS_BRANCH_PREFIX = "fix/"
 _COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt url}}}}"
@@ -357,15 +357,23 @@ def _escaped(fields: str) -> str:
     return fields.replace("{", "{{").replace("}", "}}")
 
 
+def _issues_connection(labels: str, fields: str) -> str:
+    return ("issues(states:OPEN," + labels + f"first:{_FIX_PAGE_SIZE['issues']}" "{after},"
+            "orderBy:{{field:CREATED_AT,direction:ASC}}){{pageInfo{{hasNextPage endCursor}} nodes{{"
+            + _escaped(fields) + "}}}}")
+
+
 _FIX_CONNECTIONS = {
-    "issues": ("issues(states:OPEN,labels:[\"ai-ready\",\"needs-human\"],"
-               f"first:{_FIX_PAGE_SIZE['issues']}" "{after},"
-               "orderBy:{{field:CREATED_AT,direction:ASC}}){{pageInfo{{hasNextPage endCursor}} nodes{{" + _escaped(_FIX_ISSUE) + "}}}}"),
+    "issues": _issues_connection("labels:[\"ai-ready\",\"needs-human\"],", _FIX_ISSUE),
     "pullRequests": (f"pullRequests(states:OPEN,first:{_FIX_PAGE_SIZE['pullRequests']}"
                      "{after},orderBy:{{field:CREATED_AT,direction:ASC}})"
                      "{{pageInfo{{hasNextPage endCursor}} nodes{{" + _escaped(_FIX_PR) + "}}}}"),
     "refs": _FIX_REFS,
 }
+
+
+# ISSUE_PICKUP=open: every open issue (derive leaves out the harness's own gap reports).
+_FIX_OPEN_ISSUES = _issues_connection("", _FIX_ISSUE)
 
 
 class FixObservationIncomplete(ValueError):
@@ -785,8 +793,9 @@ class GitHubGateway:
             return None
         return nodes
 
-    def build_world(self, base: str, *, filed_by: str = "") -> WorldState:
-        """The fix role's observation: open `ai-ready`/`needs-human` issues,
+    def build_world(self, base: str, *, filed_by: str = "", pickup: Pickup = Pickup.READY) -> WorldState:
+        """The fix role's observation: open `ai-ready`/`needs-human` issues
+        (with `pickup` OPEN, every open issue and its body),
         open harness PRs (`fix/<issue>-`) with head, mergeability, required
         checks, reviews, comments, every changed file and the head push, and
         harness branches owed a PR against `base`; with `filed_by` (the fixer's
@@ -794,7 +803,8 @@ class GitHubGateway:
         top-level reads propagate: the daemon skips the tick."""
         # The domain reads no clock: one stamp per build, so every gate in a tick judges one instant.
         now = datetime.now(timezone.utc).isoformat()
-        collected = {name: self._top_level(name, base) for name in _FIX_CONNECTIONS}
+        templates = {**_FIX_CONNECTIONS, **({"issues": _FIX_OPEN_ISSUES} if pickup is Pickup.OPEN else {})}
+        collected = {name: self._top_level(name, base, template) for name, template in templates.items()}
         issues: list[IssueView] = []
         merged: dict[int, PRView] = {}
         for node in collected["issues"]:
@@ -836,13 +846,13 @@ class GitHubGateway:
             self._skip_item("issue", number, FixObservationIncomplete(why))
         tip, nodes = self._base_tip(base)
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches, base=tip, base_ci=self._base_ci(base, filed_by, nodes) if filed_by else None)
+                          branches=branches, base=tip,
+                          base_ci=self._base_ci(base, filed_by, nodes) if filed_by else None, pickup=pickup)
 
-    def _top_level(self, name: str, base: str) -> list:
+    def _top_level(self, name: str, base: str, template: str) -> list:
         """One top-level connection, its own request per page (#425), read in
         full within its page bound; otherwise the read raises and the tick is
         skipped. At most `_FIX_MAX_PAGES[name]` requests."""
-        template = _FIX_CONNECTIONS[name]
         fixed = {"base": base} if name == "refs" else {}
         nodes: list = []
         cursor: str | None = None

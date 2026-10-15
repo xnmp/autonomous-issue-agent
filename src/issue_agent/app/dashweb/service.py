@@ -9,8 +9,9 @@ item with `domain.state.derive` over the local facts each role builds
 daemons will do, not a reconstruction. An unreadable store derives nothing:
 the board says the store is unavailable rather than guess.
 
-The only writes are label changes through `operator_effects` (refactor
-decision Q19): promote adds `ai-ready`, unblock removes `needs-human`.
+The GitHub writes are label changes through `operator_effects` (refactor
+decision Q19): promote adds `ai-ready`, unblock removes `needs-human`. The
+live settings are written to the operator's config files (`settings`).
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from ...domain.world import WorldState
 from .. import config
 from ..config import HarnessConfig
 from ..tick import Facts, headroom, leg_ends, lifetime_capped
-from . import views
+from . import settings, views
 from .ports import GitHubQueries
 
 HARNESS_ROOT = str(Path(__file__).resolve().parents[4])
@@ -222,6 +223,7 @@ class Backend:
         self._observations = _Observations(ttl_s=observe_ttl_s, **(
             {"executor": observe_executor} if observe_executor is not None else {}))
         self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
+        self._settings_lock = threading.Lock()
         self._self_repo = remote_repo(self.harness_root)
 
     # ── configuration ──
@@ -297,7 +299,7 @@ class Backend:
         # call) keeps the refresh at the slowest read.
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dashboard-read") as pool:
             world_f = pool.submit(self.gateway_factory(dep.cfg.repo).build_world,  # type: ignore[attr-defined]
-                                  dep.cfg.base_branch, filed_by=dep.cfg.fix_bot)
+                                  dep.cfg.base_branch, filed_by=dep.cfg.fix_bot, pickup=dep.cfg.pickup)
             issues_f = pool.submit(self.gh.issues, dep.cfg.repo)
             merged_f = pool.submit(self.gh.merged_prs, dep.cfg.repo)
             world: WorldState | None
@@ -485,6 +487,35 @@ class Backend:
             "observed_at": obs.observed_at.isoformat() if obs else None,
             "store_error": read.problem or None,
         }
+
+    # ── live settings ──
+    def settings(self, name: str) -> dict:
+        dep = self.deployment(name)
+        payload = settings.read_settings(dep.cfg, settings.Files(self.harness_root, name))
+        payload["warnings"] = [dep.problem] if dep.problem else []
+        return payload
+
+    def set_setting(self, name: str, key: str, value: str | None, scope: str) -> tuple[bool, str, list[str]]:
+        if not self.known(name):
+            return False, f"unknown deployment '{name}'", []
+        with self._settings_lock:
+            result = settings.write_setting(
+                self.harness_root, name, key, value, scope, names=self.names(),
+                load=lambda deployment: self.deployment(deployment).cfg, environ=self.environ,
+                home=self.environ.get("HOME") or os.path.expanduser("~"), open_issues=self._open_issues)
+            if result.ok:
+                # The composed snapshots changed: re-read them, and observe again
+                # (the issue pickup decides what an observation lists).
+                self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
+                for deployment in self.names():
+                    self._observations.invalidate(deployment)
+        return result.ok, result.detail, list(result.warnings)
+
+    def _open_issues(self, name: str) -> int | None:
+        """How many issues are open (the read the backlog uses); None unread."""
+        payload, error = self.gh.issues(self.deployment(name).cfg.repo)
+        return None if error or not isinstance(payload, list) else sum(
+            1 for issue in payload if isinstance(issue, dict) and ghdata.is_open(issue))
 
     # ── label writes ──
     def promote(self, name: str, number: int) -> tuple[bool, str]:

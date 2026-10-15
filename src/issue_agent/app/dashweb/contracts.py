@@ -480,3 +480,46 @@ class ActionResult(Contract):
     ok: bool
     detail: str
 
+
+
+class SettingRow(Contract):
+    """One live knob (ADR 0007 amendment): its effective value in the composed
+    snapshot, and the file that sets it."""
+
+    key: str
+    group: Literal["routes", "dispatch", "caps"]
+    kind: Literal["route", "model", "int", "usd", "choice"]
+    label: str
+    help: str
+    # "" is unset: the knob's fallback applies.
+    value: str
+    source: Literal["repo", "shared", "default"]
+    default: str
+    choices: list[str] | None = None
+    # A "model" knob's runtime (FIXER_RUNTIME/REVIEWER_RUNTIME, not live).
+    runtime: str | None = None
+    # What a leg it configures runs on now, after fallbacks.
+    effective: str | None = None
+
+
+class SettingsPayload(Warned):
+    settings: list[SettingRow]
+    runtimes: list[str]
+    efforts: dict[str, list[str]]
+    models: dict[str, list[str]]
+    files: dict[str, str]
+
+
+class SettingWrite(BaseModel):
+    """Set `key` in the repo overlay or shared.env; a null value removes it
+    from that file (the next layer's value or the default applies)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: Annotated[str, Field(min_length=1, max_length=64)]
+    value: Annotated[str, Field(max_length=1000)] | None = None
+    scope: Literal["repo", "shared"] = "repo"
+
+
+class SettingWriteResult(ActionResult):
+    warnings: list[str] = []

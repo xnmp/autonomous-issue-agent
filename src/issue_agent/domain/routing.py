@@ -47,7 +47,7 @@ def escalate(tier: Tier, attempts: int) -> Tier:
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:\[\]-]{0,199}")
 # Efforts each runner can render: the Claude SDK's EffortLevel is
 # low|medium|high|xhigh|max; codex `model_reasoning_effort` is low..xhigh.
-_EFFORTS: dict[RuntimeName, tuple[Effort, ...]] = {
+RUNTIME_EFFORTS: dict[RuntimeName, tuple[Effort, ...]] = {
     RuntimeName.CLAUDE: tuple(Effort),
     RuntimeName.CODEX: (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH),
 }
@@ -77,9 +77,9 @@ class ModelRoute:
             if (self.model.startswith("gpt-") and self.runtime is not RuntimeName.CODEX
                     or claude_model and self.runtime is not RuntimeName.CLAUDE):
                 raise ValueError("model ID belongs to a different runtime")
-        if self.effort is not None and self.effort not in _EFFORTS[self.runtime]:
+        if self.effort is not None and self.effort not in RUNTIME_EFFORTS[self.runtime]:
             raise ValueError(f"effort {getattr(self.effort, 'value', self.effort)!r} is not valid for "
-                             f"{self.runtime.value} (one of {[e.value for e in _EFFORTS[self.runtime]]})")
+                             f"{self.runtime.value} (one of {[e.value for e in RUNTIME_EFFORTS[self.runtime]]})")
 
     @property
     def spec(self) -> str:
@@ -103,9 +103,9 @@ def parse_model_route(value: object) -> ModelRoute:
         model = head
         effort = parse_effort(tail)
         if effort is None:
-            raise ValueError(f"unknown effort {tail!r} (one of {[e.value for e in _EFFORTS[name]]})"
+            raise ValueError(f"unknown effort {tail!r} (one of {[e.value for e in RUNTIME_EFFORTS[name]]})"
                              if tail else "empty effort after the model (omit the trailing ':')")
     return ModelRoute(name, model, effort)
 
 
-__all__ = ["DEFAULT_TIER", "TIER_LADDER", "ModelRoute", "Tier", "escalate", "parse_model_route", "parse_tier"]
+__all__ = ["DEFAULT_TIER", "RUNTIME_EFFORTS", "TIER_LADDER", "ModelRoute", "Tier", "escalate", "parse_model_route", "parse_tier"]

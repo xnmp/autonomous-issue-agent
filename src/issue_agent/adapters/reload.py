@@ -14,6 +14,10 @@ The nodemon/uvicorn-reload pattern, with two properties those don't need:
   and the suite ran" signal — partial changes structurally cannot make it in.
   The one mtime-watched exception is the composed env file (`AGENT_ENV`): it
   is gitignored by design, and an operator edit to it is a single atomic save.
+  With a `fingerprint` a file's identity is what that function makes of it,
+  recomputed only when its bytes change: the daemons fingerprint only the
+  part that needs a restart, so a live knob (ADR 0007 amendment) never
+  reloads.
 
 Mechanism: `ReloadWatch.changed()` is handed to `Daemon.run_forever`, which
 checks it after each tick and exits with RELOAD_EXIT_CODE; `bin/point-at.sh`
@@ -86,10 +90,13 @@ class ReloadWatch:
         repo_root: str,
         files: tuple[str, ...] = (),
         validate: Callable[[], None] | None = None,
+        fingerprint: Callable[[str], str] | None = None,
     ):
         self.repo_root = repo_root
         self.files = files
         self.validate = validate
+        self.fingerprint = fingerprint
+        self._fingerprints: dict[str, tuple[str, str]] = {}
         self._base = self._fingerprint()
 
     def _digests(self) -> tuple[str, ...]:
@@ -97,10 +104,24 @@ class ReloadWatch:
         for path in self.files:
             try:
                 with open(path, "rb") as handle:
-                    out.append(hashlib.sha256(handle.read()).hexdigest())
+                    digest = hashlib.sha256(handle.read()).hexdigest()
             except OSError:
                 out.append("")
+                continue
+            out.append(self._identity(path, digest))
         return tuple(out)
+
+    def _identity(self, path: str, digest: str) -> str:
+        if self.fingerprint is None:
+            return digest
+        cached = self._fingerprints.get(path)
+        if cached is None or cached[0] != digest:
+            try:
+                identity = self.fingerprint(path)
+            except Exception:  # noqa: BLE001 - unreadable reads as changed; validate refuses it
+                identity = f"unfingerprinted:{digest}"
+            cached = self._fingerprints[path] = (digest, identity)
+        return cached[1]
 
     def _fingerprint(self) -> tuple[str, tuple[str, ...]]:
         return (_head_commit(self.repo_root), self._digests())

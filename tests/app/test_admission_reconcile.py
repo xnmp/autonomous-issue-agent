@@ -14,7 +14,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from issue_agent.adapters import accounting_runtime
-from issue_agent.adapters.accounting_runtime import AccountingRuntime
+from issue_agent.adapters.accounting_runtime import AccountingRuntime, AdmissionCaps
 from issue_agent.adapters.control_store import BudgetLimit, ReservationRequest, SettlementRequest, SQLiteControlStore
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -150,10 +150,7 @@ def _admission(store, runtime, cap: Money, reconciler):
         store,
         REPOSITORY,
         "fix",
-        None,
-        None,
-        cap,
-        "cfg",
+        lambda: AdmissionCaps(None, None, cap, "cfg"),
         "codex",
         BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}),
         rates,
