@@ -384,12 +384,6 @@ the harness links it and posts one comment with the reason, or one saying why
 it refused. That comment ends the matter: delete the link on GitHub and the
 harness never re-adds it.
 
-Among ready issues, dispatch prefers the oldest whose steward-guessed paths
-(`touches`, kept in the STEWARD leg's result) overlap no file that an open
-harness PR changes. This changes order only. With every candidate overlapping,
-or no guesses, it is plain FIFO. A paid scheduler leg is the deferred
-alternative (#388).
-
 The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Origin,
 and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
 account; it is not a multi-user authentication service.

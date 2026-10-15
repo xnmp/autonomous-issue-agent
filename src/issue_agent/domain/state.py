@@ -121,6 +121,9 @@ _MAX_MARKER = 200
 _STANDING = frozenset({REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, "DISMISSED"})
 _STOP_TAG_RE = re.compile(r"<!-- needs-human:([a-z-]+) -->")
 # Carried by the harness's one triage comment per issue; derive reads it back.
+# Owner: derive (the read-back that makes the comment once-only, #369). Ceiling:
+# one comment per issue. Exit: it goes when the triage note does; a comment a
+# human deletes is re-posted once, never looped.
 TRIAGE_TAG = "<!-- issue-agent:triage -->"
 # Carried by the harness's one comment about a steward's "blocked by" claim.
 BLOCKER_TAG = "<!-- issue-agent:blocked-by -->"
@@ -589,7 +592,13 @@ def latest_steward(legs: tuple[LegEnd, ...]) -> LegEnd | None:
 
 
 def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str) -> NeedsHuman | None:
-    """The duplicate stop a steward result owes, until a human released one."""
+    """The duplicate stop a steward result owes, until a human released one.
+
+    Kept deliberately (#369, #450): the steward judges duplication, but closing
+    an issue is the human's call, so the claim only parks the issue. Owner: the
+    steward result (laundered against the offered issues). Ceiling: one stop per
+    issue; any released DUPLICATE stop retires it. Exit: a human reply, closing
+    the issue, or removing `needs-human`."""
     steward = leg.steward
     if steward is None or steward.duplicate_of is None or any(code == StopReason.DUPLICATE.value for _, code in stops):
         return None

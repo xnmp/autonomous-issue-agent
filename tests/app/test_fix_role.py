@@ -1293,11 +1293,10 @@ def test_a_blocked_issue_buys_nothing_until_its_blocker_closes_then_starts_by_it
 
 
 
-def stewarded(*, blocked_by: int | None = None, touches: tuple[str, ...] = (), session: str = "t1"):
-    """The steward's claim with a dependency and path guesses, or TRIAGE's grade."""
+def stewarded(*, blocked_by: int | None = None, session: str = "t1"):
+    """The steward's claim with a dependency, or TRIAGE's grade."""
     steward = {"acceptance_criteria": ["Exports open in the viewer"], "duplicate_of": None, "duplicate_reason": "",
-               "blocked_by": blocked_by, "blocked_by_reason": "Needs the export API #2 adds" if blocked_by else "",
-               "touches": list(touches)}
+               "blocked_by": blocked_by, "blocked_by_reason": "Needs the export API #2 adds" if blocked_by else ""}
 
     def run(task):
         claim = {"tier": "med", "rationale": "x"} if "tier" in task.schema["properties"] else steward
@@ -1346,29 +1345,6 @@ def test_a_link_a_human_deletes_is_never_re_added(role):
     assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
     tick(composed)
     assert gh.issues[5].blocked_by == () and len(gh.comments_with("issue", 5, "blocked by #2")) == 1
-
-
-def test_a_free_slot_goes_to_the_oldest_issue_clear_of_open_pr_files_and_otherwise_fifo(role):
-    gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Docs typo"), 7: ready(7, "In flight")})
-    open_pr(gh, 7, changed_files=frozenset({"src/auth/token.ts"}))
-    gate = threading.Event()
-    agent = SplitAgent(_blocked(gate, _DONE), triaged())
-    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
-    for number, touches in ((5, ["src/auth/"]), (6, ["docs/typo.md"])):
-        composed.control.record_unpaid_leg(
-            RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="STEWARD", owner_id="seed",
-            issue=number, number=number, head="", runtime="claude", leg_class="agent",
-            result={"steward": {"acceptance_criteria": [], "duplicate_of": None, "duplicate_reason": "",
-                                "touches": touches}})
-        composed.control.record_unpaid_leg(  # an unusable grade: no triage comment is owed
-            RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
-            issue=number, number=number, head="", runtime="claude", leg_class="agent", result={})
-    try:
-        # #5 waited longer but guesses src/auth/, which PR 100 changes: #6 gets the one slot.
-        assert dispatched(composed.daemon.tick(), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 6, tier=Tier.MED)]
-    finally:
-        gate.set()
-        composed.daemon.wait_for_dispatches()
 
 
 def test_deleting_both_the_link_and_its_comment_closes_the_matter_and_triage_proceeds(role):

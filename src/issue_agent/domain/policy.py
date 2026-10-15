@@ -10,7 +10,7 @@ a stop comment on an unlabelled item, which derive would read as released.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from .actions import (
     ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel,
@@ -19,7 +19,6 @@ from .actions import (
 from .checks import BaseCI
 from .ci import GREEN_CONCLUSIONS, base_verdicts, parse_timestamp
 from .labels import Label
-from .triage import normalise_guess, normalise_path
 from .state import (
     Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Rerun,
     Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP, BLOCKER_TAG, REVIEW_ROUND_CAP, TRIAGE_TAG,
@@ -65,63 +64,16 @@ def actions(states: Mapping[ItemKey, DerivedState], harness: Harness) -> tuple[A
     return tuple(out)
 
 
-# The overlap preference's ceiling: it defers an issue only while that issue
-# has waited less than this; after that, age alone orders it. So no overlap
-# guess, however broad, delays an issue past this, plus the ordinary wait for
-# a slot.
-OVERLAP_DEFER_CEILING = timedelta(hours=1)
-
-
-def dispatch_order(
-    keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime],
-    touches: Mapping[int, tuple[str, ...]] | None = None, busy: Iterable[str] = (),
-    now: datetime | None = None,
-) -> list[ItemKey]:
+def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime]) -> list[ItemKey]:
     """Who gets a scarce slot first: PR-stage items before issue-stage (finish
-    work in progress before starting new), then an issue whose steward's
-    `touches` guess overlaps none of `busy` (the files open harness PRs change)
-    before one that does, then the item that has waited longest (its newest leg
-    end; none = never served = oldest), then by number so the order is total.
-    Ordering only: every key keeps its place in the list, so a slot never idles
-    on it, and with every issue overlapping, or no guesses, it is plain FIFO.
-    An issue that has waited OVERLAP_DEFER_CEILING (measured against `now`;
-    without `now` the preference is off) is never deferred by it again.
+    work in progress before starting new), then the item that has waited
+    longest (its newest leg end; none = never served = oldest), then by number
+    so the order is total. Ordering only: every key keeps its place in the list.
     #1125 starved behind #1039/#1117/#1122 under issues-first, by-number order.
-    A paid scheduler leg would replace this function (#388)."""
+    A file-overlap preference (#394) was removed (#450): conflicts are the
+    rebase act's job. A paid scheduler leg would replace this function (#388)."""
     never = datetime.min.replace(tzinfo=timezone.utc)
-    guesses = touches or {}
-    occupied = path_index(busy)
-
-    def clash(key: ItemKey) -> bool:
-        since = waiting_since.get(key)
-        return (key.target is Target.ISSUE and now is not None and since is not None
-                and now - since < OVERLAP_DEFER_CEILING and overlaps(guesses.get(key.number, ()), occupied))
-
-    return sorted(keys, key=lambda k: (k.target is not Target.PR, clash(k), waiting_since.get(k, never), k.number))
-
-
-def path_index(paths: Iterable[str]) -> tuple[frozenset[str], frozenset[str]]:
-    """Paths for `overlaps`: the normalised files, and every directory above one."""
-    files = frozenset(p for raw in paths if isinstance(raw, str) and (p := normalise_path(raw)))
-    dirs = frozenset(f.rsplit("/", i)[0] for f in files for i in range(1, f.count("/") + 1))
-    return files, dirs
-
-
-def overlaps(touches: Iterable[str], index: tuple[frozenset[str], frozenset[str]]) -> bool:
-    """Path-prefix overlap on whole segments: a guess overlaps a busy file it
-    names, a directory holding one, or a file inside a busy path. `src/a`
-    does not overlap `src/ab`. A guess that normalises to nothing never overlaps."""
-    files, dirs = index
-    for raw in touches:
-        path = normalise_guess(raw) if isinstance(raw, str) else ""
-        if not path:
-            continue
-        if path in files or path in dirs:
-            return True
-        parts = path.split("/")
-        if any("/".join(parts[:i]) in files for i in range(1, len(parts))):
-            return True
-    return False
+    return sorted(keys, key=lambda k: (k.target is not Target.PR, waiting_since.get(k, never), k.number))
 
 
 def needs_human_key(key: ItemKey, stop: NeedsHuman) -> str:
@@ -258,6 +210,6 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     raise TypeError(f"unknown derived state {state!r}")
 
 
-__all__ = ["OVERLAP_DEFER_CEILING", "QUESTION_LIMIT", "actions", "base_ci_actions", "base_title",
-           "blocker_closed_comment", "blocker_comment", "dispatch_order", "needs_human_key", "overlaps", "path_index",
+__all__ = ["QUESTION_LIMIT", "actions", "base_ci_actions", "base_title",
+           "blocker_closed_comment", "blocker_comment", "dispatch_order", "needs_human_key",
            "question_text", "triage_comment"]

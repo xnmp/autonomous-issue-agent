@@ -1,8 +1,7 @@
 """The TRIAGE and STEWARD acts' results. Pure.
 
 STEWARD writes testable acceptance criteria, flags a suspected duplicate,
-proposes a genuine dependency ("blocked by") and guesses the paths the fix
-touches;
+proposes a genuine dependency ("blocked by");
 TRIAGE grades the difficulty tier that routes the issue (owner, 2026-10-14:
 one act each, on its own model). Before the split one TRIAGE result carried
 all of it, and such legacy records still read back: `steward_from_record`
@@ -17,8 +16,7 @@ against the issue numbers the harness itself offered the leg: the schema the
 harness writes enumerates them (read from GitHub at dispatch), so a number
 outside that list is dropped, not trusted. `blocked_by` is laundered the same
 way against the open issues offered, and `link_refusal` rechecks it on fresh
-reads before the harness writes the link. `touches` only orders dispatch, so a
-malformed list drops to none rather than failing the result. Anything malformed or oversized
+reads before the harness writes the link. Anything malformed or oversized
 parses to None, which readers treat as no data: the issue runs at the default
 tier, with no criteria, no duplicate stop and no comment line for it.
 
@@ -39,8 +37,6 @@ MAX_CRITERION = 500
 MAX_REASON = 500
 MAX_RATIONALE = 2000
 MAX_OFFERED = 300
-MAX_TOUCHES = 30
-MAX_TOUCH = 200
 _MAX_ISSUE = 2_147_483_647
 
 
@@ -69,8 +65,6 @@ class Steward:
     # An open issue this one cannot be correctly done before (never mere overlap).
     blocked_by: int | None = None
     blocked_by_reason: str = ""
-    # Repo paths (files or directories) the fix is expected to change: a guess.
-    touches: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("duplicate_of", "blocked_by"):
@@ -79,14 +73,11 @@ class Steward:
                 raise ValueError(f"{name} is a positive issue number or None")
         if (self.blocked_by is None) != (not self.blocked_by_reason):
             raise ValueError("a blocker is carried exactly with its reason")
-        if not isinstance(self.touches, tuple) or any(not isinstance(t, str) or not t for t in self.touches):
-            raise ValueError("touches is a tuple of paths")
 
     def record(self) -> dict[str, object]:
         return {"acceptance_criteria": list(self.acceptance_criteria),
                 "duplicate_of": self.duplicate_of, "duplicate_reason": self.duplicate_reason,
-                "blocked_by": self.blocked_by, "blocked_by_reason": self.blocked_by_reason,
-                "touches": list(self.touches)}
+                "blocked_by": self.blocked_by, "blocked_by_reason": self.blocked_by_reason}
 
 
 def _text(raw: object, limit: int) -> str | None:
@@ -110,38 +101,6 @@ def parse_triage(raw: object) -> Triage | None:
     tier = parse_tier(raw.get("tier"))
     rationale = _text(raw.get("rationale", ""), MAX_RATIONALE)
     return Triage(tier, rationale) if tier is not None and rationale is not None else None
-
-
-def parse_touches(raw: object) -> tuple[str, ...]:
-    """The steward's path guesses, normalised (`normalise_guess`), at most
-    MAX_TOUCHES of them; anything but a list is none. A guess that is not a
-    bounded string, or normalises to nothing (the repo root, `..`), is dropped:
-    the latter would overlap everything."""
-    if not isinstance(raw, list):
-        return ()
-    paths = (normalise_guess(item) for item in raw if isinstance(item, str) and len(item) <= MAX_TOUCH)
-    return tuple(dict.fromkeys(p for p in paths if p))[:MAX_TOUCHES]
-
-
-def normalise_guess(raw: str) -> str:
-    """A steward path guess as a path: a glob (`*`, `?`, `{`) is cut back to the
-    whole directory before it (`src/Button*.tsx` is `src`). Brackets stay
-    literal: `app/[id]/page.tsx` is a real route path far more often than a glob."""
-    path = raw.strip()
-    glob = min((i for i in (path.find(c) for c in "*?{") if i >= 0), default=-1)
-    return normalise_path(path[: max(path.rfind("/", 0, glob), 0)] if glob >= 0 else path)
-
-
-def normalise_path(raw: str) -> str:
-    """A repo-relative path, taken literally, for prefix matching: no
-    surrounding blanks or slashes and no `./`. A path leaving the repo (`..`)
-    or holding a control character is "" (none). GitHub's changed files go
-    through this alone: `src/routes/[slug]/+page.svelte` is a file."""
-    path = raw.strip()
-    parts = [part for part in path.replace("\\", "/").split("/") if part not in ("", ".")]
-    if not parts or ".." in parts or any(not part.isprintable() for part in parts):
-        return ""
-    return "/".join(parts)
 
 
 def _issue_claim(raw: Mapping, key: str, why_key: str, allowed: Callable[[int], bool]) -> tuple[int | None, str] | None:
@@ -180,7 +139,7 @@ def _steward(
     if dup is None or block is None:
         return None
     kept = tuple(c for c in criteria if c) if criteria_wanted else ()
-    return Steward(kept, dup[0], dup[1], block[0], block[1], parse_touches(raw.get("touches")))
+    return Steward(kept, dup[0], dup[1], block[0], block[1])
 
 
 def parse_steward(
@@ -240,10 +199,9 @@ def steward_schema(offered: Iterable[int], criteria_wanted: bool = True, blockab
             "duplicate_reason": {"type": "string"},
             "blocked_by": _enum(blockable),
             "blocked_by_reason": {"type": "string"},
-            "touches": {"type": "array", "items": {"type": "string"}},
         },
         "required": [*(["acceptance_criteria"] if criteria_wanted else []), "duplicate_of", "duplicate_reason",
-                     "blocked_by", "blocked_by_reason", "touches"],
+                     "blocked_by", "blocked_by_reason"],
         "additionalProperties": False,
     }
 
@@ -303,6 +261,6 @@ def link_refusal(issue: int, blocker: int, blocker_open: bool, blocker_blocked_b
     return ""
 
 
-__all__ = ["Steward", "Triage", "criteria_wanted", "link_refusal", "normalise_guess", "normalise_path", "offered_blockers",
-           "offered_duplicates", "parse_steward", "parse_touches", "parse_triage", "steward_from_record",
+__all__ = ["Steward", "Triage", "criteria_wanted", "link_refusal", "offered_blockers",
+           "offered_duplicates", "parse_steward", "parse_triage", "steward_from_record",
            "steward_schema", "triage_schema"]
