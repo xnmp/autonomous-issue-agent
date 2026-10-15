@@ -134,8 +134,7 @@ def build_steward_task(
 ) -> RuntimePlan:
     """STEWARD: state testable acceptance criteria, flag a suspected
     duplicate among `offered` (the other issues listed in `others`), propose a
-    genuine dependency among `blockable` (the open ones), and guess the paths
-    the fix touches (dispatch ordering only).
+    genuine dependency among `blockable` (the open ones).
     Deliberately no plan: the fixer designs, the reviewer judges. An issue
     that states its own criteria is not asked for any: its section stays the
     contract the PR body carries."""
@@ -163,10 +162,6 @@ def build_steward_task(
         "dependency: never set it because the issues touch the same area, the same files or the same "
         "component, or because doing one first would merely be tidier. When unsure, null. The harness "
         "links it on GitHub; a human can delete the link.\n\n"
-        "## touches — a rough guess\n"
-        "Up to 30 repository file paths (e.g. `src/auth/token.ts`) the fix will most likely change, "
-        "from the text alone. Name specific files, not directories; when you cannot name a file, "
-        "leave it out. An empty list is fine.\n\n"
         f"{_fenced('issue title', title)}\n\n"
         f"{_fenced('issue body', body)}\n\n"
         f"{_fenced('other issues', others)}"

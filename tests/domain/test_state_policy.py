@@ -25,7 +25,7 @@ from issue_agent.domain.checks import BaseTip, Check, Observed, RequiredCheck, U
 from issue_agent.domain.evidence import ChangeRequest, new_failures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import (
-    OVERLAP_DEFER_CEILING, QUESTION_LIMIT, actions, blocker_comment, dispatch_order, overlaps, path_index, question_text,
+    QUESTION_LIMIT, actions, blocker_comment, dispatch_order, question_text,
 )
 from issue_agent.domain.refs import harness_branch_issue
 from issue_agent.domain.state import (
@@ -1263,79 +1263,22 @@ def test_the_blocker_comment_says_what_was_linked_or_why_not_with_agent_text_ine
     assert BLOCKER_TAG in refused and "did not link it: #4 is closed." in refused
 
 
-# ── soft ordering by overlap: order only, never a block ──────────────────────
+# ── dispatch order: PRs first, then the longest wait ─────────────────────────
 
 
 def _issue_keys(*numbers: int) -> list[ItemKey]:
     return [issue_key(n) for n in numbers]
 
 
-@pytest.mark.parametrize(
-    ("touches", "busy", "clash"),
-    [
-        (("src/a.py",), ("src/a.py",), True),  # the exact file
-        (("src",), ("src/lib/a.py",), True),  # a directory prefix
-        (("src/lib/",), ("src/lib/a.py",), True),
-        (("./src/lib/*.py",), ("src/lib/a.py",), True),  # a glob cut back to its directory
-        (("src/a.py/x",), ("src/a.py",), True),  # inside a busy path
-        (("docs",), ("src/a.py",), False),  # no overlap
-        (("src/a",), ("src/ab.py",), False),  # whole segments only
-        (("src/lib/a.py",), ("src/lib/b.py",), False),  # siblings
-        ((), ("src/a.py",), False),  # no guess
-        (("", "/", "..", "*"), ("src/a.py",), False),  # guesses of nothing never overlap
-        (("src/a.py",), (), False),  # nothing in flight
-    ],
-)
-def test_overlap_is_a_whole_segment_path_prefix_match(touches, busy, clash):
-    assert overlaps(touches, path_index(busy)) is clash
-
-
-def test_a_huge_touch_list_against_huge_changed_files_is_matched_by_index():
-    busy = [f"pkg{i}/mod{j}.py" for i in range(300) for j in range(10)]  # 3000 files, the observe bound
-    misses = [f"other{i}/x.py" for i in range(10_000)]
-    index = path_index(busy)
-    assert overlaps(misses, index) is False
-    assert overlaps([*misses, "pkg299"], index) is True
-
-
-def test_the_oldest_non_overlapping_issue_goes_first_and_prs_still_lead():
-    waited = {issue_key(1): at(0), issue_key(2): at(1), issue_key(3): at(2), pr_key(9): at(5)}
-    touches = {1: ("src/auth",), 2: ("src/auth/token.ts",), 3: ("docs",)}
-    order = dispatch_order([*_issue_keys(3, 2, 1), pr_key(9)], waited, touches, {"src/auth/token.ts"}, at(6))
-    assert order == [pr_key(9), issue_key(3), issue_key(1), issue_key(2)]
-
-
-def test_an_overlapping_issue_is_deferred_only_until_it_has_waited_the_ceiling():
-    touches = {1: ("src",), 2: ("docs",)}
-    young = {issue_key(1): NOW - OVERLAP_DEFER_CEILING + timedelta(minutes=1), issue_key(2): NOW}
-    assert dispatch_order(_issue_keys(1, 2), young, touches, {"src/a.py"}, NOW) == _issue_keys(2, 1)
-    aged = {**young, issue_key(1): NOW - OVERLAP_DEFER_CEILING}
-    assert dispatch_order(_issue_keys(1, 2), aged, touches, {"src/a.py"}, NOW) == _issue_keys(1, 2)
-    never_served = {issue_key(2): NOW}  # #1 has no leg end: it has waited longest, so no deferral
-    assert dispatch_order(_issue_keys(1, 2), never_served, touches, {"src/a.py"}, NOW) == _issue_keys(1, 2)
-    assert dispatch_order(_issue_keys(1, 2), young, touches, {"src/a.py"}) == _issue_keys(1, 2)  # no clock: FIFO
-
-
-def test_every_issue_overlapping_or_no_data_is_plain_fifo():
-    waited = {issue_key(1): at(0), issue_key(2): at(1), issue_key(3): at(2)}
-    fifo = _issue_keys(1, 2, 3)
-    everything = {n: ("src",) for n in (1, 2, 3)}
-    assert dispatch_order(_issue_keys(3, 1, 2), waited, everything, {"src/a.py"}, at(3)) == fifo
-    assert dispatch_order(_issue_keys(3, 1, 2), waited) == fifo
-    assert dispatch_order(_issue_keys(3, 1, 2), waited, {}, {"src/a.py"}) == fifo
-    assert dispatch_order(_issue_keys(3, 1, 2), waited, {1: ("src",)}, ()) == fifo
-
-
-def test_an_issue_without_a_guess_is_not_pushed_back():
-    waited = {issue_key(1): at(0), issue_key(2): at(1)}
-    order = dispatch_order(_issue_keys(2, 1), waited, {2: ("docs",)}, {"src/a.py"}, at(2))
-    assert order == _issue_keys(1, 2)
+def test_prs_lead_then_the_longest_wait_then_the_number():
+    waited = {issue_key(1): at(0), issue_key(2): at(1), pr_key(9): at(5)}
+    order = dispatch_order([*_issue_keys(3, 2, 1), pr_key(9)], waited)
+    assert order == [pr_key(9), issue_key(3), issue_key(1), issue_key(2)]  # #3 never served: oldest
 
 
 def test_ordering_never_drops_or_duplicates_a_key():
     keys = [*_issue_keys(*range(1, 200)), *(pr_key(n) for n in range(500, 520))]
-    touches = {n: ("src",) if n % 2 else ("docs",) for n in range(1, 200)}
-    order = dispatch_order(keys, {}, touches, {"src/x.py"}, NOW)
+    order = dispatch_order(keys, {})
     assert sorted(order, key=lambda k: k.sort_key) == sorted(keys, key=lambda k: k.sort_key)
 
 

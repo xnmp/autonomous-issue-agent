@@ -31,7 +31,7 @@ from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, latest_steward, pr_key
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, pr_key
 from ..domain.triage import states_criteria
 from ..domain.trust import as_untrusted
 from ..domain.world import Comment, WorldState
@@ -47,8 +47,6 @@ _LIGHT_ACTS = frozenset(kind for kind in AgentKind if not kind.holds_dispatch_sl
 def fix_actions(
     states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int, *, merge: bool = True,
     light: int | None = None, waiting_since: Mapping[ItemKey, datetime] = MappingProxyType({}),
-    touches: Mapping[int, tuple[str, ...]] = MappingProxyType({}), busy: frozenset[str] = frozenset(),
-    now: datetime | None = None,
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches. At most
     `slots` slot-holding dispatches, granted in `dispatch_order`; STEWARD and TRIAGE hold
@@ -56,7 +54,7 @@ def fix_actions(
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     per_item = {key: policy_actions({key: state}, harness) for key, state in states.items()}
     granted: set[RunAgent] = set()
-    for key in dispatch_order(per_item, waiting_since, touches, busy, now):
+    for key in dispatch_order(per_item, waiting_since):
         for action in per_item[key]:
             if not isinstance(action, RunAgent) or action.kind not in _FIX_ACTS:
                 continue
@@ -345,16 +343,10 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
             issue = harness_branch_issue(pr.head_ref_name)
             if pr_key(pr.number) not in waiting and issue is not None and issue_key(issue) in waiting:
                 waiting[pr_key(pr.number)] = waiting[issue_key(issue)]
-        # The steward's path guesses against the files open harness PRs change: ordering only.
-        touches = {k.number: found.steward.touches for k, ends in local.legs.items()
-                   if k.target is Target.ISSUE and (found := latest_steward(ends)) is not None
-                   and found.steward is not None}
-        busy = frozenset(f for pr in world.prs if pr.state == "OPEN" and harness_branch_issue(pr.head_ref_name)
-                         for f in pr.changed_files)
         # The base branch's own CI is not an item: one issue per failing workflow, no lifecycle.
         base = base_ci_actions(world.base_ci, settings.base_branch, settings.harness.marker)
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
-                           light=slots.light, waiting_since=waiting, touches=touches, busy=busy, now=local.now) + base
+                           light=slots.light, waiting_since=waiting) + base
     return choose
 
 
