@@ -64,8 +64,8 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
         # 2026-08-10 incident where systemd's minimal default PATH killed
         # every resolve leg at spawn (#650).
         assert "PATH=@INSTALL_PATH@" in service["Environment"]
-        assert service["Restart"] == ["on-failure"]
-        assert service["RestartPreventExitStatus"] == ["0 2 3 4 5 6"]
+        assert service["Restart"] == ["always"]
+        assert service["RestartPreventExitStatus"] == ["2 3 4 5 6"]
         # Hot-reload exit (87) is a designed restart, not a crash: it must log
         # clean AND still restart, and must not march the start-limit counter
         # toward a mid-batch permanent kill (observed 2026-08-10: one commit's
@@ -90,8 +90,8 @@ def test_systemd_dashboard_is_a_hot_reloading_host_singleton():
     assert exec_start[-3:] == ["python", "-m", "issue_agent.app.dashweb.main"]
     assert service["WorkingDirectory"] == ["@HARNESS_ROOT@"]
     assert service["Environment"] == ["PATH=@INSTALL_PATH@"]
-    assert service["Restart"] == ["on-failure"]
-    assert service["RestartPreventExitStatus"] == ["0 2 3 4 5 6"]
+    assert service["Restart"] == ["always"]
+    assert service["RestartPreventExitStatus"] == ["2 3 4 5 6"]
     assert service["SuccessExitStatus"] == ["87"]
     assert service["RestartForceExitStatus"] == ["87"]
     assert unit["Unit"]["StartLimitIntervalSec"] == ["300"]
@@ -112,5 +112,7 @@ def test_launchd_plists_run_python_from_harness_root_with_target_dir_env():
         assert argv[-4:] == ["python", "-m", "issue_agent.app.launchd_main", role]
         assert data["WorkingDirectory"] == "@HARNESS_ROOT@"
         assert data["EnvironmentVariables"]["TARGET_DIR"] == "@TARGET_DIR@"
+        # The launchd wrapper requests restart for clean daemon exits and reserves
+        # success for permanent failures, which launchd must leave stopped.
         assert data["KeepAlive"] == {"SuccessfulExit": False}
         assert not any("watcher.sh" in arg for arg in argv)

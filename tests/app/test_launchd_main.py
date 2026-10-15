@@ -14,12 +14,25 @@ from issue_agent.domain.supervision import ExitCode
         ExitCode.OPERATOR_REPAIR_REQUIRED,
     ),
 )
-def test_launchd_maps_permanent_failures_to_success(code):
+def test_launchd_entrypoint_maps_permanent_failures_to_success(code):
     run(lambda: (_ for _ in ()).throw(SystemExit(code)))
 
 
 @pytest.mark.parametrize("code", (ExitCode.TRANSIENT, ExitCode.RELOAD))
-def test_launchd_preserves_restartable_failures(code):
+def test_launchd_entrypoint_preserves_restartable_failures(code):
     with pytest.raises(SystemExit) as stopped:
         run(lambda: (_ for _ in ()).throw(SystemExit(code)))
     assert stopped.value.code is code
+
+
+@pytest.mark.parametrize("code", (ExitCode.CLEAN, None))
+def test_launchd_entrypoint_restarts_clean_daemon_exits(code):
+    with pytest.raises(SystemExit) as stopped:
+        run(lambda: (_ for _ in ()).throw(SystemExit(code)))
+    assert stopped.value.code == ExitCode.TRANSIENT
+
+
+def test_launchd_entrypoint_restarts_normal_daemon_return():
+    with pytest.raises(SystemExit) as stopped:
+        run(lambda: None)
+    assert stopped.value.code == ExitCode.TRANSIENT

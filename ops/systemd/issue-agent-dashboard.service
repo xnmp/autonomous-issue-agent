@@ -17,9 +17,12 @@ WorkingDirectory=@HARNESS_ROOT@
 # The operator's PATH, captured at install time. Re-run install-service after
 # moving a toolchain so the singleton follows the latest harness installation.
 Environment=PATH=@INSTALL_PATH@
-Restart=on-failure
+# always: a SIGTERM the unit did not ask for (earlyoom under host memory
+# pressure, 2026-10-16) ends in the daemon's clean exit 0, and on-failure left
+# both roles down. A `systemctl stop` is never restarted either way.
+Restart=always
 RestartSec=3
-RestartPreventExitStatus=0 2 3 4 5 6
+RestartPreventExitStatus=2 3 4 5 6
 # Exit 87 is the designed hot-reload path. It is successful for reporting but
 # still forces systemd to restart the dashboard on the newly committed code.
 SuccessExitStatus=87

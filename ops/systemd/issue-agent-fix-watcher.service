@@ -30,9 +30,12 @@ Environment=TARGET_DIR=@TARGET_DIR@
 # resolve leg at spawn (issue #650) until this. Re-run install-service after
 # moving a toolchain (doctor's codex check names the drift).
 Environment=PATH=@INSTALL_PATH@
-Restart=on-failure
+# always: a SIGTERM the unit did not ask for (earlyoom under host memory
+# pressure, 2026-10-16) ends in the daemon's clean exit 0, and on-failure left
+# both roles down. A `systemctl stop` is never restarted either way.
+Restart=always
 RestartSec=30
-RestartPreventExitStatus=0 2 3 4 5 6
+RestartPreventExitStatus=2 3 4 5 6
 # Exit 87 is the designed hot-reload path (harness source changed; daemon
 # drains and asks to be restarted on new code). Without these lines every
 # reload logs as 'Failed' and counts against StartLimitBurst — three commits

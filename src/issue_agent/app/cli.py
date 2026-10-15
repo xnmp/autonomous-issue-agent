@@ -596,14 +596,47 @@ def _refuse_mismatch(verb: str, name: str, repo: str, target_dir: str) -> bool:
     return bool(mismatch)
 
 
+def _stop_installed_services(name: str) -> bool:
+    """Use the installer's service paths; ADR 0005 requires supervisor-owned stops."""
+    if sys.platform == "darwin":
+        paths = {role: os.path.expanduser(
+            f"~/Library/LaunchAgents/dev.issue-agent.{role}-watcher.{name}.plist") for role in ROLES}
+    elif sys.platform.startswith("linux"):
+        paths = {role: os.path.expanduser(
+            f"~/.config/systemd/user/issue-agent-{role}-watcher-{name}.service") for role in ROLES}
+    else:
+        return False
+    installed = {role: path for role, path in paths.items() if os.path.isfile(path)}
+    if sys.platform == "darwin":
+        for path in installed.values():
+            label = os.path.basename(path).removesuffix(".plist")
+            if subprocess.run(["launchctl", "list", label], capture_output=True,
+                              timeout=90).returncode == 0:
+                subprocess.run(["launchctl", "unload", path], check=True, timeout=90)
+    elif installed:
+        subprocess.run(["systemctl", "--user", "stop",
+                        *(os.path.basename(path) for path in installed.values())], check=True, timeout=90)
+    return bool(installed)
+
+
 def _stop_deployment(name: str) -> int:
-    """SIGTERM every launcher and role process of `name`, verified within 90s."""
-    pids = sorted(set(_launcher_pids(name)) | {p for g in _role_pids(name).values() for p in g})
-    if not pids:
+    """Stop installed services and foreground processes, verified within 90s."""
+    launchers, roles = _launcher_pids(name), _role_pids(name)
+    pids = sorted(set(launchers) | {p for g in roles.values() for p in g})
+    try:
+        installed = _stop_installed_services(name)
+    except (OSError, subprocess.SubprocessError) as exc:
+        err(f"failed to stop services for '{name}': {exc}")
+        return 1
+    if not pids and not installed:
         info(f"no watchers running for '{name}'.")
         return 0
+    # Installed definitions can coexist with a foreground run after a service stop.
+    foreground = (sorted(set(_launcher_pids(name)) | {p for g in _role_pids(name).values() for p in g})
+                  if installed else pids)
+    pids = sorted(set(pids) | set(foreground))
     info(f"stopping watchers for '{name}' (pids: {' '.join(map(str, pids))})")
-    for pid in pids:
+    for pid in foreground:
         try:
             send_signal(signal.SIGTERM, pid=pid, reason=f"operator_stop:{name}")
         except ProcessLookupError:
