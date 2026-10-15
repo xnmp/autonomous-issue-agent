@@ -14,6 +14,7 @@ its load-bearing boundaries exist.
 | [0006](0006-recovery-trigger-policy.md) | Explicit recovery trigger-to-arm policy |
 | [0007](0007-configuration-snapshot-and-reload.md) | Immutable configuration snapshot and coherent reload |
 | [0008](0008-control-authority-scope-and-deployment-fencing.md) | Machine-wide control scope, deployment ownership, and repoint fencing |
+| [0017](0017-stop-the-line.md) | One base-CI issue per red streak; a required workflow's is readied and fixed first |
 
 The superseded records (0004, 0009–0016) are in
 [../archive/adr/](../archive/adr/); the subtractive refactor deleted the

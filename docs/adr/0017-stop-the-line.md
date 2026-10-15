@@ -1,0 +1,59 @@
+# ADR 0017 — Fix a red base forward, first
+
+Status: Accepted
+Date: 2026-10-15
+Governs: src/issue_agent/domain/policy.py src/issue_agent/domain/ci.py src/issue_agent/domain/state.py
+
+## Context
+
+A workflow failing on the base branch filed one issue per workflow for life
+(#408), reopened when it failed again, and waited for a human to ready it.
+Meanwhile #313 kept PRs whose failures were the base's waiting uncharged, and
+branch protection kept them from merging (a PR's own CI includes the base's
+breakage). What was missing was getting the base fixed fast (tauri-explorer,
+2026-10-14). Three designs that also paused merges and dispatch behind a
+latch, with a flake re-run, each drew new blockers in review: the pause added
+risk and little the required checks did not already give.
+
+## Decision
+
+- **One base-CI issue per workflow per red streak**, from the base's
+  completed push runs: `CI: <workflow> failing on <base> since <short head>`,
+  named and keyed by the streak's first failing run created after the
+  workflow's last close. Green closes the open one. There is no reopen: a
+  close while still red (a human, or GitHub's `Closes #` on a fix's merge into
+  the default branch) files the next issue on the next red run. An open issue
+  from before (no `since`) counts as its workflow's current streak.
+- **A required workflow's issue is the harness's to fix.** A workflow is
+  required when one of its check runs on the base tip carries a context the
+  branch's protection or rules require. Its open issue is readied
+  (`ai-ready`), served ahead of everything else, and resolved without
+  STEWARD, TRIAGE or a blocker. Its PR (by the issue number in its branch) is
+  charged every base failure: it must fix them. While the required workflows
+  cannot be read, nothing is readied; the issue waits for a human.
+  Non-required workflows file their issue as before and are not readied.
+- **No pause, no flake guard.** Other work goes on; #313's `charge`/BaseRed is
+  unchanged. A flaky required test that turns the base red is a defect the
+  fix agent makes deterministic (#1165).
+- **Human off-switch**: `needs-human` on the issue; the harness then does not
+  ready it.
+
+## Provenance and authority
+
+Inputs: completed push runs on the base and the tip's check runs (GitHub
+Actions, under the repository's control); the branch protection and rules
+(repository admins); base-CI issues, kept only when `FIX_BOT` authored them.
+New privileged effect: `ai-ready` on the harness's own base-CI issue of a
+required workflow. Spend stays under the existing caps.
+
+## Removed
+
+The reopen path and `harness_closed` (and its close-event read); the operator
+step of readying a red base's issue.
+
+## Crash points
+
+The filing is keyed by the streak's title, and act reads the token's own issue
+listing before filing again, so a replay or a lagging search files once. The
+close and the label are read back. A crash between any two re-derives the same
+actions next tick (`tests/domain/test_base_ci.py`, `tests/app/test_fix_role.py`).
