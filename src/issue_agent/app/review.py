@@ -13,8 +13,9 @@ submits the parsed verdict as one GitHub review on that commit under the
 review bot's identity. The verdict is the agent's claim: anything but an
 exact APPROVE or REQUEST_CHANGES with a body is no verdict, and the leg
 counts as an attempt (derive caps REVIEW attempts per head). So does an end
-retrying cannot change: GitHub refusing the submission (a 4xx) or a head with
-nothing to review. A transport failure is a machine end and backs off.
+retrying cannot change: GitHub refusing the submission (a 4xx). A transport
+failure is a machine end and backs off. An empty diff is reviewed: it claims
+the base already resolves the issue (tauri #786).
 """
 
 from __future__ import annotations
@@ -88,10 +89,6 @@ class ReviewAct:
         self.dispatch(action)
 
 
-class _NothingToReview(Exception):
-    """The head's base...head diff is empty: an end retrying cannot change."""
-
-
 # The prior review and the issue body ride along whole up to this size; the
 # review is the bot's own body (REVIEW_BODY_LIMIT), so this trims the extreme.
 _PRIOR_REVIEW_BYTES = 20_000
@@ -107,9 +104,10 @@ class ReviewSettings:
 class ReviewLegs:
     """Runs one REVIEW leg and submits its verdict. A preparation or transport
     failure is recorded as a refused (machine) leg, so the PR backs off instead
-    of retrying hot. GitHub refusing the submission, or an empty diff, is
-    recorded as an attempt, so the REVIEW attempt cap stops the PR at
-    `needs-human` (written by the fix role)."""
+    of retrying hot. GitHub refusing the submission is recorded as an
+    attempt, so the REVIEW attempt cap stops the PR at `needs-human` (written
+    by the fix role). An empty diff is reviewed like any other: it claims the
+    issue is already resolved on the base, and the reviewer verifies that."""
 
     def __init__(
         self,
@@ -179,11 +177,6 @@ class ReviewLegs:
             return
         try:
             task = self._task(action, issue, pr, runs)
-        except _NothingToReview:
-            self.log(f"REVIEW PR #{action.number}: base...head is empty at {action.head[:12]}; "
-                     "nothing to review (counted as an attempt)")
-            self.accounting.record_refused_leg(attempt={"summary": "nothing to review"})
-            return
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"REVIEW PR #{action.number}: preparation failed: {exc}")
             self.accounting.record_refused_leg()
@@ -236,8 +229,6 @@ class ReviewLegs:
                  f"{runtime.value if runtime else '(default runtime)'}:{model or '(default model)'}{':' + effort.value if effort else ''}")
         base = pr.base_ref_oid
         cwd = self.checkouts.ensure(action.number, action.head, pr.base_ref_name, base)
-        if not self.checkouts.has_changes(base, action.head):
-            raise _NothingToReview
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd, runtime)
         discussion = format_pr_discussion(pr.comments)

@@ -62,6 +62,14 @@ affected acceptance criteria: the relevant screen and state must be visible and 
 REQUEST_CHANGES when evidence is missing, unreadable, or does not show the changed
 behavior (including mockups, source code, or stale captures).
 
+## A claim that the base already resolves the issue
+An empty diff, or a test-only diff whose description says the base already
+resolves the issue, makes that claim. APPROVE only when you confirm on the
+checkout that every criterion holds and a test pins the behaviour: an existing
+one you name, or the PR's own, which must fail with the named fixing change
+reverted. Screenshots are not owed, since no behaviour changes. The merge then
+closes the issue. Otherwise REQUEST_CHANGES naming what is still unmet.
+
 ## Dimension 9 — Maintainability (VERY IMPORTANT — weight this heavily)
 Long-term reason-about-ability is the top design concern. Judge whether the CHANGED
 code will stay easy to understand, test, and change. Reason from that principle —

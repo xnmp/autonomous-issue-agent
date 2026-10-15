@@ -400,10 +400,12 @@ and the review bot has no standing verdict on that head. It submits the parsed
 verdict as one review on that commit, with the bot's previous review of the
 pull request in the prompt. A submission GitHub did not answer is resubmitted
 after the machine backoff without buying the review again; one GitHub refused
-(a 4xx, such as a token without pull-request write) counts as an attempt, as
-does a head whose diff is empty. Everything else is the fix role's: a bot
+(a 4xx, such as a token without pull-request write) counts as an attempt. An
+empty diff is reviewed like any other: the fixer pushes one when the base
+already resolves the issue, and an approval merges it and closes the issue.
+Everything else is the fix role's: a bot
 change request is answered by an `ADDRESS_REVIEW` leg, and three attempts on
-one head (unusable verdicts, refusals, empty diffs), or repeated bot
+one head (unusable verdicts, refusals), or repeated bot
 change-request rounds, stop the pull request at `needs-human`. To buy a fresh
 review of the same head, dismiss the bot's review on GitHub. The role refuses
 to start without `TARGET_DIR`, or when its credential's login is not

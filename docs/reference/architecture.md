@@ -192,7 +192,8 @@ scope (ADR 0008).
 The review role (slice 5c) owes a REVIEW leg when CI is green on a harness PR's
 head and the review bot has no standing verdict on that head. The leg reads the
 exact head: a detached checkout with the base fetched, where the agent runs
-`git diff <base>...<head>` itself (an empty diff is refused without a leg). It
+`git diff <base>...<head>` itself (an empty diff is reviewed as a claim that the
+base already resolves the issue). It
 is briefed with the steward's acceptance criteria as the bar (the issue body
 when there are none; never the fixer-written PR description), the issue and its
 human comments (bounded), the PR text, the conversation and its own prior review: the Codex reviewer's read-only sandbox
