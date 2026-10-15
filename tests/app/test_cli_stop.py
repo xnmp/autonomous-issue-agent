@@ -1,5 +1,6 @@
 """Operator stops cancel supervisor restarts and verify process exit (ADR 0005)."""
 
+import plistlib
 import signal
 import subprocess
 
@@ -129,6 +130,95 @@ def test_stop_already_unloaded_launchd_services_is_idempotent(tmp_path, monkeypa
     monkeypatch.setattr(cli.subprocess, "run", run)
     assert cli._stop_deployment("myapp") == 0
     assert commands == [["launchctl", "list", path.stem] for path in paths]
+
+
+@pytest.mark.parametrize("platform", ("linux", "darwin"))
+@pytest.mark.parametrize("current_installed", (False, True))
+def test_stop_discovers_all_predecessors_by_embedded_deployment_before_signalling(
+    tmp_path, monkeypatch, platform, current_installed,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli.sys, "platform", platform)
+    current = _install_units(tmp_path, platform, ("fix", "review"))
+    predecessors = []
+    for suffix, identity in (("123456", "myapp"), ("654321", "myapp"),
+                             ("999999", "other-app"), ("111111", "MYAPP"), ("222222", None)):
+        for role in ("fix", "review"):
+            path = current[0].with_name(
+                f"dev.issue-agent.{role}-watcher.{suffix}.plist" if platform == "darwin"
+                else f"issue-agent-{role}-watcher-{suffix}.service"
+            )
+            env = {"ISSUE_AGENT_DEPLOYMENT_ID": identity} if identity is not None else {}
+            path.write_bytes(plistlib.dumps({"Label": path.stem, "EnvironmentVariables": env})
+                             if platform == "darwin" else
+                             "".join(f"Environment={key}={value}\n" for key, value in env.items()).encode())
+            if identity == "myapp":
+                predecessors.append(path)
+    malformed = current[0].with_name("dev.issue-agent.fix-watcher.bad.plist"
+                                   if platform == "darwin" else "issue-agent-fix-watcher-bad.service")
+    malformed.write_text("not a plist" if platform == "darwin" else 'Environment="unterminated')
+    if not current_installed:
+        for path in current:
+            path.unlink()
+        current = []
+    monkeypatch.setattr(cli, "read_repo_env_field", lambda *_: "")
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _: [103])
+    running = {path for path in (*current, *predecessors)}
+    monkeypatch.setattr(cli, "_role_pids", lambda _: {"fix": [101]} if running else {})
+    commands, signals = [], []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command[:2] == ["launchctl", "unload"]:
+            running.remove(next(path for path in running if str(path) == command[2]))
+        elif command[:3] == ["systemctl", "--user", "stop"]:
+            running.difference_update(path for path in tuple(running) if path.name in command[3:])
+        return subprocess.CompletedProcess(command, 0)
+
+    def kill(pid, signum):
+        assert not running, "every matching job must stop before foreground processes"
+        signals.append((pid, signum))
+        if signum == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli.os, "kill", kill)
+    assert cli._stop_deployment("myapp") == 0
+    stopped = ([command[2] for command in commands if command[:2] == ["launchctl", "unload"]]
+               if platform == "darwin" else [unit for command in commands for unit in command[3:]])
+    expected = [str(path) if platform == "darwin" else path.name for path in (*current, *predecessors)]
+    assert sorted(stopped) == sorted(expected)
+    assert signals[0] == (103, signal.SIGTERM)
+    assert sorted(signals[1:]) == [(101, 0), (103, 0)]
+    assert all(path.exists() for path in (*current, *predecessors))
+
+
+@pytest.mark.parametrize("legacy_suffix", ("", "-checkout", "-acme-repo"))
+@pytest.mark.parametrize("embedded_target", (None, "/repos/checkout", "/repos/other"))
+def test_stop_systemd_discovers_legacy_names_without_deployment_identity(
+    tmp_path, monkeypatch, legacy_suffix, embedded_target,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli, "read_repo_env_field",
+                        lambda _path, field: {"REPO": "acme/repo", "TARGET_DIR": "/repos/checkout"}[field])
+    directory = tmp_path / ".config/systemd/user"
+    directory.mkdir(parents=True)
+    paths = [directory / f"issue-agent-{role}-watcher{legacy_suffix}.service" for role in ("fix", "review")]
+    for path in paths:
+        path.write_text(f"Environment=TARGET_DIR={embedded_target}\n" if embedded_target else "[Service]\n")
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _: [])
+    monkeypatch.setattr(cli, "_role_pids", lambda _: {})
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._stop_deployment("myapp") == 0
+    assert commands == ([] if embedded_target == "/repos/other" else
+                        [["systemctl", "--user", "stop", *(path.name for path in paths)]])
 
 
 @pytest.mark.parametrize("platform", ("linux", "darwin"))

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import glob
 import json
 import os
 import re
@@ -37,7 +38,7 @@ from ..domain.deployment import canonical_deployment_name
 from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
 from .config import default_state_dir as config_default_state_dir
-from .doctor import doctor_findings, identity_findings
+from .doctor import doctor_findings, identity_findings, parse_unit
 from .identity import LOGIN
 
 # …/src/issue_agent/app/cli.py → the harness checkout (plugin/ and config/).
@@ -596,26 +597,53 @@ def _refuse_mismatch(verb: str, name: str, repo: str, target_dir: str) -> bool:
     return bool(mismatch)
 
 
+def _systemd_predecessor_matches(path: str, env: dict[str, str], name: str) -> bool:
+    """Mirror install-systemd.sh's legacy names and target ownership guard."""
+    overlay = os.path.join(REPOS_DIR, f"{name}.env")
+    target = read_repo_env_field(overlay, "TARGET_DIR")
+    if not target or (env.get("TARGET_DIR") and env["TARGET_DIR"] != target):
+        return False
+    repo = read_repo_env_field(overlay, "REPO")
+    suffixes = ("", f"-{canonical_deployment_name(os.path.basename(target))}",
+                f"-{derive_name(repo)}" if repo else "")
+    return os.path.basename(path) in {
+        f"issue-agent-{role}-watcher{suffix}.service" for role in ROLES for suffix in suffixes
+    }
+
+
 def _stop_installed_services(name: str) -> bool:
-    """Use the installer's service paths; ADR 0005 requires supervisor-owned stops."""
+    """Discover installed writers as the installers do; supervisor stops own ADR 0005."""
     if sys.platform == "darwin":
-        paths = {role: os.path.expanduser(
-            f"~/Library/LaunchAgents/dev.issue-agent.{role}-watcher.{name}.plist") for role in ROLES}
+        directory, suffix = os.path.expanduser("~/Library/LaunchAgents"), ".plist"
+        prefixes = [f"dev.issue-agent.{role}-watcher" for role in ROLES]
+        current_suffix = f".{name}{suffix}"
     elif sys.platform.startswith("linux"):
-        paths = {role: os.path.expanduser(
-            f"~/.config/systemd/user/issue-agent-{role}-watcher-{name}.service") for role in ROLES}
+        directory, suffix = os.path.expanduser("~/.config/systemd/user"), ".service"
+        prefixes = [f"issue-agent-{role}-watcher" for role in ROLES]
+        current_suffix = f"-{name}{suffix}"
     else:
         return False
-    installed = {role: path for role, path in paths.items() if os.path.isfile(path)}
+    installed = []
+    for prefix in prefixes:
+        for path in sorted(glob.glob(os.path.join(directory, f"{prefix}*{suffix}"))):
+            if not os.path.isfile(path):
+                continue
+            parsed = parse_unit(path)
+            env = parsed[0] if parsed is not None else {}
+            identity = env.get("ISSUE_AGENT_DEPLOYMENT_ID")
+            if (os.path.basename(path) == f"{prefix}{current_suffix}" or identity == name
+                or (suffix == ".service" and parsed is not None and not identity
+                    and _systemd_predecessor_matches(path, env, name))):
+                installed.append(path)
     if sys.platform == "darwin":
-        for path in installed.values():
+        for path in installed:
             label = os.path.basename(path).removesuffix(".plist")
             if subprocess.run(["launchctl", "list", label], capture_output=True,
                               timeout=90).returncode == 0:
                 subprocess.run(["launchctl", "unload", path], check=True, timeout=90)
     elif installed:
         subprocess.run(["systemctl", "--user", "stop",
-                        *(os.path.basename(path) for path in installed.values())], check=True, timeout=90)
+                        *(os.path.basename(path) for path in installed)], check=True, timeout=90)
     return bool(installed)
 
 
