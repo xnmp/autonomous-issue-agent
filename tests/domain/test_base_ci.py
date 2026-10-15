@@ -75,6 +75,37 @@ def test_a_close_while_red_files_the_next_issue_on_the_next_red_run_only():
     assert filed.title == f"{PREFIX} since sha3"
 
 
+def _run(run: int, conclusion: str, created: str, completed: str) -> BaseRun:
+    return BaseRun("macOS Smoke", run, f"https://x/runs/{run}", f"sha{run}", conclusion,
+                   f"2026-10-14T{created}Z", f"2026-10-14T{completed}Z")
+
+
+def test_a_green_close_never_holds_back_a_red_run_that_overlapped_it():
+    # Green G (10:00) finishes 10:20 and closes the old streak's issue at 10:21; red R, created 10:05
+    # while G ran, finishes 10:40: the base is red and must have an issue.
+    green, red = _run(1, "success", "10:00:00", "10:20:00"), _run(2, "failure", "10:05:00", "10:40:00")
+    for old in (f"{PREFIX} since sha0", PREFIX):
+        (filed,) = _act(green, red, issues=[BaseIssue(40, old, "2026-10-14T10:21:00Z")])
+        assert filed.title == f"{PREFIX} since sha2"
+
+
+def test_after_a_close_mid_streak_a_failure_completing_at_or_after_it_files():
+    issues = [BaseIssue(40, f"{PREFIX} since sha1", "2026-10-14T10:21:00Z")]  # closed by its fix's merge
+    first = _run(1, "failure", "09:00:00", "09:30:00")
+    assert _act(first, _run(2, "failure", "10:00:00", "10:20:59"), issues=issues) == ()  # finished before the close
+    (filed,) = _act(first, _run(3, "failure", "10:21:00", "10:21:00"), issues=issues)  # same second as the close
+    assert filed.title == f"{PREFIX} since sha3"
+    (filed,) = _act(first, _run(4, "failure", "10:00:00", "10:50:00"), issues=issues)  # running across the close
+    assert filed.title == f"{PREFIX} since sha4"
+
+
+def test_an_open_issue_whose_fix_merged_is_closed_while_red_so_the_next_failure_files():
+    issues = [BaseIssue(40, f"{PREFIX} since sha2")]  # a fix into a non-default base: `Closes #` closed nothing
+    (closed,) = base_ci_actions(BaseCI((_br(2, "failure"),), tuple(issues)), "dev", "<!-- m -->", merged=(40,))
+    assert isinstance(closed, SetIssueState) and closed.number == 40 and not closed.open
+    assert base_ci_actions(BaseCI((_br(2, "failure"),), tuple(issues)), "dev", "<!-- m -->", merged=(41,)) == ()
+
+
 def test_a_title_stays_within_githubs_limit_whatever_the_base_branch():
     base = "release/" + "b" * 192
     (filed,) = base_ci_actions(BaseCI((_br(2, "failure", name="w" * 300),), ()), base, "<!-- m -->")
@@ -152,6 +183,6 @@ def test_the_base_fix_pr_is_charged_the_bases_failure_and_another_pr_waits_as_ba
 
 
 def test_base_fix_work_is_served_first():
-    keys = [pr_key(7), issue_key(3), issue_key(40)]
+    keys = [pr_key(7), issue_key(3), issue_key(40)]  # the fix role adds the base fix's PR to `first` too
     assert dispatch_order(keys, {}, frozenset({issue_key(40)}))[0] == issue_key(40)
     assert dispatch_order(keys, {})[0] == pr_key(7)

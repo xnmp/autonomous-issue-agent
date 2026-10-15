@@ -413,8 +413,9 @@ PR whose failing checks all fail on the base tip too waits uncharged. A
 workflow failing on the base's push runs gets one issue per red streak,
 `CI: <workflow> failing on <base> since <head>`, naming the first failing
 run; the harness closes it when the workflow passes, and a later failure, or
-one that outlives a close (a human's, or GitHub's `Closes #` on a fix's
-merge), gets the next streak's issue. If the workflow has a check the base
+one completing after a close while still red (a human's, or a fix's merge,
+which the harness closes itself on a non-default base), gets the next
+streak's issue. If the workflow has a check the base
 branch requires, the harness readies the issue itself and dispatches it ahead
 of everything else, without steward, triage or blocked-by, and its PR is
 charged the base's failures. Other work is not paused: required checks

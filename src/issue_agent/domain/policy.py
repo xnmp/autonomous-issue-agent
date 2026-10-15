@@ -127,17 +127,23 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
             "the harness will not write that link again.")
 
 
-def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str, admitted: Iterable[int] = ()) -> tuple[Action, ...]:
+def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str, admitted: Iterable[int] = (),
+                    merged: Iterable[int] = ()) -> tuple[Action, ...]:
     """One issue per workflow per red streak on the base branch, required or
     not (#402, ADR 0017). Green closes the workflow's open issues. A red
     verdict with none open files one, named and keyed by the streak's first
-    failing run created after the workflow's last close: a close while still
-    red (a human, or GitHub's `Closes #` on a fix's merge) files the next
-    issue on the next red run. A required workflow's open issue is readied
-    (`ai-ready`) unless it carries `ai-ready` or `needs-human` (`admitted`)."""
+    failing run; once an issue filed for this streak is closed while it stays
+    red (a human, a fix's merge), by the first failing run that completed
+    after that close. A close by the green before the streak never holds it
+    back. An open issue whose harness PR merged (`merged`; a fix into a
+    non-default base that `Closes #` does not close) is closed while the base
+    stays red, so the next red run files. A required workflow's open issue is
+    readied (`ai-ready`) unless it carries `ai-ready` or `needs-human`
+    (`admitted`)."""
     if base_ci is None:
         return ()
     out: list[Action] = []
+    done = frozenset(merged)
     for latest, since, bounded in base_verdicts(base_ci.runs):
         issues, name = workflow_issues(base_ci, latest.workflow, base), _inert(" ".join(latest.workflow.split())[:200])
         opened = [i for i in issues if not i.closed_at]
@@ -145,13 +151,20 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str, admitted: It
             out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
                                                       f"{latest.url} (head `{latest.head_sha}`).") for i in opened)
             continue
-        closed = max((at for i in issues if (at := parse_timestamp(i.closed_at))), default=None)
-        first = None if opened else min(
-            (r for r in base_ci.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
-             and _created(r) >= _created(since) and (closed is None or _created(r)[0] > closed)),
-            key=_created, default=None)
+        if opened:
+            out.extend(SetIssueState(i.number, False, f"{marker}\nIts fix merged, but **{name}** still fails on "
+                                                      f"`{base}`: {latest.url}. The next failing run files a fresh "
+                                                      "issue.") for i in opened if i.number in done)
+            continue
+        streak = sorted((r for r in base_ci.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
+                         and _created(r) >= _created(since)), key=_created)
+        closed = {i.title: at for i in issues if (at := parse_timestamp(i.closed_at))}
+        after = max((closed[t] for r in streak if (t := base_title(latest.workflow, base, r.head_sha)) in closed),
+                    default=None)
+        first = next((r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed and (
+            after is None or (parse_timestamp(r.completed_at) or after) >= after)), None)
         if first is None:
-            continue  # its issue is open, or closed after every listed failure: the next red run files
+            continue  # closed after every listed failure of the streak: the next failing run files
         title = base_title(latest.workflow, base, first.head_sha)
         lead = "Earliest listed" if first == since and not bounded else "First"
         out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {lead} failing run: {first.url} "

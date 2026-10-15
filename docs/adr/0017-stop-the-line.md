@@ -19,17 +19,22 @@ risk and little the required checks did not already give.
 
 - **One base-CI issue per workflow per red streak**, from the base's
   completed push runs: `CI: <workflow> failing on <base> since <short head>`,
-  named and keyed by the streak's first failing run created after the
-  workflow's last close. Green closes the open one. There is no reopen: a
-  close while still red (a human, or GitHub's `Closes #` on a fix's merge into
-  the default branch) files the next issue on the next red run. An open issue
-  from before (no `since`) counts as its workflow's current streak.
+  named and keyed by the streak's first failing run. Green closes the open
+  one. There is no reopen: once an issue filed for the streak is closed while
+  it stays red (a human, or `Closes #` on a fix's merge), the first failing
+  run that completes at or after that close files the next issue. The green
+  close before a streak never holds it back, so whenever a workflow's latest
+  completed run is red its issue is open or filed. An open issue whose
+  harness PR merged (into a non-default base, where `Closes #` closes
+  nothing) is closed while the base stays red. An open issue from before (no
+  `since`) counts as its workflow's current streak.
 - **A required workflow's issue is the harness's to fix.** A workflow is
   required when one of its check runs on the base tip carries a context the
   branch's protection or rules require. Its open issue is readied
   (`ai-ready`), served ahead of everything else, and resolved without
   STEWARD, TRIAGE or a blocker. Its PR (by the issue number in its branch) is
-  charged every base failure: it must fix them. While the required workflows
+  served first too and charged every base failure: it must fix them (with
+  two red required workflows, another workflow's too). While the required workflows
   cannot be read, nothing is readied; the issue waits for a human.
   Non-required workflows file their issue as before and are not readied.
 - **No pause, no flake guard.** Other work goes on; #313's `charge`/BaseRed is

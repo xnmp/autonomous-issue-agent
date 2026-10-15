@@ -1496,6 +1496,23 @@ def test_402_the_base_fix_pr_is_charged_the_bases_failure_and_others_wait(role):
     assert [a.number for a in dispatched(taken, AgentKind.FIX_CI)] == [100]
 
 
+def test_402_a_fix_merged_into_a_non_default_base_that_leaves_it_red_files_the_next_issue(role):
+    gh = FakeGitHub(base_runs=[base_run("Smoke", 2, "failure", -5)], required=frozenset({"Smoke"}))
+    composed, _ = role(gh, Agent(did_nothing()))
+    tick(composed)
+    (issue,) = base_issues(gh).values()
+    tick(composed)
+    open_pr(gh, issue=issue.number)
+    gh.prs[100] = replace(gh.prs[100], state="MERGED")  # merged outside the harness; `Closes #` closes nothing on dev
+    tick(composed)
+    assert gh.issues[issue.number].state == "closed"  # not left open and shadowed by its merged PR
+    gh.base_runs.append(base_run("Smoke", 3, "failure", 5))
+    tick(composed)
+    fresh = base_issues(gh)["CI: Smoke failing on dev since sha3"]
+    tick(composed)
+    assert [a.number for a in dispatched(tick(composed), AgentKind.RESOLVE)] == [fresh.number]
+
+
 def test_402_a_second_red_streak_after_a_merged_fix_files_and_dispatches_a_new_issue(role):
     gh = FakeGitHub(base_runs=[base_run("Smoke", 2, "failure", -5)], required=frozenset({"Smoke"}))
     composed, _ = role(gh, Agent(did_nothing()))
