@@ -1,6 +1,6 @@
 """Entry point — `python -m issue_agent.app.main <fix|review>`.
 
-Builds the identity (fixer = ambient/PAT; review = GitHub App token), the
+Resolves the role's verified GitHub identity (`identity.py`), builds the
 adapters, and runs the chosen role's daemon forever.
 """
 
@@ -22,7 +22,7 @@ from ..adapters.control_store import (
 )
 from ..adapters.credentials import require_stored_secrets, with_credentials
 from ..adapters.env_file import source_env_file
-from ..adapters.github import GitHubGateway, Identity
+from ..adapters.github import GitHubGateway
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from ..adapters.systemd_notify import SystemdNotifier
 from ..adapters.worktree import Worktrees
@@ -34,7 +34,7 @@ from ..domain.repository import canonical_repository
 from .config import HarnessConfig, from_env, rate_table, render_agent_md, supervision_dir
 from .fix import compose_fix_daemon
 from .review import compose_review_daemon
-from .review_identity import review_identity as _app_identity
+from .identity import resolve_role_identity, role_credential
 from .tick import Daemon, Role, leg_sandbox
 
 
@@ -80,6 +80,7 @@ def _validate_reload_candidate(env: dict[str, str], role: str | None = None) -> 
     loaded = _load_agent_env(env)
     if role:
         require_stored_secrets(loaded, role)
+        role_credential(role, loaded)
     candidate = from_env(loaded)
     candidate.validate()
 
@@ -163,15 +164,14 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
         rate_table=rate_table(cfg, RuntimeName.CLAUDE.value),
         leg_sandbox=sandbox,
     )
+    identity, login = resolve_role_identity(role, env, cfg.fix_bot if role == "fix" else cfg.review_bot,
+                                            lambda candidate: GitHubGateway(cfg.repo, candidate).viewer_login(), log)
+    cfg = dataclasses.replace(cfg, fix_bot=login) if role == "fix" else dataclasses.replace(cfg, review_bot=login)
+    gw = GitHubGateway(cfg.repo, identity, progress=scheduler_progress)
     if role == "fix":
-        gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
-                           progress=scheduler_progress)
         worktrees = Worktrees(cfg.target_dir or os.getcwd(), cfg.worktree_root, cfg.base_branch)
         return _store_woken(compose_fix_daemon(cfg, gw, worktrees, runner), cfg, role, log)
-    if role == "review":
-        gw = GitHubGateway(cfg.repo, _app_identity(env, warn=log), progress=scheduler_progress)
-        return _store_woken(compose_review_daemon(cfg, gw, runner), cfg, role, log)
-    raise SystemExit(f"unknown role: {role!r} (use fix|review)")
+    return _store_woken(compose_review_daemon(cfg, gw, runner), cfg, role, log)
 
 
 def _role(argv: list[str] | None) -> str:

@@ -100,9 +100,11 @@ def secret_source_findings(env: dict, stored: tuple[str, ...]) -> tuple[Finding,
 
 
 def identity_findings(env: dict, stored: tuple[str, ...] = ()) -> tuple[Finding, ...]:
-    """The two-identity model: the fixer and the reviewer each on their own
-    credential (a GitHub App or REVIEW_BOT_TOKEN for review). `stored` names
-    secrets held as systemd credentials: present, though not in `env`."""
+    """Each role's credential as `app/identity.py` resolves it: FIX_BOT_TOKEN
+    for the fixer; the GitHub App when its key is readable, else
+    REVIEW_BOT_TOKEN, for the reviewer. A role with none refuses to start; no
+    role falls back to the operator's `gh` login. `stored` names secrets held
+    as systemd credentials: present, though not in `env`."""
     findings: list[Finding] = []
     fix = str(env.get("FIX_BOT_TOKEN") or "")
     review = str(env.get("REVIEW_BOT_TOKEN") or "")
@@ -111,22 +113,23 @@ def identity_findings(env: dict, stored: tuple[str, ...] = ()) -> tuple[Finding,
     app = [str(env.get(k) or "") for k in ("GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE")]
     for name, value in (("FIX_BOT_TOKEN", fix), ("REVIEW_BOT_TOKEN", review)):
         if value and not value.strip():
-            findings.append(Finding("error", f"{name} is whitespace: it is sent as a bearer token "
-                                             "and GitHub 401s every call. Unset it or set a real token."))
+            findings.append(Finding("error", f"{name} is whitespace: the role holding it refuses to start. "
+                                             "Unset it or set a real token."))
     if not has_fix:
-        findings.append(Finding("error", "FIX_BOT_TOKEN is not set: fix legs run sandboxed with no GitHub "
-                                         "credential and cannot push or read CI logs (#413)."))
+        findings.append(Finding("error", "FIX_BOT_TOKEN is not set: the fix role refuses to start, and fix legs "
+                                         "need it to push and read CI logs (#413)."))
     if any(app) and not all(app):
         findings.append(Finding("error", "GH_APP_ID, GH_APP_INSTALL_ID and GH_APP_KEY_FILE must be set together."))
-    uses_app = all(app)
-    if uses_app:
-        key = app[2]
+    uses_app, why = False, "no GitHub App"
+    if all(app):
         home = str(env.get("HOME") or "")
-        key = home + key[1:] if home and key.startswith("~") else os.path.expanduser(key)
-        if not os.access(key, os.R_OK):
-            findings.append(Finding("error", f"GH_APP_KEY_FILE {app[2]!r} is not readable: "
-                                             "the reviewer cannot mint its token."))
-    elif (review and review == fix) or (not has_review and not has_fix):
+        key = home + app[2][1:] if home and app[2].startswith("~") else os.path.expanduser(app[2])
+        uses_app, why = os.access(key, os.R_OK), f"GH_APP_KEY_FILE {app[2]!r} is not readable"
+        if not uses_app and has_review:
+            findings.append(Finding("warn", f"{why}: the reviewer uses REVIEW_BOT_TOKEN."))
+    if not uses_app and not has_review:
+        findings.append(Finding("error", f"REVIEW_BOT_TOKEN is not set and {why}: the review role refuses to start."))
+    elif not uses_app and review and review == fix:
         findings.append(Finding("error", "the fixer and the reviewer resolve to the same credential: "
                                          "GitHub 422s a review by the PR's author, so nothing can merge. "
                                          "Give the reviewer its own token or a GitHub App."))

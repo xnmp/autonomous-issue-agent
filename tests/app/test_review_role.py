@@ -53,10 +53,6 @@ class ReviewGitHub(FakeGitHub):
     fail_submit: int = 0  # submissions GitHub fails to answer (a 502)
     refuse_submit: int = 0  # submissions GitHub refuses with a 4xx
     refused: int = 0
-    login: str = REVIEW_BOT  # who the review credential acts as
-
-    def viewer_login(self) -> str:
-        return self.login
 
     def reviewed_on(self, pr: int, head: str, login: str) -> bool:
         return any(
@@ -140,13 +136,9 @@ def roles(tmp_path):
             )
 
         def fix(self, gh, agent, **env):
-            reviewer, gh.login = gh.login, FIX_BOT  # the fix role boots as its own credential
-            try:
-                return compose_fix_daemon(
-                    cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent, log=lambda _line: None
-                )
-            finally:
-                gh.login = reviewer
+            return compose_fix_daemon(
+                cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent, log=lambda _line: None
+            )
 
     return Roles()
 
@@ -314,18 +306,6 @@ def test_a_push_during_the_review_leaves_the_verdict_on_the_old_head_and_never_m
 
 
 # ── boot checks: misconfigurations no retry can fix ──────────────────────────
-
-
-def test_a_review_credential_that_is_not_review_bot_refuses_to_start(roles):
-    # It posted under the real login while the read-back looked for REVIEW_BOT:
-    # one duplicate review per retry, forever.
-    for login in ("someone-else", ""):
-        with pytest.raises(ValueError, match="REVIEW_BOT"):
-            roles.review(ReviewGitHub(issues={5: ready()}, login=login), Agent())
-
-
-def test_review_bot_matches_its_credential_up_to_case_and_the_bot_suffix(roles):
-    roles.review(ReviewGitHub(issues={5: ready()}, login=REVIEW_BOT.upper().removesuffix("[BOT]")), Agent())
 
 
 def test_the_review_role_refuses_to_start_without_a_checkout_to_pin_reviews_to(roles):

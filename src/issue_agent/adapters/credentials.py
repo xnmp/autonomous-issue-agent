@@ -81,8 +81,7 @@ def with_credentials(
 def require_stored_secrets(env: Mapping[str, str], role: str) -> None:
     """Fail closed: when `role`'s unit would have imported a credstore file
     that never arrived (foreground run, or a reload after the plaintext was
-    removed) and the env has no value, refuse rather than let the daemon fall
-    back to the operator's ambient `gh` login."""
+    removed) and the env has no value, refuse, naming where the secret is."""
     home = env.get("HOME") or os.path.expanduser("~")
     for name in ROLE_SECRETS.get(role, ()):
         if not (env.get(name) or "").strip() and in_credstore(home, name):

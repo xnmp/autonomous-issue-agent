@@ -612,7 +612,8 @@ def build_enable_auto_merge_args(repo: str, pr: int, method: str, expected_head:
 @dataclass(frozen=True)
 class Identity:
     """How `gh` authenticates: app-token mint, else static token, else ambient
-    `gh auth`."""
+    `gh auth`, the operator's own login (operator CLI writes only; a daemon
+    never runs ambient: `app/identity.py`)."""
 
     static_token: str | None = None
     token_provider: Callable[[], str] | None = None  # e.g. AppTokenMinter.get

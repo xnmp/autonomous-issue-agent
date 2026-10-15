@@ -536,12 +536,13 @@ adapters live under `adapters/dashweb/`.
 binary the daemons exec, the installed services' PATH and snapshot),
 `app/fix.py` (the fix role: one paid leg per dispatch, resuming the right
 session),
+`app/identity.py` (each role's GitHub credential, verified against its
+configured login at boot; no credential refuses to start, ADR 0001),
 `app/launchd_main.py`,
 `app/main.py`,
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict
 once, resubmitting a stored verdict free when its submission never landed),
-`app/review_identity.py`,
 `app/tick.py` (the daemon both roles run: local facts from SQLite,
 derive → policy → choose, the action executor, bounded paid dispatch, the
 single `run_leg` path, the SIGTERM drain, and `compose_role`: the one

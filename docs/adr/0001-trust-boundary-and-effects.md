@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
+Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
 
 ## Decision
 
@@ -72,6 +72,18 @@ legs only) and is required: a Claude leg with no such credential (that or
 `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`) is refused, so the operator's
 `~/.claude` is never mounted beyond the leg's own session store. launchd and
 foreground runs keep env-file secrets.
+Role identity (#443, 2026-10-15) is resolved once at boot by
+`app/identity.py`, fail-closed. The fix role acts on `FIX_BOT_TOKEN`; the
+review role on its GitHub App when the key is readable, else
+`REVIEW_BOT_TOKEN`. A role with no credential refuses to start: no daemon
+runs on the operator's ambient `gh` login, which only operator CLI writes use.
+The role then asks GitHub (`viewer`) who the credential is and refuses unless
+the answer is a well-formed login equal to its configured `FIX_BOT` /
+`REVIEW_BOT`, since keyed writes are read back by that author (#424). The
+verified spelling becomes the role's own login in `Harness`; the sibling's
+login stays configuration, because a role holds no credential to verify the
+other's. Crash points: none; the check runs before any lease or write, and a
+refusal exits `INVALID_CONFIG` (`tests/app/test_role_identity.py`).
 Paid legs are refused when bwrap is missing or cannot create a
 sandbox: there is no unsandboxed mode and no per-repo knob. The sandbox
 replaces the "trusted inbound content only" operator constraint and the

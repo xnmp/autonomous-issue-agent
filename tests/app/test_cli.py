@@ -867,10 +867,10 @@ def test_cmd_init_stores_a_verified_token_privately_and_never_echoes_it(tmp_path
 
 def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configured(tmp_path, monkeypatch):
     """The App supplies the review identity, so REVIEW_BOT_TOKEN is not
-    asked for. The FIXER's is: the App covers review only, and
-    `main` builds the fix gateway from FIX_BOT_TOKEN or nothing (2026-08-02
-    keifu — an App-configured deployment still ran its fixer on the operator's
-    ambient credential)."""
+    asked for. The FIXER's is: the App covers review only, and the fix role
+    refuses to start without FIX_BOT_TOKEN (2026-08-02 keifu: an
+    App-configured deployment ran its fixer on the operator's ambient
+    credential; #443 removed that fallback)."""
     text, _asked, secrets = _init(
         tmp_path,
         monkeypatch,

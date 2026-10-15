@@ -245,9 +245,6 @@ class _BuildableGateway(FakeGateway):
     def build_world(self):  # pragma: no cover - never ticked in these tests
         raise AssertionError("these tests build the daemon, they do not tick it")
 
-    def viewer_login(self) -> str:
-        return REVIEW_BOT  # the review role's boot check: its credential is REVIEW_BOT
-
 
 def _role_state_env(tmp_path) -> dict[str, str]:
     return {"STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "review-state")}
