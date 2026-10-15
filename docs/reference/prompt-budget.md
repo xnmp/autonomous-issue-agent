@@ -68,3 +68,7 @@ whitespace-delimited words.
 Re-measured 2026-10-14 after the leg sandbox (#413) replaced the
 "trusted inbound content only" paragraph with the sandbox posture: 8,321 UTF-8
 bytes and 1,132 whitespace-delimited words.
+
+Re-measured 2026-10-16 after the owner rule to prefer the change that leaves
+less surface for future gaps (#477): 8,720 UTF-8 bytes and 1,203
+whitespace-delimited words.
