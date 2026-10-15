@@ -354,6 +354,7 @@ def _machine_state(monkeypatch, tmp_path) -> Path:
 
 
 def test_build_role_does_not_reload_env_when_already_provided(tmp_path, monkeypatch):
+    monkeypatch.setattr("issue_agent.adapters.github.GitHubGateway.viewer_login", lambda self: "fix-bot")
     # review S7: `_load_agent_env` shells out to `bash -c ... env -0`.
     # build_role used to call it unconditionally
     # (`_load_agent_env(env if env is not None else dict(os.environ))`), so
@@ -383,6 +384,7 @@ def test_build_role_does_not_reload_env_when_already_provided(tmp_path, monkeypa
 
 
 def test_build_role_self_loads_env_when_called_standalone_without_one(tmp_path, monkeypatch):
+    monkeypatch.setattr("issue_agent.adapters.github.GitHubGateway.viewer_login", lambda self: "fix-bot")
     # Anti-vacuity twin: a standalone caller that does NOT already have a
     # loaded env (env=None, the documented default) must still get AGENT_ENV
     # applied — the "load once" fix must not silently drop loading entirely.

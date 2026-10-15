@@ -140,9 +140,13 @@ def roles(tmp_path):
             )
 
         def fix(self, gh, agent, **env):
-            return compose_fix_daemon(
-                cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent, log=lambda _line: None
-            )
+            reviewer, gh.login = gh.login, FIX_BOT  # the fix role boots as its own credential
+            try:
+                return compose_fix_daemon(
+                    cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent, log=lambda _line: None
+                )
+            finally:
+                gh.login = reviewer
 
     return Roles()
 

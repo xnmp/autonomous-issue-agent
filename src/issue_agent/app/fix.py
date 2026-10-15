@@ -24,6 +24,7 @@ from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.effort import Effort
 from ..domain.evidence import ChangeRequest, CiFailures
+from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
@@ -363,6 +364,14 @@ def compose_fix_daemon(
     """The fix role: every Action but REVIEW, paid legs up to
     FIX_DISPATCH_CONCURRENCY."""
     log = log or stderr_log("fix")
+    # Keyed comments are read back by author: under another login they never
+    # confirm and would be posted again every tick (#424).
+    acting_as = gateway.viewer_login()
+    if not login_eq(acting_as, cfg.fix_bot):
+        raise ValueError(
+            f"FIX_BOT is {cfg.fix_bot!r} but the fix credential acts as "
+            f"{acting_as or 'nobody GitHub would name'!r}: set FIX_BOT to the "
+            "credential's login, or give the fix role FIX_BOT's credential")
     settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, cfg.fixer_runtime.value,
                            "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
                            routes={tier: cfg.fix_route(tier) for tier in Tier}, triage_route=cfg.triage_route(),
