@@ -479,7 +479,7 @@ class Backend:
                        for role in dash.ROLE_NAMES],
             "leases": views.lease_rows(read.leases, legs),
             "needs_attention": needs,
-            "base_failures": (views.base_failures(obs.world.base_ci, dep.cfg.base_branch, dep.cfg.repo)
+            "base_failures": (views.base_failures(obs.world.base, dep.cfg.repo)
                               if obs and obs.world else None),
             "health_trend": views.health_trend(obs.issues, _local_timezone(timezone_name)) if obs else [],
             "spend_per_hour": [asdict(b) for b in dash.spend_per_hour(legs, now)],

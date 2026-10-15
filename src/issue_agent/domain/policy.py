@@ -9,6 +9,7 @@ a stop comment on an unlabelled item, which derive would read as released.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -18,7 +19,7 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
-from .checks import BaseCI, BaseRun
+from .checks import BaseHealth, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
@@ -128,7 +129,7 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
             "the harness will not write that link again.")
 
 
-def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
+def base_ci_actions(health: BaseHealth | None, marker: str,
                     labels: Mapping[int, frozenset[Label]] = MappingProxyType({}),
                     merged: Mapping[int, str] = MappingProxyType({})) -> tuple[Action, ...]:
     """One issue per workflow per red streak on the base branch, required or
@@ -147,18 +148,21 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
     keeps the issue open. A required
     workflow's open issue is readied (`ai-ready`) unless it carries
     `ai-ready` or `needs-human` (`labels`, of the open issues the fix role
-    reads)."""
-    if base_ci is None:
+    reads). An open issue whose workflow is neither listed in the base's runs
+    nor among the repository's workflows is closed (#449): renamed or removed,
+    it would never pass."""
+    if health is None or health.runs is None:
         return ()
+    base = health.ref
     out: list[Action] = []
-    for latest, since, bounded in base_verdicts(base_ci.runs):
-        issues, name = workflow_issues(base_ci, latest.workflow, base), _inert(" ".join(latest.workflow.split())[:200])
+    for latest, since, bounded in base_verdicts(health.runs):
+        issues, name = workflow_issues(health, latest.workflow), _inert(" ".join(latest.workflow.split())[:200])
         opened = [i for i in issues if not i.closed_at]
         if latest.conclusion in GREEN_CONCLUSIONS:
             out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
                                                       f"{latest.url} (head `{latest.head_sha}`).") for i in opened)
             continue
-        streak = sorted((r for r in base_ci.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
+        streak = sorted((r for r in health.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
                          and _created(r) >= _created(since)), key=_created)
         closed = {i.title: at for i in issues if (at := parse_timestamp(i.closed_at))}
         failed = {i.number: next((r for r in streak if _created(r)[0] >= at), None) for i in opened
@@ -182,9 +186,17 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
         out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {lead} failing run: {first.url} "
                                     f"(head `{first.head_sha}`).\n\nThe harness closes this issue when it passes; a "
                                     "later failure gets an issue of its own.", f"base-ci:{base}:{title}"))
+    if health.workflows is not None:  # the 100 listed runs span hours: a path-filtered workflow may be absent
+        live = {i.number for w in health.workflows | {r.workflow for r in health.runs}
+                for i in workflow_issues(health, w)}
+        shape = re.compile(rf"CI: .+ failing on {re.escape(base)}(?: since \S+)?")
+        out.extend(SetIssueState(i.number, False, f"{marker}\nNo workflow of this repository runs under this issue's "
+                                                  f"name on `{base}` any more (renamed, removed or disabled), so it "
+                                                  "would never pass here.")
+                   for i in health.issues if not i.closed_at and i.number not in live and shape.fullmatch(i.title))
     admitted = {n for n, held in labels.items() if Label.AI_READY in held or Label.NEEDS_HUMAN in held}
     out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
-               for n in sorted(base_fix(base_ci, base) - admitted))
+               for n in sorted(base_fix(health) - admitted))
     return tuple(out)
 
 

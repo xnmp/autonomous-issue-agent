@@ -26,7 +26,7 @@ from issue_agent.app.tick import leg_ends
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.effort import Effort
-from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun, BaseTip, Check, Observed, RequiredCheck
+from issue_agent.domain.checks import BaseHealth, BaseIssue, BaseRun, Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import MAX_BUDGET_STATUS, AgentResult, ExitReason
 from issue_agent.domain.routing import Tier
@@ -75,7 +75,7 @@ class FakeGitHub:
     observed_by: list[str] = field(default_factory=list)
     # The workflows the base branch requires (None: unread), read with the base tip's checks.
     required: frozenset[str] | None = None
-    base_tip: BaseTip | None = field(default_factory=lambda: BaseTip("dev", "b0", ()))
+    base_reports: tuple[Check, ...] | None = ()  # the base tip's checks (None: unread)
 
     # ── observation ──
     def build_world(self, base: str, *, filed_by: str = "", pickup: Pickup = Pickup.READY) -> WorldState:
@@ -87,18 +87,20 @@ class FakeGitHub:
                 prs=tuple(self.prs.values()),
                 branches=tuple(Branch(b, self.pushed_at.get(b, now)) for b in self.branches if self._owed(b)),
                 now=now,
-                base=self.base_tip,
-                base_ci=self._base_ci(filed_by) if filed_by else None,
+                base=self._base(filed_by),
                 pickup=pickup,
             )
 
-    def _base_ci(self, filer: str) -> BaseCI:
-        """What the gateway reads: the runs, the fixer's issues titled
-        "… failing on dev", open and closed, and the required workflows."""
+    def _base(self, filer: str) -> BaseHealth:
+        """What the gateway reads: the tip's checks and, for the fixer, the
+        runs, its issues titled "… failing on dev", open and closed, and the
+        required workflows."""
+        if not filer:
+            return BaseHealth("dev", self.base_reports)
         issues = tuple(BaseIssue(n, i.title, "" if i.state == "open" else self.closed_times[n])
                        for n, i in sorted(self.issues.items())
                        if i.author == filer and "failing on dev" in i.title and n not in self.unindexed)
-        return BaseCI(tuple(self.base_runs), issues, self.required)
+        return BaseHealth("dev", self.base_reports, tuple(self.base_runs), issues, self.required)
 
     def _open_blockers(self, issue: IssueView) -> IssueView:
         """GitHub lists only a blocker that is still open (a closed one is resolved)."""
@@ -1503,7 +1505,7 @@ def test_402_the_base_fix_pr_is_charged_the_bases_failure_and_others_wait(role):
     tick(composed)
     (issue,) = base_issues(gh).values()
     red = _ci("h1", "fail").reports[0]
-    gh.base_tip = BaseTip("dev", "b9", (red,))  # the PRs' failing check fails on the base tip too
+    gh.base_reports = (red,)  # the PRs' failing check fails on the base tip too
     open_pr(gh, issue=issue.number, ci="fail")
     gh.prs[100] = replace(gh.prs[100], base_ref_name="dev")
     taken = tick(composed)

@@ -20,13 +20,15 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from ..domain.checks import BaseCI, BaseTip, Unavailable
+from ..domain.checks import BaseHealth, Unavailable
 from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
 from ..domain.world import BlockerRef, Branch, Comment, IssueView, Pickup, PRView, Push, Review, WorldState
-from .github_ci import base_issues, base_reports, base_runs, observe_checks, required_policy, required_workflows
+from .github_ci import (
+    active_workflows, base_issues, base_reports, base_runs, observe_checks, required_policy, required_workflows,
+)
 
 # Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
 # fields (mergeable / mergeStateStatus) once hung ~14 min on a just-merged PR
@@ -341,10 +343,11 @@ _FIX_REFS = ("refs(refPrefix:\"refs/heads/\",query:\"" + _HARNESS_BRANCH_PREFIX 
              "{{totalCount nodes{{state closedAt}}}} target{{... on Commit{{committedDate}}}} "
              "compare(headRef:$base){{behindBy}}}}}}")
 # The base tip's checks, a request of their own (#313, #425): a PR check red here too is
-# the base's, not the PR's. GitHub's rollup lists a rerun job's latest attempt.
+# the base's, not the PR's. GitHub's rollup lists a rerun job's latest attempt. An
+# Actions check suite is its workflow run: its conclusion is the run's (#442).
 _BASE_CONTEXTS = ("contexts(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{__typename "
                   "... on CheckRun{{id databaseId name status conclusion startedAt detailsUrl "
-                  "checkSuite{{app{{databaseId}} workflowRun{{workflow{{name}}}}}}}} "
+                  "checkSuite{{conclusion app{{databaseId}} workflowRun{{event workflow{{name}}}}}}}} "
                   "... on StatusContext{{id createdAt context state targetUrl}}}}}}")
 _BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid statusCheckRollup{id "
              + _BASE_CONTEXTS.format(after="") + "}}}}")
@@ -799,7 +802,7 @@ class GitHubGateway:
         open harness PRs (`fix/<issue>-`) with head, mergeability, required
         checks, reviews, comments, every changed file and the head push, and
         harness branches owed a PR against `base`; with `filed_by` (the fixer's
-        login), also `base_ci`. `GhUnavailable` and incomplete
+        login), also the base's runs and base-CI issues. `GhUnavailable` and incomplete
         top-level reads propagate: the daemon skips the tick."""
         # The domain reads no clock: one stamp per build, so every gate in a tick judges one instant.
         now = datetime.now(timezone.utc).isoformat()
@@ -844,10 +847,8 @@ class GitHubGateway:
         branches, unknown = parse_fix_refs(collected["refs"])
         for number, why in sorted(unknown.items()):
             self._skip_item("issue", number, FixObservationIncomplete(why))
-        tip, nodes = self._base_tip(base)
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches, base=tip,
-                          base_ci=self._base_ci(base, filed_by, nodes) if filed_by else None, pickup=pickup)
+                          branches=branches, base=self._base_health(base, filed_by), pickup=pickup)
 
     def _top_level(self, name: str, base: str, template: str) -> list:
         """One top-level connection, its own request per page (#425), read in
@@ -868,49 +869,51 @@ class GitHubGateway:
                 raise FixObservationIncomplete(f"{name} page has no cursor")
         raise FixObservationIncomplete(f"{name} exceed {_FIX_MAX_PAGES[name]} pages")
 
-    def _base_tip(self, base: str) -> tuple[BaseTip | None, list | None]:
-        """The base tip and its checks (with the raw check nodes), read on their own, or None when
-        unreadable: a red PR check is then the PR's, as before #313 (never a
-        silent wait). A failed request skips the tick, as it did when the tip
-        rode the combined read: a timeout answered as GraphQL errors must not
-        charge the base's red to every PR."""
+    def _base_health(self, base: str, filer: str) -> BaseHealth:
+        """The base's health, its parts read apart (#442). The tip's checks,
+        None when unreadable: a red PR check is then the PR's, as before #313
+        (never a silent wait). A failed request skips the tick, as it did when
+        the tip rode the combined read: a timeout answered as GraphQL errors
+        must not charge the base's red to every PR. With `filer`: the base's
+        push runs, the repository's workflows and the base-CI issues `filer`
+        opened, open and closed, read together (nothing is filed or changed
+        unless all are read); the required workflows, from the branch policy
+        and the tip's check runs (#402), None when unread."""
         raw = self._repository_page(_BASE_TIP, base=base).get("baseTip")
         try:
-            if not isinstance(raw, dict) or raw.get("name") != base or not isinstance(raw.get("target"), dict):
+            if (not isinstance(raw, dict) or raw.get("name") != base or not isinstance(raw.get("target"), dict)
+                    or not isinstance(raw["target"].get("oid"), str) or not raw["target"]["oid"]):
                 raise FixObservationIncomplete("base ref is absent or not the configured base")
             rollup = raw["target"].get("statusCheckRollup")
             nodes = [] if rollup is None else self._nested(
                 rollup, "contexts", _BASE_CONTEXTS, on="StatusCheckRollup", backward=False)
             if nodes is None:
                 raise FixObservationIncomplete("base checks exceed their bound")
-            return BaseTip(base, raw["target"].get("oid"), base_reports(nodes)), nodes
+            reports = base_reports(nodes)
         except (ValueError, KeyError, TypeError) as exc:
             sys.stderr.write(f"base tip unread this poll ({type(exc).__name__}: {str(exc)[:120]}) "
                              "— red PR checks are charged to the PR\n")
-            return None, None
-
-    def _base_ci(self, base: str, filer: str, nodes: list | None) -> BaseCI | None:
-        """Base runs and the base-CI issues `filer` opened, open and closed; None
-        when either read is unusable (nothing is then filed or changed). The
-        required workflows are read from the branch policy and the tip's check
-        `nodes`; unread, they are None and nothing is readied (#402)."""
+            nodes = reports = None
+        if not filer:
+            return BaseHealth(base, reports)
         try:
             runs = base_runs(self._gh_json([
-                "api", f"repos/{self.repo}/actions/runs?branch={quote(base, safe='')}&event=push&status=completed"
+                "api", f"repos/{self.repo}/actions/runs?branch={quote(base, safe='')}&event=push"
                        f"&exclude_pull_requests=true&per_page=100"]), base)
             issues = base_issues(self._graphql(_BASE_ISSUES, q=(
                 f'repo:{self.repo} is:issue author:{filer} in:title "failing on {base}" sort:created-desc'))
                 .get("search"), filer)
+            workflows = active_workflows(self._gh_json(["api", f"repos/{self.repo}/actions/workflows?per_page=100"]))
         except (ValueError, KeyError, TypeError, GhUnavailable) as exc:
             # An optional read: GitHub not answering it must not cost the tick its merges and dispatches.
             sys.stderr.write(f"base CI unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
-            return None
+            return BaseHealth(base, reports)
         try:
             required = None if nodes is None else required_workflows(required_policy(self.repo, base, self._gh_json), nodes)
         except Exception as exc:  # noqa: BLE001 - an unread policy readies nothing, as in observe_checks
             sys.stderr.write(f"base required workflows unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
             required = None
-        return BaseCI(runs, issues, required)
+        return BaseHealth(base, reports, runs, issues, required, workflows)
 
     def create_issue(self, title: str, body: str) -> Accepted | Refused:
         """Open an unlabelled issue; the receipt carries its number."""

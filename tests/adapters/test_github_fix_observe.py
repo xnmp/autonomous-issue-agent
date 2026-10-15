@@ -680,7 +680,7 @@ def world_with(tip, *more):
 
 def test_313_the_base_tips_checks_are_read_with_the_world():
     world, runner = world_with(base_tip([run_node("frontend"), run_node("rust", "SUCCESS", n=2), status_node("ci/x")]))
-    assert world.base is not None and (world.base.ref, world.base.oid) == ("dev", "b9")
+    assert world.base is not None and world.base.ref == "dev" and world.base.reports is not None
     assert [(c.name, c.bucket, c.kind, c.app_id) for c in world.base.reports] == [
         ("frontend", "fail", "check", 15368),
         ("rust", "pass", "check", 15368),
@@ -711,14 +711,14 @@ def test_313_a_base_tip_with_no_checks_is_an_empty_read_not_an_unread_one():
 )
 def test_313_an_unreadable_base_tip_is_absent_and_the_tick_goes_on(tip):
     world, _ = world_with(tip)
-    assert world.base is None
+    assert world.base is not None and world.base.reports is None
 
 
 def test_313_a_base_tip_past_one_page_is_read_in_full():
     more = {"contexts": {"totalCount": 101, "pageInfo": {"hasNextPage": False, "endCursor": None},
                          "nodes": [run_node("last", n=101)]}}
     world, runner = world_with(base_tip([run_node(f"j{i}", n=i + 1) for i in range(100)], more="c1", total=101), more)
-    assert world.base is not None and len(world.base.reports) == 101
+    assert world.base is not None and world.base.reports is not None and len(world.base.reports) == 101
     assert any("on StatusCheckRollup{contexts(first:100,after:$cursor)" in q for q in runner.queries)
 
 
@@ -727,7 +727,7 @@ def test_313_a_huge_base_check_list_past_its_bound_is_absent():
     pages = [{"contexts": {"totalCount": 5000, "pageInfo": {"hasNextPage": True, "endCursor": f"c{k}"},
                            "nodes": [run_node(f"p{k}-{i}", n=1000 * k + i) for i in range(100)]}} for k in range(2, 12)]
     world, _ = world_with(base_tip(big, more="c1", total=5000), *pages)
-    assert world.base is None
+    assert world.base is not None and world.base.reports is None
 
 
 # ── "blocked by" (GitHub issue dependencies) ─────────────────────────────────

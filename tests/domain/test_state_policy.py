@@ -21,7 +21,7 @@ from issue_agent.domain.actions import (
     UpdateBranch,
 )
 from issue_agent.domain.backoff import LegEnd
-from issue_agent.domain.checks import BaseTip, Check, Observed, RequiredCheck, Unavailable
+from issue_agent.domain.checks import BaseHealth, Check, Observed, RequiredCheck, Unavailable
 from issue_agent.domain.evidence import ChangeRequest, new_failures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import (
@@ -192,8 +192,8 @@ def test_red_required_check_on_head_dispatches_fix_ci():
     assert pr_state(pr(ci=RED)) == fixing()
 
 
-def _red_base(*red: str, ref: str = "dev") -> BaseTip:
-    return BaseTip(ref, "b9", tuple(Check(n, "FAILURE", "fail") for n in red) + (Check("lint", "SUCCESS", "pass"),))
+def _red_base(*red: str, ref: str = "dev") -> BaseHealth:
+    return BaseHealth(ref, tuple(Check(n, "FAILURE", "fail") for n in red) + (Check("lint", "SUCCESS", "pass"),))
 
 
 def _two_red() -> Observed:
@@ -221,16 +221,16 @@ def test_313_an_unread_or_other_base_charges_the_pr(base):
 
 
 def test_313_the_pr_resumes_when_the_base_goes_green():
-    green = BaseTip("dev", "b10", (Check("test", "SUCCESS", "pass"),))
+    green = BaseHealth("dev", (Check("test", "SUCCESS", "pass"),))
     assert pr_state_in(pr(ci=RED, base_ref_name="dev"), green) == fixing()
 
 
 def test_313_a_base_twin_still_running_is_waited_for():
-    running = BaseTip("dev", "b10", (Check("test", "FAILURE", "fail"), Check("test", "IN_PROGRESS", "pending")))
+    running = BaseHealth("dev", (Check("test", "FAILURE", "fail"), Check("test", "IN_PROGRESS", "pending")))
     assert pr_state_in(pr(ci=RED, base_ref_name="dev"), running) == Wait(WaitReason.CI_PENDING)
 
 
-def pr_state_in(p: PRView, base: BaseTip | None):
+def pr_state_in(p: PRView, base: BaseHealth | None):
     return one(WorldState(prs=(p,), base=base))
 
 

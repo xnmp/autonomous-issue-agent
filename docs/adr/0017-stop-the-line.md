@@ -3,6 +3,7 @@
 Status: Accepted
 Date: 2026-10-15
 Governs: src/issue_agent/domain/policy.py src/issue_agent/domain/ci.py src/issue_agent/domain/state.py
+  src/issue_agent/adapters/github_ci.py
 
 ## Context
 
@@ -78,3 +79,33 @@ key. If the filing lands and the close is lost, the next tick closes the old
 issue and files nothing more. Closing first would strand the base: once
 closed, the old issue drops out of the merged-PR read, and the post-merge
 run completed before the close, so nothing would file.
+
+## Amendment (2026-10-15, #442, #449): one base observation
+
+Base health is one `BaseHealth` value per tick. Its parts are still read
+apart, because they answer different questions: the tip's check rollup
+(job-level, what #313's `charge` matches a PR's failures against) and the
+push-run listing (run-level history, what streaks are cut from). They now
+identify a failure the same way:
+
+- An Actions job on the tip is base evidence only from a **push** run that is
+  running or ended red or green. On a fast-forwarded tip the rollup also
+  lists the PR's `pull_request` runs; and a cancelled run's aggregate jobs
+  report FAILURE where the listing reports no verdict (tauri-explorer
+  `156de47`, 2026-10-15). A PR therefore waits as BaseRed on an Actions job
+  only when a red push run, and so a base-CI issue, stands behind it. Commit
+  statuses and other apps' checks are charged as before and have no issue.
+- A run being **re-run** has no conclusion and dropped out of the completed
+  listing, so the older run read as the latest: a green one closed the
+  streak's issue, and the re-run's failure (the same run, completed before
+  that close) filed nothing. The listing now keeps a run being re-run, and
+  its workflow has no verdict until the re-run ends.
+- An open base-CI issue whose workflow is neither in the listed runs nor
+  among the repository's active workflows is **closed** (renamed, removed or
+  disabled). The 100 listed runs span hours, so a path-filtered workflow is
+  often absent from them; the workflow listing alone is not enough either, as
+  a run's name is what titles the issue. Unread workflows close nothing.
+
+Provenance: the workflow listing (`actions/workflows`) is the repository's
+workflow files, under write access. The close is read back like the green
+close and re-derived from the next observation if lost.

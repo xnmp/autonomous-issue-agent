@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 
-from .checks import BaseCI, BaseIssue, BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
+from .checks import BaseHealth, BaseIssue, BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -144,14 +144,19 @@ def base_verdicts(runs: Iterable[BaseRun]) -> tuple[tuple[BaseRun, BaseRun, bool
     """Per workflow name: its latest verdict run (by creation, then run id; a
     re-run keeps its run), the first run of the streak of that verdict ending
     at it as far back as `runs` reach, and whether an opposite verdict bounds
-    that streak (else it may have begun before the earliest listed run)."""
+    that streak (else it may have begun before the earliest listed run). A
+    workflow whose latest such run is being re-run has no verdict until it
+    ends: an older run's would close or file against the tip's (#442)."""
     by_workflow: dict[str, list[BaseRun]] = {}
     for run in sorted(runs, key=lambda r: (parse_timestamp(r.created_at) or _EPOCH, r.run_id), reverse=True):
-        if run.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS:
+        if run.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS | {""}:
             by_workflow.setdefault(run.workflow, []).append(run)
     out = []
     for name in sorted(by_workflow):
         latest, *older = by_workflow[name]
+        if not latest.conclusion:
+            continue
+        older = [r for r in older if r.conclusion]
         red = latest.conclusion in RED_CONCLUSIONS
         streak = [latest, *itertools.takewhile(lambda r: (r.conclusion in RED_CONCLUSIONS) == red, older)]
         out.append((latest, streak[-1], len(streak) <= len(older)))
@@ -169,18 +174,18 @@ def base_title(workflow: str, base: str, head: str = "") -> str:
     return f"CI: {name} failing on {base}" + (f" since {head[:7]}" if head else "")
 
 
-def workflow_issues(base_ci: BaseCI, workflow: str, base: str) -> tuple[BaseIssue, ...]:
+def workflow_issues(health: BaseHealth, workflow: str) -> tuple[BaseIssue, ...]:
     """`workflow`'s base-CI issues, oldest first."""
-    prefix = base_title(workflow, base)
-    return tuple(sorted((i for i in base_ci.issues if i.title == prefix or i.title.startswith(prefix + " since ")),
+    prefix = base_title(workflow, health.ref)
+    return tuple(sorted((i for i in health.issues if i.title == prefix or i.title.startswith(prefix + " since ")),
                         key=lambda i: i.number))
 
 
-def base_fix(base_ci: BaseCI | None, base: str) -> frozenset[int]:
+def base_fix(health: BaseHealth | None) -> frozenset[int]:
     """The open base-CI issues of workflows the base branch requires (#402):
     the harness readies them and serves them first, without STEWARD, TRIAGE
     or a blocker, and their PRs are charged the base's failures. None while
     the required workflows are unread: the issues then wait for a human."""
-    if base_ci is None or base_ci.required is None:
+    if health is None or health.required is None:
         return frozenset()
-    return frozenset(i.number for w in base_ci.required for i in workflow_issues(base_ci, w, base) if not i.closed_at)
+    return frozenset(i.number for w in health.required for i in workflow_issues(health, w) if not i.closed_at)

@@ -322,9 +322,8 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
                 waiting[pr_key(pr.number)] = waiting[issue_key(issue)]
         # The base branch's own CI is not an item: one issue per failing workflow per red streak (#402).
         merged = {n: p.merged_at for p in world.prs if p.state == "MERGED" and (n := harness_branch_issue(p.head_ref_name))}
-        base = base_ci_actions(world.base_ci, settings.base_branch, settings.harness.marker,
-                               {i.number: i.labels for i in world.issues}, merged)
-        fixing = base_fix(world.base_ci, settings.base_branch)
+        base = base_ci_actions(world.base, settings.harness.marker, {i.number: i.labels for i in world.issues}, merged)
+        fixing = base_fix(world.base)
         first = frozenset({issue_key(n) for n in fixing} | {
             pr_key(p.number) for p in world.prs if p.state == "OPEN" and harness_branch_issue(p.head_ref_name) in fixing})
         gaps = gap_actions(local.legs, states, GapTarget(settings.repository, settings.target_public),

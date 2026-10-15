@@ -6,9 +6,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from issue_agent.domain.actions import AgentKind, FileIssue, Relabel, SetIssueState, Target
 from issue_agent.domain.backoff import LegEnd
-from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun, BaseTip, Check, Observed, RequiredCheck
+from issue_agent.domain.checks import BaseHealth, BaseIssue, BaseRun, Check, Observed, RequiredCheck
 from issue_agent.domain.evidence import new_failures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import base_ci_actions, dispatch_order
@@ -25,9 +27,9 @@ def _br(run: int, conclusion: str, name: str = "macOS Smoke", hour: int = 0) -> 
     return BaseRun(name, run, f"https://x/runs/{run}", f"sha{run}", conclusion, at, at)
 
 
-def _act(*runs, issues=(), required=None, labels=None, merged=None):
-    return base_ci_actions(BaseCI(tuple(runs), tuple(issues), required), "dev", "<!-- m -->", labels or {},
-                           merged or {})
+def _act(*runs, issues=(), required=None, labels=None, merged=None, workflows=None):
+    return base_ci_actions(BaseHealth("dev", runs=tuple(runs), issues=tuple(issues), required=required,
+                                      workflows=workflows), "<!-- m -->", labels or {}, merged or {})
 
 
 def _filed(actions) -> list[FileIssue]:
@@ -38,7 +40,8 @@ def _filed(actions) -> list[FileIssue]:
 
 
 def test_an_unread_base_acts_on_nothing():
-    assert base_ci_actions(None, "dev", "<!-- m -->") == ()
+    assert base_ci_actions(None, "<!-- m -->") == ()
+    assert base_ci_actions(BaseHealth("dev"), "<!-- m -->") == ()  # the tip read, the runs not
 
 
 def test_a_red_streak_files_one_issue_named_and_keyed_by_its_first_failing_run():
@@ -159,7 +162,7 @@ def test_needs_human_keeps_an_issue_open_after_its_fix_merged():
 
 def test_a_title_stays_within_githubs_limit_whatever_the_base_branch():
     base = "release/" + "b" * 192
-    (filed,) = base_ci_actions(BaseCI((_br(2, "failure", name="w" * 300),), ()), base, "<!-- m -->")
+    (filed,) = base_ci_actions(BaseHealth(base, runs=(_br(2, "failure", name="w" * 300),)), "<!-- m -->")
     assert len(filed.title) <= 256 and f" failing on {base} since " in filed.title  # what the issue search finds
 
 
@@ -173,6 +176,68 @@ def test_a_hostile_or_huge_workflow_name_is_bounded_in_the_title_and_inert_in_th
     (filed,) = _act(_br(2, "failure", name=name))
     assert len(filed.title) <= 256 and "\n" not in filed.title and len(filed.body) < 1000
     assert "@owner" not in filed.body and "<img" not in filed.body and "![p]" not in filed.body
+
+
+# ── a run being re-run (#442) ────────────────────────────────────────────────
+
+
+def test_a_run_being_re_run_withholds_its_workflows_verdict_until_the_re_run_ends():
+    # Red run 2 has its issue; a human re-runs it. The older green must neither close the issue nor
+    # hold back the filing: while it was closed, the re-run's failure (the same run) would file nothing.
+    rerun = _br(2, "", hour=1)
+    issue = [BaseIssue(40, f"{PREFIX} since sha2")]
+    assert _act(_br(1, "success"), rerun, issues=issue) == ()
+    assert _act(_br(1, "success"), _br(2, "failure", hour=1), issues=issue) == ()  # it failed again
+    (closed,) = _act(_br(1, "success"), _br(2, "success", hour=1), issues=issue)  # it was a flake
+    assert _closes([closed]) == [40]
+    assert _act(_br(1, "failure"), rerun) == ()  # nothing filed against a verdict being replaced
+
+
+def test_an_older_run_being_re_run_leaves_the_latest_verdict_and_its_streak_alone():
+    (filed,) = _act(_br(1, "success"), _br(2, "failure", hour=1), _br(3, "", hour=2), _br(4, "failure", hour=3))
+    assert filed.title == f"{PREFIX} since sha2"
+    (closed,) = _act(_br(2, "", hour=1), _br(4, "success", hour=3), issues=[BaseIssue(40, f"{PREFIX} since sha2")])
+    assert _closes([closed]) == [40]
+
+
+def test_base_health_reads_issues_and_workflows_only_with_the_runs():
+    for part in ({"issues": (BaseIssue(40, PREFIX),)}, {"required": frozenset()}, {"workflows": frozenset()}):
+        with pytest.raises(ValueError):
+            BaseHealth("dev", **part)
+    with pytest.raises(ValueError):
+        BaseHealth("")
+
+
+# ── a renamed or removed workflow's issue (#449) ─────────────────────────────
+
+OLD = BaseIssue(40, "CI: Old Smoke failing on dev since sha1")
+CLOSED_OLD = "No workflow of this repository runs under this issue's name on `dev` any more"
+
+
+def test_an_open_issue_of_a_workflow_neither_listed_nor_in_the_repository_is_closed():
+    for old in (OLD, BaseIssue(40, "CI: Old Smoke failing on dev")):  # a legacy title too
+        (closed,) = _act(_br(2, "success"), issues=[old], workflows=frozenset({"macOS Smoke"}))
+        assert _closes([closed]) == [40] and CLOSED_OLD in closed.comment and "Old Smoke" not in closed.comment
+
+
+def test_a_renamed_workflows_red_files_under_the_new_name_and_closes_the_old_issue():
+    actions = _act(_br(2, "failure"), issues=[OLD], workflows=frozenset({"macOS Smoke"}))
+    assert [a.title for a in _filed(actions)] == [f"{PREFIX} since sha2"] and _closes(actions) == [40]
+
+
+def test_an_issue_is_kept_while_its_workflow_exists_runs_or_cannot_be_read():
+    smoke = BaseIssue(40, f"{PREFIX} since sha1")
+    assert _act(_br(2, "success", name="Lint"), issues=[smoke], workflows=frozenset({"macOS Smoke"})) == ()
+    # listed in the base's runs but not by that name in the repository's workflows
+    assert _closes(_act(_br(2, "failure"), issues=[smoke], workflows=frozenset())) == []
+    assert _act(_br(2, "success", name="Lint"), issues=[OLD]) == ()  # the workflows are unread
+
+
+def test_only_this_bases_open_base_ci_issues_are_closed_as_orphaned():
+    others = [BaseIssue(41, "CI: Old Smoke failing on main since sha1"), BaseIssue(42, "Old Smoke failing on dev"),
+              BaseIssue(43, "CI: Old Smoke failing on dev-2"), BaseIssue(44, OLD.title, CLOSED_AT),
+              BaseIssue(45, "CI: Old Smoke failing on dev since sha1 again")]
+    assert _act(_br(2, "success"), issues=others, workflows=frozenset({"macOS Smoke"})) == ()
 
 
 # ── a required workflow's issue is readied ───────────────────────────────────
@@ -198,14 +263,13 @@ def test_a_non_required_or_unmapped_workflows_issue_is_not_readied():
 H = Harness("fix-bot", "review-bot")
 POLICY = frozenset({RequiredCheck("smoke")})
 RED_SMOKE = Check("smoke", "FAILURE", "fail", required=True)
-TIP = BaseTip("dev", "b9", (RED_SMOKE,))
 LIGHT = (LegEnd(AgentKind.STEWARD, NOW - timedelta(hours=2), False),
          LegEnd(AgentKind.TRIAGE, NOW - timedelta(hours=1), False))
 
 
 def _world(*, required=frozenset({"macOS Smoke"}), issues=(), prs=()) -> WorldState:
-    return WorldState(issues=tuple(issues), prs=tuple(prs), base=TIP, now=NOW.isoformat(),
-                      base_ci=BaseCI((_br(2, "failure"),), tuple(OPEN), required))
+    return WorldState(issues=tuple(issues), prs=tuple(prs), now=NOW.isoformat(),
+                      base=BaseHealth("dev", (RED_SMOKE,), (_br(2, "failure"),), tuple(OPEN), required))
 
 
 def _issue(number: int, **kw) -> IssueView:
