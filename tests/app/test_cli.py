@@ -552,8 +552,9 @@ def test_linux_pid_deployment_identity_comes_from_process_environment():
     if not os.path.isdir("/proc"):
         return
     process = subprocess.Popen(
-        [cli.sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(5)"],
+        [cli.sys.executable, "-c", "print('ready', flush=True); input()"],
         env={**os.environ, "ISSUE_AGENT_DEPLOYMENT_ID": "deployment-a"},
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -562,8 +563,7 @@ def test_linux_pid_deployment_identity_comes_from_process_environment():
         assert process.stdout.readline().strip() == "ready"
         assert cli._pid_deployment_name(process.pid) == "deployment-a"
     finally:
-        process.terminate()
-        process.wait(timeout=5)
+        process.communicate(input="\n", timeout=5)
 
 
 def test_explicit_target_dir_is_the_repository_detection_authority(tmp_path, monkeypatch) -> None:

@@ -26,6 +26,12 @@ clients.
 
 ## Consequences
 
-Supervisors restart transient failures only. Shutdown is bounded by
+After earlyoom SIGTERMed the daemons on 2026-10-16 and their clean exit 0 left
+them down, supervisors restart clean exits and transient failures, while codes
+2–6 stay stopped (launchd's wrapper maps permanent errors to success and clean
+daemon exits to restart requests).
+Operator stops use `systemctl --user stop` or the installer's `launchctl unload`
+for installed services, preventing automatic restart; foreground runs use SIGTERM.
+Shutdown is bounded by
 `TimeoutStopSec`; the final kill signal is a last resort, not normal teardown.
 Hot reload is commit/content-hash gated and takes effect only between ticks.

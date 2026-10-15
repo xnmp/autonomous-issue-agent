@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
-import subprocess
-import threading
+import signal
 
 from issue_agent.app import cli
 
 
 def test_operator_stop_logs_each_sigterm_target(monkeypatch, capfd) -> None:
-    victim = subprocess.Popen(["sleep", "30"])
-    threading.Thread(target=victim.wait, daemon=True).start()  # reap so the stop sees it exit
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _n: [victim.pid])
+    calls = []
+
+    def kill(pid, signum):
+        calls.append((pid, signum))
+        if signum == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(cli.os, "kill", kill)
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _n: [123])
     monkeypatch.setattr(cli, "_role_pids", lambda _n: {})
-    try:
-        assert cli._stop_deployment("dep") == 0
-    finally:
-        victim.kill()
+    assert cli._stop_deployment("dep") == 0
+    assert calls == [(123, signal.SIGTERM), (123, 0)]
     (line,) = _lines(capfd.readouterr().err)
-    assert f"SIGTERM pid={victim.pid} reason=operator_stop:dep" in line
+    assert "SIGTERM pid=123 reason=operator_stop:dep" in line
 
 
 def _lines(captured: str) -> list[str]:

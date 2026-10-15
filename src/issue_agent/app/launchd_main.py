@@ -24,15 +24,20 @@ def run(entrypoint: Callable[[], None] = daemon_main) -> None:
         entrypoint()
     except SystemExit as exc:
         try:
-            code = ExitCode(int(exc.code))
+            code = ExitCode.CLEAN if exc.code is None else ExitCode(int(exc.code))
         except (TypeError, ValueError):
             raise
+        if code == ExitCode.CLEAN:
+            # SuccessfulExit=false reserves wrapper success for permanent errors.
+            raise SystemExit(ExitCode.TRANSIENT) from None
         if code not in _PERMANENT:
             raise
         sys.stderr.write(
             f"launchd: permanent issue-agent exit {int(code)}; "
             "leaving service stopped for operator repair\n"
         )
+        return
+    raise SystemExit(ExitCode.TRANSIENT)
 
 
 if __name__ == "__main__":
