@@ -54,14 +54,15 @@ def reported_gaps(control) -> frozenset[str]:
     return frozenset(key.removeprefix(f"{_REPORT_NAMESPACE}:") for key in control.done_keys(f"{_REPORT_NAMESPACE}:"))
 
 
-def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bool:
+def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str, since: str = "") -> bool:
     """One review on exactly `head` under `bot`, the identity the review
     gateway acts as (checked at boot). GitHub's read-back is the idempotency:
-    a standing bot verdict on `head` means it landed (a crash after the POST,
-    or a racing leg), so nothing is posted twice. GitHub's answer is the
+    a standing bot verdict on `head`, no older than `since` (the body edit the
+    review judged, #472), means it landed (a crash after the POST, or a racing
+    leg), so nothing is posted twice. GitHub's answer is the
     receipt: False is its refusal (a 4xx), which no retry changes; no answer
     raises."""
-    if gateway.reviewed_on(pr, head, bot):
+    if gateway.reviewed_on(pr, head, bot, since):
         return True
     return isinstance(gateway.submit_review(pr, verdict.event, verdict.body, head), Accepted)
 

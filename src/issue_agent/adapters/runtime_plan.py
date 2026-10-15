@@ -39,6 +39,10 @@ class RuntimePlan:
     evidence: tuple[str, ...] = ()
     # The branch the leg works on; its receipt records the branch's remote commit at the end.
     branch: str = ""
+    # A REVIEW's PR body edit time as briefed (GitHub `lastEditedAt`, "" never
+    # edited): its receipt records it with the verdict, so a stored verdict is
+    # resubmitted only for the description it judged (#472).
+    body_edited_at: str = ""
 
     @property
     def rendered_prompt(self) -> str:

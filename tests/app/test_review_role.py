@@ -54,11 +54,21 @@ class ReviewGitHub(FakeGitHub):
     refuse_submit: int = 0  # submissions GitHub refuses with a 4xx
     refused: int = 0
 
-    def reviewed_on(self, pr: int, head: str, login: str) -> bool:
+    def reviewed_on(self, pr: int, head: str, login: str, since: str = "") -> bool:
         return any(
             r.author == login and r.commit_id == head and r.state in ("APPROVED", "CHANGES_REQUESTED")
+            and r.submitted_at >= since
             for r in self.prs[pr].reviews
         )
+
+    def pr_body(self, number: int) -> tuple[str, str]:
+        p = self.prs[number]
+        return p.body, p.body_edited_at
+
+    def edit_body(self, number: int, body: str) -> None:
+        """A `PATCH /pulls/{n}` of the description: GitHub stamps `lastEditedAt`."""
+        with self.lock:
+            self.prs[number] = replace(self.prs[number], body=body, body_edited_at=_now())
 
     def submit_review(self, pr: int, event: str, body: str, head: str) -> Accepted | Refused:
         if self.fail_submit:
@@ -330,6 +340,76 @@ def test_a_bot_change_request_is_addressed_by_the_fix_role_not_reviewed_again(ro
     assert tick(review) == []
     assert dispatched(tick(fix), AgentKind.ADDRESS_REVIEW) == [
         RunAgent(AgentKind.ADDRESS_REVIEW, 100, head="h1", evidence=ChangeRequest(REVIEW_BOT, "h1", body="Handle None."))]
+
+
+def test_tauri_1182_a_description_only_answer_buys_a_review_of_the_same_head_not_another_address_review(roles):
+    # The bot asked only for CI evidence in the description; a commit would
+    # stale the runs, so the fixer edits the body and the head stays h1.
+    gh = green()
+    reviewer = Agent(verdict("REQUEST_CHANGES", "List the passing Linux, Windows and macOS runs on h1."),
+                     verdict("APPROVE", "The runs on h1 are listed and green."))
+    review = roles.review(gh, reviewer)
+
+    def answer_in_the_description(_task):
+        gh.edit_body(100, "Linux, Windows and macOS runs green on h1.")
+        return AgentResult(False, status="pushed", cost_usd=0.1, session_id="s1")
+
+    fix = roles.fix(gh, Agent(answer_in_the_description))
+    tick(review)
+    assert len(dispatched(tick(fix), AgentKind.ADDRESS_REVIEW)) == 1
+    assert dispatched(tick(fix), AgentKind.ADDRESS_REVIEW) == []  # the answer stands; nothing to address
+
+    assert dispatched(tick(review), AgentKind.REVIEW) == [RunAgent(AgentKind.REVIEW, 100, head="h1", tier=Tier.MED)]
+    assert [(s[1], s[3]) for s in gh.submitted] == [("REQUEST_CHANGES", "h1"), ("APPROVE", "h1")]
+    second = reviewer.tasks[1].prompt
+    assert "Linux, Windows and macOS runs green on h1." in second and "List the passing Linux" in second
+    tick(fix)
+    assert gh.merged == [(100, "h1")]
+
+
+def test_a_re_review_after_a_body_edit_whose_submission_github_fails_is_resubmitted_not_bought_again(roles, later):
+    gh = green()
+    reviewer = Agent(verdict("REQUEST_CHANGES", "List the runs on h1."), verdict("APPROVE", "Runs listed."))
+    review = roles.review(gh, reviewer)
+    tick(review)
+    gh.edit_body(100, "Runs green on h1.")
+    gh.fail_submit = 1
+    tick(review)
+    assert [s[1] for s in gh.submitted] == ["REQUEST_CHANGES"]  # the re-review's POST went unanswered
+
+    later()
+    assert dispatched(tick(review), AgentKind.REVIEW)
+    assert [(s[1], s[3]) for s in gh.submitted] == [("REQUEST_CHANGES", "h1"), ("APPROVE", "h1")]
+    assert len(reviewer.tasks) == 2
+
+
+def test_a_re_review_that_lands_with_its_reply_lost_is_never_posted_twice(roles):
+    # tauri #1182's shape: a change request, a description-only answer, a
+    # re-review whose POST lands but whose reply is lost. A replayed leg that
+    # reads GitHub before the landed review shows must read it back, not post.
+    gh = green()
+    reviewer = Agent(verdict("REQUEST_CHANGES", "List the runs on h1."), verdict("APPROVE", "Runs listed."))
+    review = roles.review(gh, reviewer)
+    tick(review)
+    gh.edit_body(100, "Runs green on h1.")
+    lagging = gh.prs[100]
+    gh.lose_reply.add("submit_review")
+    tick(review)
+    assert [(s[1], s[3]) for s in gh.submitted] == [("REQUEST_CHANGES", "h1"), ("APPROVE", "h1")]
+
+    gh.get_pr = lambda _number, **_kw: lagging
+    asyncio.run(roles.review(gh, Agent()).legs.run(RunAgent(AgentKind.REVIEW, 100, head="h1")))
+    assert [(s[1], s[3]) for s in gh.submitted] == [("REQUEST_CHANGES", "h1"), ("APPROVE", "h1")]
+    assert len(reviewer.tasks) == 2
+
+
+def test_a_body_edit_before_the_bots_verdict_buys_no_second_review(roles):
+    gh = green()
+    gh.edit_body(100, "Edited before the review.")
+    reviewer = Agent(verdict("APPROVE"))
+    review = roles.review(gh, reviewer)
+    tick(review)
+    assert tick(review) == [] and len(reviewer.tasks) == 1
 
 
 def test_three_unparseable_verdicts_on_one_head_stop_for_a_human_written_by_the_fix_role(roles):

@@ -193,7 +193,12 @@ but cannot replace it; changed linkage defers to a new observation. An issueless
 PR is claimed by negative PR number without manufacturing a per-issue spend
 scope (ADR 0008).
 The review role (slice 5c) owes a REVIEW leg when CI is green on a harness PR's
-head and the review bot has no standing verdict on that head. The leg reads the
+head and the review bot has no standing verdict on that head, a change request
+standing only if it is no older than the PR body's last edit (GraphQL
+`lastEditedAt`): a fixer may answer a review in the description alone, since a
+commit would stale the CI evidence it cites (#472). An approval stands through
+body edits.
+The leg reads the PR body and its edit time in one read, and the
 exact head: a detached checkout with the base fetched, where the agent runs
 `git diff <base>...<head>` itself (an empty diff is reviewed as a claim that the
 base already resolves the issue). It
@@ -202,7 +207,8 @@ when there are none; never the fixer-written PR description), the issue and its
 human comments (bounded), the PR text, the conversation and its own prior review: the Codex reviewer's read-only sandbox
 has no network, so it cannot fetch them. `GitHubAct`
 submits the parsed verdict as one review on that commit, read back first
-(a standing bot verdict on the head means it landed), so a crash after
+(a standing bot verdict on the head, no older than the body edit it judged,
+means it landed), so a crash after
 submission never posts a second review. The verdict is also kept on the leg's
 result: a verdict whose submission never landed is resubmitted without
 buying the review again. An unparseable verdict is an attempt, and derive caps

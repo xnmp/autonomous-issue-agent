@@ -30,6 +30,18 @@ review role: its one write, the bot's review of a head, claims
 `review:{pr}:{head}` and first reads back whether the bot already reviewed
 that commit, so a crash after submission never posts a second review.
 
+Amended by #472 (2026-10-16): a bot change request on a head stands only
+while it is no older than the PR body's last edit (GitHub `lastEditedAt`), so
+a fixer may answer it in the description alone; an approval stands through
+edits. The review write's identity is therefore the head plus the edit the
+review judged: the leg reads the body and its edit time in one GitHub read,
+records that time with the verdict on its receipt, reads back a bot verdict
+on the head no older than it, and resubmits a stored verdict only when the
+recorded time still equals GitHub's. Provenance of the new input: anyone who
+can edit the PR (the fix bot, collaborators, GitHub Apps) moves
+`lastEditedAt`, and GitHub stamps it. It can only make a review owed, never
+make or keep a verdict, so it cannot produce a merge.
+
 Slice 5d-1 (2026-10-13) removes the durable-command path for every writer.
 There is no `LifecycleCommand`, command queue or effect receipt. Operator
 writes (`adapters/operator_effects.py`) are label moves through the same

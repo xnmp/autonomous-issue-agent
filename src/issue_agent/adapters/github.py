@@ -324,7 +324,7 @@ _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage sta
             "nodes{{databaseId author{{login}} state submittedAt body commit{{oid}}}}}}")
 _FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
 _FIX_PR = (
-    "id number state headRefName headRefOid baseRefName baseRefOid title author{login} "
+    "id number state headRefName headRefOid baseRefName baseRefOid title author{login} lastEditedAt "
     "mergeable mergeStateStatus " + _LABELS + " " + _LABELED + " " + _COMMENTS.format(before="") + " "
     + _REVIEWS.format(before="") + " " + _FILES.format(after="")
     + " commits(last:1){nodes{commit{oid committedDate author{user{login}}}}}"
@@ -586,8 +586,15 @@ def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PR
         state=str(node.get("state") or ""), changed_files=_changed_files([{"path": f.get("path")} for f in files
                                                                          if isinstance(f, dict)]),
         mergeable=str(node.get("mergeable") or ""), merge_state=str(node.get("mergeStateStatus") or ""),
-        author=_login(node.get("author")), pushes=pushes,
+        author=_login(node.get("author")), pushes=pushes, body_edited_at=_edited_at(node),
     )
+
+
+def _edited_at(node: dict) -> str:
+    """GraphQL `lastEditedAt`: null (never edited) or malformed reads as "",
+    which leaves review owed on the head alone (#472)."""
+    edited = node.get("lastEditedAt")
+    return edited if isinstance(edited, str) else ""
 
 
 def parse_fix_refs(nodes: list) -> tuple[tuple[Branch, ...], dict[int, str]]:
@@ -738,6 +745,16 @@ class GitHubGateway:
 
     def get_issue(self, number: int) -> IssueView:
         return parse_issue(self._view("issue", number, "number,title,body,labels,comments,updatedAt,author,state"))  # type: ignore[arg-type]
+
+    def pr_body(self, number: int) -> tuple[str, str]:
+        """The PR body and when it was last edited ("" never), in one read: a
+        review is pinned to the description it judged (#472). `gh pr view`
+        cannot read the edit time."""
+        data = self._repository_page(f"pullRequest(number:{int(number)}){{body lastEditedAt}}")
+        node = data.get("pullRequest")
+        if not isinstance(node, dict) or not isinstance(node.get("body"), str):
+            raise FixObservationIncomplete(f"pull request {number} body is unreadable")
+        return node["body"], _edited_at(node)
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         """One PR. `mergeability=False` leaves out the lazily computed fields
@@ -1013,10 +1030,17 @@ class GitHubGateway:
         data = self._view("issue", issue, "state")
         return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 
-    def reviewed_on(self, pr: int, head: str, login: str) -> bool:
-        """Whether `login` has a standing verdict on commit `head`, across every
-        page. Raises unless the read was complete: the review role submits on
-        "absent"."""
+    def reviewed_on(self, pr: int, head: str, login: str, since: str = "") -> bool:
+        """Whether `login` has a standing verdict on commit `head` submitted no
+        earlier than `since` (the body edit the review judged, #472; "" or
+        unparseable: any), across every page. Raises unless the read was
+        complete: the review role submits on "absent"."""
+        after = parse_timestamp(since)
+
+        def current(raw: object) -> bool:
+            at = parse_timestamp(raw) if isinstance(raw, str) else None
+            return after is None or at is None or at >= after
+
         data = self._gh_json(["api", f"repos/{self.repo}/pulls/{pr}/reviews?per_page=100", "--paginate", "--slurp"])
         if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
             raise RuntimeError(f"pull request {pr} reviews were not answered completely")
@@ -1024,6 +1048,7 @@ class GitHubGateway:
             isinstance(item, dict) and isinstance(item.get("user"), dict)
             and login_eq(str(item["user"].get("login") or ""), login) and item.get("commit_id") == head
             and str(item.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED")
+            and current(item.get("submitted_at"))
             for page in data for item in page)
 
     def comment(self, kind: str, number: int, body: str) -> Accepted | Refused:

@@ -2,7 +2,8 @@
 
 The role ticks exactly like the fix role (`tick.py`) and keeps only
 `RunAgent(REVIEW)`: derive owes a review when CI is green on a harness PR's
-head and the review bot has no verdict on that head. Every other Action
+head and the review bot has no verdict on that head newer than the PR body's
+last edit (#472). Every other Action
 (labels, stop comments, merges, the other legs) is the fix role's, so
 `needs-human` keeps one writer and a REVIEW attempt cap is stopped by fix.
 
@@ -27,15 +28,16 @@ from ..adapters.act import submit_review
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.agent_task import RuntimeName
+from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.leg import Leg, LegTarget
 from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
 from ..domain.routing import ModelRoute, Tier
-from ..domain.state import DerivedState, Harness, ItemKey, Local, human_comments, pr_key
+from ..domain.state import DerivedState, Harness, ItemKey, Local, bot_verdict_on_head, human_comments, pr_key
 from ..domain.trust import as_untrusted
-from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
+from ..domain.world import Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
 from .config import REVIEW_DISPATCH_CAPACITY, HarnessConfig
@@ -61,16 +63,19 @@ def review_choose(harness: Harness) -> Choose:
     return choose
 
 
-def stored_verdict(runs: Iterable[LegRun], pr: int, head: str) -> Verdict | None:
-    """The verdict of this head's newest agent REVIEW leg, if it parsed one.
-    The receipt holds what `parse_verdict` accepted; it is parsed again here,
-    since a receipt is only as trusted as the agent output it came from."""
+def stored_verdict(runs: Iterable[LegRun], pr: int, head: str, edited: str = "") -> Verdict | None:
+    """The verdict of this head's newest agent REVIEW leg, if it parsed one
+    and judged the description last edited at `edited` (GitHub's stamp
+    against GitHub's, #472; a receipt from before the stamp was recorded
+    judged ""). The receipt holds what `parse_verdict` accepted; it is parsed
+    again here, since a receipt is only as trusted as the agent output it
+    came from."""
     mine = [run for run, end in leg_ends(runs) if end.kind is AgentKind.REVIEW and run_item(run) == pr_key(pr)
             and run.head == head and not end.machine]
     if not mine or mine[-1].receipt is None:
         return None
     raw = mine[-1].receipt.get("verdict")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or raw.get("body_edited_at", "") != edited:
         return None
     return parse_verdict({"decision": raw.get("event"), "body": raw.get("body")})
 
@@ -141,6 +146,8 @@ class ReviewLegs:
         if pr.state != "OPEN" or issue is None or pr.head_ref_oid != action.head:
             self.log(f"REVIEW PR #{action.number}: skipped — PR closed or head moved")
             return
+        body, edited = self.gateway.pr_body(action.number)
+        pr = replace(pr, body=body, body_edited_at=edited)
         repo, owner = self.settings.repository, self.settings.owner_id
         if not self.control.lease(repo, "review", issue, owner):
             self.log(f"REVIEW PR #{action.number}: skipped — issue #{issue} already has a review leg in flight")
@@ -158,18 +165,22 @@ class ReviewLegs:
 
     async def _run_claimed(self, action: RunAgent, issue: int, pr: PRView) -> None:
         bot = self.settings.harness.review_bot
-        on_head = [r for r in pr.reviews if login_eq(r.author, bot) and r.commit_id == action.head]
-        if any(r.state.upper() in (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED) for r in on_head):
+        if bot_verdict_on_head(pr, self.settings.harness) is not None:
             self.log(f"REVIEW PR #{action.number}: skipped — already reviewed at {action.head[:12]}")
             return
+        edited = parse_timestamp(pr.body_edited_at)
+        # The bot's reviews of this head and description: one older than a body
+        # edit was answered by it (a standing approval skipped above).
+        on_head = [r for r in pr.reviews if login_eq(r.author, bot) and r.commit_id == action.head
+                   and not (edited is not None and (at := parse_timestamp(r.submitted_at)) is not None and at < edited)]
         runs = self.control.leg_runs(self.settings.repository, (issue,))
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
                                  head=action.head, tier=action.tier.value if action.tier is not None else "")
-        verdict = stored_verdict(runs, action.number, action.head)
+        verdict = stored_verdict(runs, action.number, action.head, pr.body_edited_at)
         if verdict is not None and not on_head:
             # A paid verdict whose submission never landed (a crash, or GitHub
             # refused it): submit it, free. A dismissed verdict is not resubmitted.
-            self._submit(action, verdict)
+            self._submit(action, verdict, pr.body_edited_at)
             return
         try:
             task = self._task(action, issue, pr, runs)
@@ -186,12 +197,12 @@ class ReviewLegs:
             self.log(f"REVIEW PR #{action.number}: no usable verdict "
                      f"(status={result.status or ('error' if result.is_error else 'ok')}); nothing submitted")
             return
-        self._submit(action, verdict)
+        self._submit(action, verdict, pr.body_edited_at)
 
-    def _submit(self, action: RunAgent, verdict: Verdict) -> None:
+    def _submit(self, action: RunAgent, verdict: Verdict, judged_edit: str) -> None:
         pr, head = action.number, action.head
         try:
-            landed = submit_review(self.gateway, pr, head, verdict, self.settings.harness.review_bot)
+            landed = submit_review(self.gateway, pr, head, verdict, self.settings.harness.review_bot, judged_edit)
         except Exception as exc:  # noqa: BLE001 - GitHub did not answer or confirm: a machine end
             self.log(f"REVIEW PR #{pr}: submission failed, retried after backoff: {exc}")
             self.accounting.record_refused_leg()
@@ -200,7 +211,8 @@ class ReviewLegs:
             self.log(f"PR #{pr}: {verdict.event} stands on {head[:12]}")
             return
         self.log(f"REVIEW PR #{pr}: GitHub refused the {verdict.event} on {head[:12]} (counted as an attempt)")
-        self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
+        self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body,
+                                                                "body_edited_at": judged_edit}})
 
     def _issue(self, issue: int, runs: Iterable[LegRun], *, required: bool) -> tuple[str, str]:
         """The issue's body and human comments, each bounded. Derive's
@@ -239,7 +251,7 @@ class ReviewLegs:
             prior_review=as_untrusted(prior) if prior else None,
         )
         task = tasks.build_review_task(action.number, issue, action.head, base, context, self.task_config)
-        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort)
+        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort, body_edited_at=pr.body_edited_at)
 
 
 def _bounded(author: str, text: str) -> str:
