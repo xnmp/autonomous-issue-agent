@@ -269,3 +269,32 @@ def test_open_pickup_is_refused_when_the_open_issues_cannot_be_read(harness):
     gh_error["error"] = "HTTP 502"
     body = client.post("/api/repos/demo/settings", json={"key": "ISSUE_PICKUP", "value": "open"}).json()
     assert body["ok"] is False and "could not be counted" in body["detail"]
+
+
+def test_a_save_is_refused_when_the_installed_service_snapshot_differs_beyond_live_knobs(harness):
+    """`publish` overwrites the service snapshot, so a non-live difference
+    there (a `start` after `install-service`) must not reach the service."""
+    root, snapshot, _, client = harness
+    snapshot.write_text(snapshot.read_text() + "POLL_SECONDS=5\n")
+    before, published = _files(root), snapshot.read_text()
+
+    body = client.post("/api/repos/demo/settings", json={"key": "DAILY_SPEND_CAP_USD", "value": "7"}).json()
+
+    assert body["ok"] is False and "POLL_SECONDS" in body["detail"]
+    assert _files(root) == before and snapshot.read_text() == published
+
+
+def test_staged_config_stays_private_and_is_removed(harness, monkeypatch, tmp_path):
+    """The staged files hold the shared tokens: never in TMPDIR (disk on macOS
+    and WSL), and gone after the save."""
+    *_, client = harness
+    spill = tmp_path / "tmpdir"
+    spill.mkdir()
+    monkeypatch.setenv("TMPDIR", str(spill))
+    monkeypatch.setattr("tempfile.tempdir", None)
+
+    assert client.post("/api/repos/demo/settings", json={"key": "FIX_DISPATCH_CONCURRENCY", "value": "4"}).json()["ok"]
+
+    staging = tmp_path / "state" / "settings-staging"
+    assert list(spill.iterdir()) == []
+    assert staging.stat().st_mode & 0o777 == 0o700 and list(staging.iterdir()) == []

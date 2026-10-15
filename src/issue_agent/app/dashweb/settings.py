@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import shutil
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
@@ -159,7 +160,8 @@ class WriteResult:
 
 
 def _vet(files: Files, target: str, after: str, key: str, value: str | None, scope: str,
-         environ: Mapping[str, str], open_issues: Callable[[str], int | None]) -> tuple[str, str]:
+         environ: Mapping[str, str], open_issues: Callable[[str], int | None], *, staging: str,
+         home: str) -> tuple[str, str]:
     """`(refusal, warning)` for one deployment if `target` held `after`. The
     candidate is composed with the real `compose-env.sh` in a scratch
     directory and parsed the daemons' way. Refused: an invalid result; a
@@ -173,16 +175,24 @@ def _vet(files: Files, target: str, after: str, key: str, value: str | None, sco
                            for path in (files.shared, files.overlay))
     except (OSError, ValueError) as exc:
         return f"refused, {deployment}: {exc}", ""
-    with tempfile.TemporaryDirectory(prefix="issue-agent-settings-") as scratch:
+    # The staged files hold the shared tokens: private and never left behind.
+    try:
+        scratch = tempfile.mkdtemp(prefix="issue-agent-settings-", dir=_staging_root(environ, staging))
+    except OSError as exc:
+        return f"refused, {deployment}: no private staging directory: {exc}", ""
+    try:
         staged, problem = config_files.compose_staged(files.harness_root, deployment, shared, overlay, environ,
                                                       scratch)
         if problem:
             return f"refused, {deployment}: {problem}", ""
-        try:
-            env = config_files.sourced((staged,), environ)
-            pending = _pending(staged, files.active, environ)
-        except ValueError as exc:
-            return f"refused, {deployment}: {exc}", ""
+        running = (*((files.active,) if os.path.isfile(files.active) else ()),
+                   *config_files.service_snapshots(deployment, home))
+        env = config_files.sourced((staged,), environ)
+        pending = _pending(staged, running, environ)
+    except ValueError as exc:
+        return f"refused, {deployment}: {exc}", ""
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     cfg = from_env(env)
     if errors := cfg.validation_errors():
         return f"refused, {deployment} would be invalid: " + "; ".join(errors), ""
@@ -203,15 +213,29 @@ def _vet(files: Files, target: str, after: str, key: str, value: str | None, sco
     return "", ""
 
 
-def _pending(staged: str, active: str, environ: Mapping[str, str]) -> list[str]:
-    """The restart-requiring names that differ between a candidate and the
-    running composed file (none for a deployment never launched)."""
-    if not os.path.isfile(active):
-        return []
+def _staging_root(environ: Mapping[str, str], state_dir: str) -> str:
+    """A private directory for staged config (it holds tokens): the user's
+    runtime directory (tmpfs) when set and writable, else a 0700 directory
+    in the deployment's state dir. Never TMPDIR or /tmp, which are disk on
+    macOS and WSL."""
+    runtime = environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and os.path.isdir(runtime) and os.access(runtime, os.W_OK | os.X_OK):
+        return runtime
+    root = os.path.join(state_dir, "settings-staging")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def _pending(staged: str, running: tuple[str, ...], environ: Mapping[str, str]) -> list[str]:
+    """The restart-requiring names that differ between a candidate and each
+    file a daemon runs from: `.active` (`issue-agent start`) and any installed
+    service snapshot, which `publish` overwrites (none if never launched)."""
     names: set[str] = set()
-    for role in ("fix", "review"):
-        new, old = restart_part(staged, environ, role), restart_part(active, environ, role)
-        names |= {name for name in new.keys() | old.keys() if new.get(name) != old.get(name)}
+    for path in running:
+        for role in ("fix", "review"):
+            new, old = restart_part(staged, environ, role), restart_part(path, environ, role)
+            names |= {name for name in new.keys() | old.keys() if new.get(name) != old.get(name)}
     return sorted(names)
 
 
@@ -245,7 +269,7 @@ def write_setting(
     warnings: list[str] = []
     for deployment in dict.fromkeys((name, *affected)):
         refusal, warning = _vet(Files(harness_root, deployment), target, after, key, value, scope, environ,
-                                open_issues)
+                                open_issues, staging=load(deployment).state_dir, home=home)
         if refusal:
             return WriteResult(False, refusal)
         warnings += [warning] if warning else []
