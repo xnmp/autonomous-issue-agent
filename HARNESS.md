@@ -415,8 +415,9 @@ workflow failing on the base's push runs gets one issue per red streak,
 run; the harness closes it when the workflow passes, and a later failure, or
 one completing after a close while still red (a human's, or a fix's merge),
 gets the next streak's issue. On a non-default base, where `Closes #` closes
-nothing, the harness closes a fixed issue itself once a run created after
-the merge has failed; runs from before the merge are ignored. To reopen
+nothing, once a run created after the merge has failed, the harness files
+that failure's issue and then closes the fixed one itself; runs from before
+the merge are ignored. To reopen
 such an issue and keep it open, label it `needs-human`. If the workflow has a check the base
 branch requires, the harness readies the issue itself and dispatches it ahead
 of everything else, without steward, triage or blocked-by, and its PR is

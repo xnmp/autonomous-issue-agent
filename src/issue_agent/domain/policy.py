@@ -138,10 +138,13 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
     red (a human, a fix's merge), by the first failing run that completed
     after that close. A close by the green before the streak never holds it
     back. An open issue whose harness PR merged (`merged`: issue -> merged at;
-    a fix into a non-default base that `Closes #` does not close) is closed
-    once a failing run created at or after the merge has completed, and that
-    run files the next issue in the same tick; a run from before the merge
-    counts for neither, and `needs-human` keeps it open. A required
+    a fix into a non-default base that `Closes #` does not close) has ended
+    once a failing run created at or after the merge has completed: that run
+    files the next issue, and the ended issue is closed only once another
+    issue of the workflow is seen open. The close never precedes the filing,
+    so a lost write (an error, a kill) leaves the next tick to derive what is
+    left. A run from before the merge counts for neither, and `needs-human`
+    keeps the issue open. A required
     workflow's open issue is readied (`ai-ready`) unless it carries
     `ai-ready` or `needs-human` (`labels`, of the open issues the fix role
     reads)."""
@@ -162,10 +165,10 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
                   if (at := parse_timestamp(merged.get(i.number, ""))) and Label.NEEDS_HUMAN not in labels.get(
                       i.number, frozenset())}
         ended = {n: r for n, r in failed.items() if r is not None}  # its fix merged, and a later run still fails
-        out.extend(SetIssueState(n, False, f"{marker}\nIts fix merged, but **{name}** still fails on `{base}` "
-                                           f"after it: {r.url}. That failure has an issue of its own.")
-                   for n, r in sorted(ended.items()))
-        if len(ended) < len(opened):
+        if len(ended) < len(opened):  # another issue stays open for the red base: the ended ones may close
+            out.extend(SetIssueState(n, False, f"{marker}\nIts fix merged, but **{name}** still fails on `{base}` "
+                                               f"after it: {r.url}. That failure has an issue of its own.")
+                       for n, r in sorted(ended.items()))
             continue
         after = max((closed[t] for r in streak if (t := base_title(latest.workflow, base, r.head_sha)) in closed),
                     default=None)

@@ -26,8 +26,10 @@ risk and little the required checks did not already give.
   close before a streak never holds it back, so whenever a workflow's latest
   completed run is red its issue is open or filed. An open issue whose
   harness PR merged (into a non-default base, where `Closes #` closes
-  nothing) is closed once a failing run created at or after the merge has
-  completed, and that run files the next issue in the same tick. A run
+  nothing) has ended once a failing run created at or after the merge has
+  completed. That run files the next issue first; the ended issue is closed
+  only on a later tick that sees the next issue open, so no write order
+  leaves a red workflow without an open issue. A run
   created before the merge never tested the fix, so it neither closes the
   issue nor files the next one; if the merge's own run passes, green closes
   the issue as fixed. `needs-human` keeps the issue open: a human's reopen
@@ -66,5 +68,13 @@ step of readying a red base's issue.
 
 The filing is keyed by the streak's title, and act reads the token's own issue
 listing before filing again, so a replay or a lagging search files once. The
-close and the label are read back. A crash between any two re-derives the same
-actions next tick (`tests/domain/test_base_ci.py`, `tests/app/test_fix_role.py`).
+close and the label are read back. A crash between any two re-derives what is
+left next tick (`tests/domain/test_base_ci.py`, `tests/app/test_fix_role.py`).
+A failed action does not stop the tick's later actions, so the close of a
+merged fix's issue is never emitted beside the filing that replaces it: it
+waits until that issue is observed open. If the filing is lost (an error, a
+kill), the old issue stays open and the filing is derived again under its
+key. If the filing lands and the close is lost, the next tick closes the old
+issue and files nothing more. Closing first would strand the base: once
+closed, the old issue drops out of the merged-PR read, and the post-merge
+run completed before the close, so nothing would file.

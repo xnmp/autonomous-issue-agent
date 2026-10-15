@@ -1510,8 +1510,9 @@ def test_402_a_fix_merged_into_a_non_default_base_that_leaves_it_red_files_the_n
     assert gh.issues[issue.number].state == "open" and len(base_issues(gh)) == 1
     gh.base_runs.append(base_run("Smoke", 4, "failure", 5))  # the merge's run is red
     tick(composed)
+    fresh = base_issues(gh)["CI: Smoke failing on dev since sha4"]  # filed before the fixed issue closes
+    tick(composed)
     assert gh.issues[issue.number].state == "closed"  # not left open and shadowed by its merged PR
-    fresh = base_issues(gh)["CI: Smoke failing on dev since sha4"]
     tick(composed)
     assert [a.number for a in dispatched(tick(composed), AgentKind.RESOLVE)] == [fresh.number]
 

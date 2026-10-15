@@ -117,15 +117,28 @@ def test_a_run_created_before_the_fix_merged_neither_closes_its_issue_nor_files(
     assert _closes(actions) == [40] and "passes on `dev` again" in actions[0].comment and _filed(actions) == []
 
 
-def test_a_failure_created_at_or_after_the_merge_closes_its_issue_and_files_the_next():
-    after = _run(3, "failure", "10:00:00", "10:40:00")  # the merge's own run
-    actions = _act(FIRST, BEFORE, after, issues=FIXED, merged={40: MERGED_AT})
-    assert _closes(actions) == [40] and "still fails" in actions[0].comment and "runs/3" in actions[0].comment
-    (filed,) = _filed(actions)
-    assert filed.title == f"{PREFIX} since sha3" and filed.key == f"base-ci:dev:{PREFIX} since sha3"
-    # closed, and the next issue open: nothing more
-    closed = [BaseIssue(40, f"{PREFIX} since sha1", "2026-10-14T10:41:00Z"), BaseIssue(41, filed.title)]
-    assert _act(FIRST, BEFORE, after, issues=closed, merged={40: MERGED_AT}) == ()
+AFTER = _run(3, "failure", "10:00:00", "10:40:00")  # the merge's own run
+NEXT = BaseIssue(41, f"{PREFIX} since sha3")
+
+
+def test_a_failure_created_at_or_after_the_merge_files_the_next_issue_then_closes_the_fixed_one():
+    (filed,) = _act(FIRST, BEFORE, AFTER, issues=FIXED, merged={40: MERGED_AT})  # the filing comes first, alone
+    assert isinstance(filed, FileIssue) and filed.title == NEXT.title and filed.key == f"base-ci:dev:{NEXT.title}"
+    (closed,) = _act(FIRST, BEFORE, AFTER, issues=[*FIXED, NEXT], merged={40: MERGED_AT})  # seen filed: close it
+    assert _closes([closed]) == [40] and "still fails" in closed.comment and "runs/3" in closed.comment
+    done = [BaseIssue(40, FIXED[0].title, "2026-10-14T10:41:00Z"), NEXT]
+    assert _act(FIRST, BEFORE, AFTER, issues=done, merged={40: MERGED_AT}) == ()
+
+
+def test_whichever_write_is_lost_the_next_tick_derives_the_rest_and_the_base_keeps_an_open_issue():
+    filing = _act(FIRST, BEFORE, AFTER, issues=FIXED, merged={40: MERGED_AT})
+    # (b) neither landed (a create_issue error, or a kill before it): the same filing, under the same key
+    assert _act(FIRST, BEFORE, AFTER, issues=FIXED, merged={40: MERGED_AT}) == filing
+    # (a) the filing landed and the close was lost: close the fixed issue and file nothing more
+    actions = _act(FIRST, BEFORE, AFTER, issues=[*FIXED, NEXT], merged={40: MERGED_AT})
+    assert _closes(actions) == [40] and _filed(actions) == []
+    # no tick ever closes the workflow's last open issue while the base is red
+    assert _closes(filing) == []
 
 
 def test_only_an_issue_whose_own_fix_merged_with_a_readable_time_is_closed():
@@ -139,7 +152,8 @@ def test_needs_human_keeps_an_issue_open_after_its_fix_merged():
     after = _run(3, "failure", "10:00:00", "10:40:00")
     parked = {40: frozenset({Label.NEEDS_HUMAN})}
     assert _act(FIRST, after, issues=FIXED, labels=parked, merged={40: MERGED_AT}) == ()
-    assert _closes(_act(FIRST, after, issues=FIXED, labels={40: frozenset({Label.AI_READY})},
+    assert _act(FIRST, after, issues=[*FIXED, NEXT], labels=parked, merged={40: MERGED_AT}) == ()
+    assert _closes(_act(FIRST, after, issues=[*FIXED, NEXT], labels={40: frozenset({Label.AI_READY})},
                         merged={40: MERGED_AT})) == [40]  # a reopen without the label is closed again
 
 
