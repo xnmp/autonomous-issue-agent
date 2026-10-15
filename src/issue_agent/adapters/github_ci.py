@@ -151,8 +151,18 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                    for n in nodes)):
         raise ValueError("issue search is absent, malformed or short")
     return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
-                           n["createdAt"] if isinstance(n.get("createdAt"), str) else "")
+                           n["createdAt"] if isinstance(n.get("createdAt"), str) else "", _closer(n))
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
+
+
+def _closer(node: dict) -> str:
+    """The commit that closed an issue (#442), "" when absent or unreadable."""
+    events = (node.get("timelineItems") or {}).get("nodes") if isinstance(node.get("timelineItems"), dict) else None
+    closer = events[-1].get("closer") if isinstance(events, list) and events and isinstance(events[-1], dict) else None
+    if not isinstance(closer, dict):
+        return ""
+    oid = (closer.get("mergeCommit") or {}).get("oid") if isinstance(closer.get("mergeCommit"), dict) else closer.get("oid")
+    return oid if isinstance(oid, str) and oid else ""
 
 
 def active_workflows(payload, listing) -> frozenset[str] | None:

@@ -174,11 +174,12 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
                                                f"after it: {r.url}. That failure has an issue of its own.")
                        for n, r in sorted(ended.items()))
             continue
-        after = max((_ended(i, at, latest.workflow, health.runs) for i in issues
-                     if (at := parse_timestamp(i.closed_at))), default=None)
+        # The commit whose merge or push closed the last issue tested the fix, whenever GitHub dates the close.
+        after, closer = max(((_ended(i, at, latest.workflow, health.runs), i.closed_by) for i in issues
+                             if (at := parse_timestamp(i.closed_at))), default=(None, ""))
         first = min(ended.values(), key=_created) if ended else next((
             r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
-            and (after is None or _created(r)[0] >= after)), None)
+            and (after is None or _created(r)[0] >= after or closer and r.head_sha == closer)), None)
         if first is None:
             continue  # every listed failure predates what ended the last issue: the next failing run files
         title = base_title(latest.workflow, base, first.head_sha)

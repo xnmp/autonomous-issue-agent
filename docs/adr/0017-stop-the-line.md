@@ -114,8 +114,9 @@ identify a failure the same way:
   into the default branch) is anchored on the close, so a run that tested
   pre-fix code never files. Incident: tauri #1150, a legacy issue closed by
   #1178's merge at 11:55:46Z; the next tick refiled the streak as #1179 from
-  a run of `e6daf55`. Residual: the merge commit's run must be created after
-  the close (GitHub closed 1-2 s before it on all 13 recent tauri merges); a
+  a run of `e6daf55`. A run of the commit that closed the issue (a merged
+  PR's merge commit, or a pushed commit, read with the issue search) also
+  files, however GitHub dates the close against that run's creation. A
   human's close of a red streak waits for a run created after it, not a
   re-run of an older one.
 - An open base-CI issue whose workflow is neither in the listed runs nor

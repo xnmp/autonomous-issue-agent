@@ -262,3 +262,14 @@ def test_a_workflow_named_apart_from_its_runs_on_the_base_leaves_the_listing_unr
     assert active_workflows(_workflows(("Smoke", "active")), listing) is None
     assert active_workflows(_workflows(("Smoke2", "active")), listing) == frozenset({"Smoke2"})
     assert active_workflows(_workflows(("Smoke", "active")), {"workflow_runs": [run_row("Smoke2")]}) == {"Smoke"}
+
+
+def test_the_commit_that_closed_an_issue_is_read_with_it_and_unreadable_is_none():
+    def closed(closer):
+        return {**found(1, "t", "CLOSED", closed="2026-10-15T11:55:46Z"),
+                "timelineItems": {"nodes": [{"createdAt": "2026-10-15T11:55:46Z", "closer": closer}]}}
+    nodes = [closed({"mergeCommit": {"oid": "d20c058"}}), closed({"oid": "abc"}), closed(None), closed({}),
+             closed({"mergeCommit": None}), closed("x"), {**closed(None), "timelineItems": {"nodes": "x"}},
+             {**closed(None), "timelineItems": None}, found(2, "t")]
+    assert [i.closed_by for i in base_issues(search(*nodes), "fix-bot")] == ["d20c058", "abc", "", "", "", "", "", "",
+                                                                             ""]

@@ -139,6 +139,18 @@ def test_a_merge_closing_the_streaks_issue_files_nothing_until_the_merges_own_ru
         assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", MERGE_RUN, "12:30:00"), issues=issues) == ()
 
 
+def test_the_closing_commits_own_run_files_even_if_github_dated_it_before_the_close():
+    # The merge commit's run created 11:55:45, a second before GitHub recorded `Closes #` at 11:55:46.
+    merge_run = "11:55:45"
+    for closer, files in (("sha4", True), ("", False), ("shaX", False)):  # absent or another commit: the close rules
+        issues = [BaseIssue(40, PREFIX, MERGE_CLOSED, "", closer)]
+        actions = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", merge_run, "12:30:00"), issues=issues)
+        assert [a.title for a in _filed(actions)] == ([f"{PREFIX} since sha4"] if files else [])
+        assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", merge_run, "12:30:00"), issues=issues) == ()
+    # A run of the pre-merge code never files, closer or not.
+    assert _act(*OLD_RED, IN_FLIGHT, issues=[BaseIssue(40, PREFIX, MERGE_CLOSED, "", "sha4")]) == ()
+
+
 MERGED_AT = "2026-10-14T10:00:00Z"
 FIXED = [BaseIssue(40, f"{PREFIX} since sha1")]  # a fix into a non-default base: `Closes #` closed nothing
 FIRST = _run(1, "failure", "09:00:00", "09:30:00")

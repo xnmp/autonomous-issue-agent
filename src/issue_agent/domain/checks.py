@@ -99,6 +99,7 @@ class BaseIssue:
     title: str
     closed_at: str = ""  # "" while open
     created_at: str = ""
+    closed_by: str = ""  # the commit that closed it: a merged PR's merge commit, or a pushed commit
 
 
 @dataclass(frozen=True)
