@@ -1,5 +1,5 @@
-"""The fix role's one-query observation (slice 5b): parsers and the bounded
-world build, against GitHub GraphQL answer shapes."""
+"""The fix role's observation (slice 5b, #425): parsers and the bounded world
+build, one request per connection page, against GitHub GraphQL answer shapes."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import pytest
 from issue_agent.adapters import github as gh
 from issue_agent.adapters.github import (
     FixObservationIncomplete,
+    GhUnavailable,
     GitHubGateway,
     parse_fix_issue,
     parse_fix_pr,
@@ -286,24 +287,40 @@ def page(nodes, more=False, cursor=None) -> dict:
     return {"pageInfo": {"hasNextPage": more, "endCursor": cursor}, "nodes": nodes}
 
 
+_ASKED = re.compile(r"\b(issues|pullRequests|refs)\(|\b(baseTip):")
+
+
+def asked(query: str) -> set[str]:
+    """The top-level connections a repository query asks for."""
+    return {a or b for a, b in _ASKED.findall(query)}
+
+
 class GraphQL:
-    """Answers each `gh api graphql` call from a queue of repository pages."""
+    """Answers each repository read from the queued pages of the connections
+    it asks for, and each node read from the node queue."""
 
     def __init__(self, *repositories):
-        self.answers = [json.dumps({"data": {"repository": r}}) for r in repositories]
+        self.pages: dict[str, list] = {}
+        for repository in repositories:
+            for key, value in repository.items():
+                self.pages.setdefault(key, []).append(value)
+        self.nodes: list = []
         self.queries: list[str] = []
 
     def __call__(self, argv, _token):
         assert argv[:3] == ["gh", "api", "graphql"], argv
-        self.queries.append(next(a for a in argv if a.startswith("query=")))
-        return self.answers.pop(0)
+        query = next(a for a in argv if a.startswith("query="))
+        self.queries.append(query)
+        if query.startswith("query=query($id"):
+            return json.dumps({"data": {"node": self.nodes.pop(0)}})
+        return json.dumps({"data": {"repository": {k: self.pages[k].pop(0) for k in asked(query) if self.pages.get(k)}}})
 
 
 def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
     merged = xref(9, head="fix/4-old")
     runner = GraphQL(
         {
-            "issues": page([issue_node(5), issue_node(4, timelineItems={"pageInfo": {}, "nodes": [merged]})]),
+            "issues": page([issue_node(5), issue_node(4, timelineItems={"pageInfo": {"hasPreviousPage": False}, "nodes": [merged]})]),
             "pullRequests": page([pr_node(headRefName="feature/x")]),  # not a harness PR: never fetched further
             "refs": page([ref("5-null-token")]),
         }
@@ -312,7 +329,6 @@ def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
     assert [i.number for i in world.issues] == [5, 4]
     assert [(p.number, p.state) for p in world.prs] == [(9, "MERGED")]
     assert world.branches == (Branch("fix/5-null-token", "2026-10-01T00:00:00Z"),)
-    assert len(runner.queries) == 1  # one query for the whole observation
 
 
 def test_an_issue_with_unreadable_comments_is_skipped_not_misread():
@@ -322,10 +338,11 @@ def test_an_issue_with_unreadable_comments_is_skipped_not_misread():
 
 
 def test_a_top_level_connection_past_its_page_bound_skips_the_tick():
-    first = {"issues": page([], more=True, cursor="c0"), "pullRequests": page([]), "refs": page([])}
-    more = [{"issues": page([], more=True, cursor=f"c{i}")} for i in range(1, 12)]
+    endless = [{"issues": page([], more=True, cursor=f"c{i}")} for i in range(gh._FIX_MAX_PAGES["issues"] + 5)]
+    runner = GraphQL(*endless)
     with pytest.raises(FixObservationIncomplete, match="issues exceed"):
-        GitHubGateway("o/r", runner=GraphQL(first, *more)).build_world("dev")
+        GitHubGateway("o/r", runner=runner).build_world("dev")
+    assert len(runner.queries) == gh._FIX_MAX_PAGES["issues"]  # bounded: no request past the ceiling
 
 
 @pytest.mark.parametrize(
@@ -352,6 +369,158 @@ def test_an_unreadable_open_pr_still_shadows_its_issue_with_no_head():
         }
     )
     world = GitHubGateway("o/r", runner=runner).build_world("dev")
+    assert [(p.number, p.head_ref_oid, p.content_known) for p in world.prs] == [(100, "", False)]
+
+
+# ── #425: no single request is large ─────────────────────────────────────────
+
+
+class ServedGitHub:
+    """Serves whole connections the way GitHub pages them: each repository
+    read gets `first:N` items after its `$after` cursor (an index here).
+    `fail` maps a (connection, page number) to the answer that page gets."""
+
+    def __init__(self, issues=(), prs=(), refs=(), tip=None, fail=None):
+        self.items = {"issues": list(issues), "pullRequests": list(prs), "refs": list(refs)}
+        self.tip, self.fail = tip, fail or {}
+        self.queries: list[tuple[str, dict]] = []
+
+    def __call__(self, argv, _token):
+        assert argv[:3] == ["gh", "api", "graphql"], argv
+        pairs = dict(argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "-f")
+        query = pairs.pop("query")
+        self.queries.append((query, pairs))
+        (name,) = asked(query)
+        number = len(self.asking(name))
+        if (name, number) in self.fail:
+            failure = self.fail[(name, number)]
+            if isinstance(failure, BaseException):
+                raise failure
+            return json.dumps(failure)
+        if name == "baseTip":
+            return json.dumps({"data": {"repository": {"baseTip": self.tip}}})
+        start = int(pairs.get("after", "0"))
+        size = int(re.search(name + r"\([^)]*first:(\d+)", query).group(1))
+        chunk, end = self.items[name][start : start + size], start + size
+        more = end < len(self.items[name])
+        return json.dumps({"data": {"repository": {name: page(chunk, more, str(end) if more else None)}}})
+
+    def asking(self, name: str) -> list[str]:
+        return [q for q, _ in self.queries if asked(q) == {name}]
+
+
+def test_425_each_request_carries_one_connection_and_a_small_page():
+    served = ServedGitHub(issues=[issue_node(n) for n in range(1, 4)], refs=[ref(f"{n}-x") for n in range(1, 4)])
+    GitHubGateway("o/r", runner=served).build_world("dev")
+    assert sorted(name for q, _ in served.queries for name in asked(q)) == ["baseTip", "issues", "pullRequests", "refs"]
+    for query, _ in served.queries:
+        assert len(asked(query)) == 1, query
+        assert all(int(n) <= 50 for n in re.findall(r"(?:issues|pullRequests|refs)\([^)]*first:(\d+)", query))
+
+
+def test_425_a_huge_repository_is_read_in_full_across_many_small_requests():
+    issues = [issue_node(n) for n in range(1, 1001)]
+    refs = [ref(f"{n}-x") for n in range(1, 1001)]
+    prs = [pr_node(n, headRefName=f"feature/{n}") for n in range(1, 1001)]  # human PRs: listed, never acted on
+    served = ServedGitHub(issues=issues, prs=prs, refs=refs)
+    world = GitHubGateway("o/r", runner=served).build_world("dev")
+    assert [i.number for i in world.issues] == list(range(1, 1001))
+    assert len(world.branches) == 1000 and world.prs == ()
+    assert {name: len(served.asking(name)) for name in ("issues", "pullRequests", "refs")} == gh._FIX_MAX_PAGES
+
+
+@pytest.mark.parametrize("name", ["issues", "pullRequests", "refs"])
+def test_425_one_item_past_the_ceiling_skips_the_tick_after_a_bounded_number_of_requests(name):
+    many = {"issues": [issue_node(n) for n in range(1, 1002)],
+            "pullRequests": [pr_node(n, headRefName=f"feature/{n}") for n in range(1, 1002)],
+            "refs": [ref(f"{n}-x") for n in range(1, 1002)]}
+    served = ServedGitHub()
+    served.items[name] = many[name]
+    with pytest.raises(FixObservationIncomplete, match=f"{name} exceed"):
+        GitHubGateway("o/r", runner=served).build_world("dev")
+    assert len(served.asking(name)) == gh._FIX_MAX_PAGES[name]
+
+
+@pytest.mark.parametrize(
+    "bad_page",
+    [
+        {"nodes": [], "pageInfo": None},  # no page info: whether more follow is unknown
+        {"nodes": []},
+        {"nodes": [], "pageInfo": {}},
+        {"nodes": [], "pageInfo": {"hasNextPage": "false"}},
+        {"nodes": [], "pageInfo": {"hasNextPage": None, "endCursor": None}},
+        {"nodes": [], "pageInfo": []},
+        {"nodes": None, "pageInfo": {"hasNextPage": False}},
+        {"nodes": [], "pageInfo": {"hasNextPage": True}},  # more, but no cursor to fetch them
+        {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": ""}},
+        {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": 7}},
+    ],
+)
+@pytest.mark.parametrize("name", ["issues", "pullRequests", "refs"])
+def test_425_malformed_page_info_on_a_later_page_fails_the_read_never_truncates_it(name, bad_page):
+    count = range(1, gh._FIX_PAGE_SIZE[name] + 2)  # one item onto a second page
+    served = ServedGitHub(issues=[issue_node(n) for n in count], refs=[ref(f"{n}-x") for n in count],
+                          prs=[pr_node(n, headRefName=f"feature/{n}") for n in count],
+                          fail={(name, 2): {"data": {"repository": {name: bad_page}}}})
+    with pytest.raises(FixObservationIncomplete):
+        GitHubGateway("o/r", runner=served).build_world("dev")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GhUnavailable("server", "HTTP 502: Bad Gateway"),
+        {"errors": [{"message": "Something went wrong while executing your query"}]},  # GitHub's timeout answer
+        {"data": {"repository": None}},
+    ],
+)
+def test_425_a_failed_later_page_skips_the_tick_rather_than_observing_the_first_page_alone(failure):
+    served = ServedGitHub(issues=[issue_node(n) for n in range(1, gh._FIX_PAGE_SIZE["issues"] + 2)],
+                          fail={("issues", 2): failure})
+    with pytest.raises((FixObservationIncomplete, GhUnavailable)):
+        GitHubGateway("o/r", runner=served).build_world("dev")
+    assert len(served.queries) == 2  # no retry: the next tick is the retry
+
+
+@pytest.mark.parametrize("name", ["pullRequests", "refs"])
+def test_425_a_failed_connection_after_a_good_one_still_skips_the_tick(name):
+    served = ServedGitHub(issues=[issue_node(5)], fail={(name, 1): GhUnavailable("server", "HTTP 504: Gateway Timeout")})
+    with pytest.raises(GhUnavailable):
+        GitHubGateway("o/r", runner=served).build_world("dev")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GhUnavailable("server", "HTTP 502"),
+        {"errors": [{"message": "Something went wrong while executing your query"}]},  # GitHub's timeout answer
+        {"data": None},
+        {"data": {"repository": None}},
+    ],
+)
+def test_425_a_failed_base_tip_request_skips_the_tick_rather_than_charging_base_reds_to_prs(failure):
+    served = ServedGitHub(issues=[issue_node(5)], fail={("baseTip", 1): failure})
+    with pytest.raises((FixObservationIncomplete, GhUnavailable)):
+        GitHubGateway("o/r", runner=served).build_world("dev")
+
+
+@pytest.mark.parametrize("info", [None, {}, {"hasPreviousPage": "no"}, {"hasPreviousPage": None}])
+def test_425_cross_references_without_page_info_make_the_issue_unknown_not_unmerged(info):
+    xrefs = {"nodes": [], **({} if info is None else {"pageInfo": info})}
+    served = ServedGitHub(issues=[issue_node(5, timelineItems=xrefs), issue_node(6)])
+    world = GitHubGateway("o/r", runner=served).build_world("dev")
+    assert [i.number for i in world.issues] == [6]
+
+
+@pytest.mark.parametrize("connection", ["comments", "reviews", "files"])
+def test_425_a_pr_nested_connection_without_page_info_makes_its_content_unknown(connection):
+    empty = {"totalCount": 0, "nodes": []}
+    pr = pr_node(comments={**empty, "pageInfo": {"hasPreviousPage": False}},
+                 reviews={**empty, "pageInfo": {"hasPreviousPage": False}},
+                 files={**empty, "pageInfo": {"hasNextPage": False}})
+    pr[connection] = empty  # GitHub's shape without its page info
+    served = ServedGitHub(prs=[pr])
+    world = GitHubGateway("o/r", runner=served).build_world("dev")
     assert [(p.number, p.head_ref_oid, p.content_known) for p in world.prs] == [(100, "", False)]
 
 
@@ -420,6 +589,8 @@ class PagedGitHub:
         self.calls.append((query, variables))
         if query.startswith("query($id"):
             return json.dumps({"data": {"node": self.node(query, variables)}})
+        if "baseTip:" in query:
+            return json.dumps({"data": {"repository": {"baseTip": None}}})
         if "refs(" in query and "after:$after" in query:
             return json.dumps({"data": {"repository": {"refs": _fwd([ref("5-x")])}}})
         return json.dumps({"data": {"repository": self.first()}})
@@ -437,7 +608,7 @@ def _used(query: str) -> set[str]:
 def test_every_paged_query_declares_exactly_the_variables_it_uses_and_is_sent_them():
     runner = PagedGitHub()
     world = GitHubGateway("o/r", runner=runner).build_world("dev")
-    assert len(runner.calls) == 7  # first read, refs page 2, 5 nested pages
+    assert len(runner.calls) == 10  # issues, PRs, refs ×2, base tip, 5 nested pages
     for query, variables in runner.calls:
         assert _declared(query) == _used(query) == set(variables), query
 
@@ -462,7 +633,7 @@ def test_cross_references_past_their_bound_skip_the_issue_rather_than_read_as_un
     assert world.issues == () and not any(p.state == "MERGED" for p in world.prs)
 
 
-# ── #313: the base tip's checks ride the first read ─────────────────────────
+# ── #313: the base tip's checks ─────────────────────────────────────────────
 
 
 def run_node(name, conclusion="FAILURE", status="COMPLETED", app=15368, n=1) -> dict:
@@ -502,11 +673,11 @@ def base_tip(nodes, name="dev", more=None, total=None) -> dict:
 def world_with(tip, *more):
     first = {"issues": page([]), "pullRequests": page([]), "refs": page([]), "baseTip": tip}
     runner = GraphQL(first)
-    runner.answers += [json.dumps({"data": {"node": m}}) for m in more]
+    runner.nodes += list(more)
     return GitHubGateway("o/r", runner=runner).build_world("dev"), runner
 
 
-def test_313_the_base_tips_checks_come_with_the_one_query():
+def test_313_the_base_tips_checks_are_read_with_the_world():
     world, runner = world_with(base_tip([run_node("frontend"), run_node("rust", "SUCCESS", n=2), status_node("ci/x")]))
     assert world.base is not None and (world.base.ref, world.base.oid) == ("dev", "b9")
     assert [(c.name, c.bucket, c.kind, c.app_id) for c in world.base.reports] == [
@@ -514,7 +685,7 @@ def test_313_the_base_tips_checks_come_with_the_one_query():
         ("rust", "pass", "check", 15368),
         ("ci/x", "fail", "status", None),
     ]
-    assert len(runner.queries) == 1 and "baseTip:ref(qualifiedName:$base)" in runner.queries[0]
+    assert any("baseTip:ref(qualifiedName:$base)" in q for q in runner.queries)
 
 
 def test_313_a_base_tip_with_no_checks_is_an_empty_read_not_an_unread_one():
@@ -547,7 +718,7 @@ def test_313_a_base_tip_past_one_page_is_read_in_full():
                          "nodes": [run_node("last", n=101)]}}
     world, runner = world_with(base_tip([run_node(f"j{i}", n=i + 1) for i in range(100)], more="c1", total=101), more)
     assert world.base is not None and len(world.base.reports) == 101
-    assert "on StatusCheckRollup{contexts(first:100,after:$cursor)" in runner.queries[1]
+    assert any("on StatusCheckRollup{contexts(first:100,after:$cursor)" in q for q in runner.queries)
 
 
 def test_313_a_huge_base_check_list_past_its_bound_is_absent():
@@ -647,10 +818,15 @@ def test_the_world_carries_open_blockers_and_logs_an_unreadable_connection(capsy
 def test_an_error_inside_blocked_by_alone_never_skips_the_tick(capsys):
     # A blocker GitHub will not show this token: it nulls the connection and
     # reports an error on that path, with the rest of the data intact.
-    repository = {"issues": page([issue_node(5, blockedBy=None)]), "pullRequests": page([]), "refs": page([])}
+    issues = {"issues": page([issue_node(5, blockedBy=None)])}
     error = {"message": "Resource not accessible", "path": ["repository", "issues", "nodes", 0, "blockedBy"]}
-    answers = [json.dumps({"data": {"repository": repository}, "errors": [error]})]
-    world = GitHubGateway("o/r", runner=lambda argv, _t: answers.pop(0)).build_world("dev")
+    rest = GraphQL({"pullRequests": page([]), "refs": page([])})
+
+    def runner(argv, token):
+        query = next(a for a in argv if a.startswith("query="))
+        return json.dumps({"data": {"repository": issues}, "errors": [error]}) if "issues(" in query else rest(argv, token)
+
+    world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [(i.number, i.blocked_by) for i in world.issues] == [(5, ())]
     assert "issue #5: blockedBy is absent or malformed" in capsys.readouterr().err
 

@@ -232,7 +232,16 @@ def format_pr_discussion(
     return capped if capped == joined else capped + "\n\n---\n\n[older comments truncated]"
 
 
-_FIX_MAX_PAGES = {"issues": 10, "pullRequests": 10, "refs": 10}
+# #425: one request carrying every connection grew with repository activity
+# past GitHub's GraphQL server timeout (502/504; the tick was skipped). Each
+# connection is its own request now, paged so that one page stays near a
+# second however busy the repository gets. Measured on xnmp/tauri-explorer
+# (2026-10-15): 100 issues with their nested reads 4.7s, 25 1.7s; 50 PRs
+# 5.3s, 10 1.1s; 100 refs 2.2-4.1s (per-ref PR association and compare), 50
+# 1.7s. The item ceilings are those of the old 10 pages of 100.
+_FIX_PAGE_SIZE = {"issues": 25, "pullRequests": 10, "refs": 50}
+_FIX_MAX_ITEMS = 1000
+_FIX_MAX_PAGES = {name: -(-_FIX_MAX_ITEMS // size) for name, size in _FIX_PAGE_SIZE.items()}
 _FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500, "contexts": 1000}
 _HARNESS_BRANCH_PREFIX = "fix/"
 _COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt url}}}}"
@@ -270,12 +279,13 @@ _FIX_PR = (
 # base spelling), which failed every fix-role read (2026-10-13, all three
 # deployments). `query` (case-insensitive, matches anywhere) narrows
 # server-side; the parser keeps only names that start with the harness prefix.
-_FIX_REFS = ("refs(refPrefix:\"refs/heads/\",query:\"" + _HARNESS_BRANCH_PREFIX + "\",first:100{after})"
+_FIX_REFS = ("refs(refPrefix:\"refs/heads/\",query:\"" + _HARNESS_BRANCH_PREFIX + "\","
+             f"first:{_FIX_PAGE_SIZE['refs']}" "{after})"
              "{{pageInfo{{hasNextPage endCursor}} "
              "nodes{{name associatedPullRequests(last:1,orderBy:{{field:CREATED_AT,direction:ASC}})"
              "{{totalCount nodes{{state closedAt}}}} target{{... on Commit{{committedDate}}}} "
              "compare(headRef:$base){{behindBy}}}}}}")
-# The base tip's checks, in the first page (#313): a PR check red here too is
+# The base tip's checks, a request of their own (#313, #425): a PR check red here too is
 # the base's, not the PR's. GitHub's rollup lists a rerun job's latest attempt.
 _BASE_CONTEXTS = ("contexts(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{__typename "
                   "... on CheckRun{{id databaseId name status conclusion startedAt detailsUrl checkSuite{{app{{databaseId}}}}}} "
@@ -293,9 +303,11 @@ def _escaped(fields: str) -> str:
 
 
 _FIX_CONNECTIONS = {
-    "issues": ("issues(states:OPEN,labels:[\"ai-ready\",\"needs-human\"],first:100{after},"
+    "issues": ("issues(states:OPEN,labels:[\"ai-ready\",\"needs-human\"],"
+               f"first:{_FIX_PAGE_SIZE['issues']}" "{after},"
                "orderBy:{{field:CREATED_AT,direction:ASC}}){{pageInfo{{hasNextPage endCursor}} nodes{{" + _escaped(_FIX_ISSUE) + "}}}}"),
-    "pullRequests": ("pullRequests(states:OPEN,first:100{after},orderBy:{{field:CREATED_AT,direction:ASC}})"
+    "pullRequests": (f"pullRequests(states:OPEN,first:{_FIX_PAGE_SIZE['pullRequests']}"
+                     "{after},orderBy:{{field:CREATED_AT,direction:ASC}})"
                      "{{pageInfo{{hasNextPage endCursor}} nodes{{" + _escaped(_FIX_PR) + "}}}}"),
     "refs": _FIX_REFS,
 }
@@ -305,13 +317,17 @@ class FixObservationIncomplete(ValueError):
     """A required connection could not be read in full within its bound."""
 
 
-def _connection(parent: object, name: str) -> tuple[list, dict]:
+def _connection(parent: object, name: str, more: str = "") -> tuple[list, dict]:
+    """A connection's nodes and pageInfo. A paged read names its `more` flag:
+    without a boolean one, whether more pages follow is unknown, never "no"."""
     if not isinstance(parent, dict) or not isinstance(parent.get(name), dict):
         raise FixObservationIncomplete(f"{name} is absent")
     conn = parent[name]
     nodes, info = conn.get("nodes"), conn.get("pageInfo")
     if not isinstance(nodes, list) or (info is not None and not isinstance(info, dict)):
         raise FixObservationIncomplete(f"{name} is malformed")
+    if more and (info is None or type(info.get(more)) is not bool):
+        raise FixObservationIncomplete(f"{name} page info is malformed")
     return nodes, info or {}
 
 
@@ -675,11 +691,11 @@ class GitHubGateway:
 
     def _nested(self, node: dict, name: str, template: str, *, on: str, backward: bool) -> list | None:
         """A nested connection of an `on`-typed node read in full, or None past its bound."""
-        nodes, info = _connection(node, name)
+        more, cursor_key = ("hasPreviousPage", "startCursor") if backward else ("hasNextPage", "endCursor")
+        nodes, info = _connection(node, name, more)
         nodes = list(nodes)
         total = node[name].get("totalCount")
-        more, cursor_key = ("hasPreviousPage", "startCursor") if backward else ("hasNextPage", "endCursor")
-        while info.get(more):
+        while info[more]:
             cursor = info.get(cursor_key)
             if len(nodes) >= _FIX_NESTED_MAX[name] or not isinstance(cursor, str) or not cursor:
                 return None
@@ -688,7 +704,7 @@ class GitHubGateway:
                 f"query($id:ID!,$cursor:String!){{node(id:$id){{... on {on}{{{field}}}}}}}",
                 id=str(node.get("id") or ""), cursor=cursor,
             )
-            page, info = _connection(data.get("node"), name)
+            page, info = _connection(data.get("node"), name, more)
             nodes = [*page, *nodes] if backward else [*nodes, *page]
         if type(total) is int and total != len(nodes) or len(nodes) > _FIX_NESTED_MAX[name]:
             return None
@@ -703,22 +719,7 @@ class GitHubGateway:
         top-level reads propagate: the daemon skips the tick."""
         # The domain reads no clock: one stamp per build, so every gate in a tick judges one instant.
         now = datetime.now(timezone.utc).isoformat()
-        first = self._repository_page(
-            " ".join([*(t.format(after="") for t in _FIX_CONNECTIONS.values()), _BASE_TIP]), base=base)
-        collected: dict[str, list] = {}
-        for name, template in _FIX_CONNECTIONS.items():
-            nodes, info = _connection(first, name)
-            nodes, pages = list(nodes), 1
-            while info.get("hasNextPage"):
-                cursor = info.get("endCursor")
-                if pages >= _FIX_MAX_PAGES[name] or not isinstance(cursor, str) or not cursor:
-                    raise FixObservationIncomplete(f"{name} exceed {_FIX_MAX_PAGES[name]} pages")
-                page = self._repository_page(template.format(after=",after:$after"), after=cursor,
-                                             **({"base": base} if name == "refs" else {}))
-                more, info = _connection(page, name)
-                nodes.extend(more)
-                pages += 1
-            collected[name] = nodes
+        collected = {name: self._top_level(name, base) for name in _FIX_CONNECTIONS}
         issues: list[IssueView] = []
         merged: dict[int, PRView] = {}
         for node in collected["issues"]:
@@ -759,12 +760,36 @@ class GitHubGateway:
         for number, why in sorted(unknown.items()):
             self._skip_item("issue", number, FixObservationIncomplete(why))
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches, base=self._base_tip(first.get("baseTip"), base),
+                          branches=branches, base=self._base_tip(base),
                           base_ci=self._base_ci(base, filed_by) if filed_by else None)
 
-    def _base_tip(self, raw: object, base: str) -> BaseTip | None:
-        """The base tip and its checks, or None when unreadable: a red PR check
-        is then the PR's, as before #313 (never a silent wait)."""
+    def _top_level(self, name: str, base: str) -> list:
+        """One top-level connection, its own request per page (#425), read in
+        full within its page bound; otherwise the read raises and the tick is
+        skipped. At most `_FIX_MAX_PAGES[name]` requests."""
+        template = _FIX_CONNECTIONS[name]
+        fixed = {"base": base} if name == "refs" else {}
+        nodes: list = []
+        cursor: str | None = None
+        for _ in range(_FIX_MAX_PAGES[name]):
+            page = (self._repository_page(template.format(after=""), **fixed) if cursor is None
+                    else self._repository_page(template.format(after=",after:$after"), after=cursor, **fixed))
+            more, info = _connection(page, name, "hasNextPage")
+            nodes.extend(more)
+            if not info["hasNextPage"]:
+                return nodes
+            cursor = info.get("endCursor")
+            if not isinstance(cursor, str) or not cursor:
+                raise FixObservationIncomplete(f"{name} page has no cursor")
+        raise FixObservationIncomplete(f"{name} exceed {_FIX_MAX_PAGES[name]} pages")
+
+    def _base_tip(self, base: str) -> BaseTip | None:
+        """The base tip and its checks, read on their own, or None when
+        unreadable: a red PR check is then the PR's, as before #313 (never a
+        silent wait). A failed request skips the tick, as it did when the tip
+        rode the combined read: a timeout answered as GraphQL errors must not
+        charge the base's red to every PR."""
+        raw = self._repository_page(_BASE_TIP, base=base).get("baseTip")
         try:
             if not isinstance(raw, dict) or raw.get("name") != base or not isinstance(raw.get("target"), dict):
                 raise FixObservationIncomplete("base ref is absent or not the configured base")

@@ -82,7 +82,8 @@ def test_the_read_composes_the_bases_completed_push_runs_and_the_fixers_issues()
 
 def test_without_a_filer_base_ci_is_not_read_at_all():
     github = GitHub(runs={"total_count": 1, "workflow_runs": [run_row()]})
-    assert GitHubGateway("o/r", runner=github).build_world("dev").base_ci is None and len(github.calls) == 1
+    assert GitHubGateway("o/r", runner=github).build_world("dev").base_ci is None
+    assert not github.rest("/actions/runs?") and not github.rest("search(")
 
 
 def test_rows_of_another_branch_event_or_status_are_not_the_bases():
