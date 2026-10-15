@@ -171,15 +171,20 @@ def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...
 def _make_leg_tmp(root: str, plan: MountPlan) -> None:
     """The leg's /tmp and /var/tmp directories under `root`, which must not
     exist yet: nothing planted there (a link, an earlier leg's files) reaches
-    this leg. Mode 0700: no other local user reads a leg's scratch."""
+    this leg, and a refusal removes only what this call made. Mode 0700: no
+    other local user reads a leg's scratch."""
     try:
         os.makedirs(os.path.dirname(root), mode=0o700, exist_ok=True)
         os.mkdir(root, 0o700)
+    except OSError as exc:
+        raise SandboxRefused(f"the leg's temp directory {root} cannot be created fresh ({exc.strerror})") from exc
+    try:
         for mount in plan.mounts:
             if mount.source:
                 os.mkdir(mount.source, 0o700)
     except OSError as exc:
-        raise SandboxRefused(f"the leg's temp directory {root} cannot be created fresh ({exc.strerror})") from exc
+        shutil.rmtree(root, ignore_errors=True)
+        raise SandboxRefused(f"the leg's temp directory {root} cannot be filled ({exc.strerror})") from exc
 
 
 def _own_commondir(path: str) -> None:
@@ -373,7 +378,7 @@ class LegSandbox:
         try:
             argv = (self._binary() or self._bwrap,
                     *bwrap_arguments(plan, protected_paths(self.home, self.protected)), "--", binary, *command[1:])
-        except SandboxRefused:
+        except BaseException:
             shutil.rmtree(leg_tmp, ignore_errors=True)
             raise
         credential = self._credential if plan.publishes else None

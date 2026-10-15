@@ -74,10 +74,17 @@ disk, `leg-tmp/<run>/{tmp,var-tmp}` in the deployment's process registry
 (ADR 0005), not tmpfs: a tmpfs is charged to the unit's memory, and one leg's
 Chrome traces OOM-killed the fix unit. The launch refuses a path that already
 exists or would expose a protected one. Crash points: a refused launch removes
-what it made; the run's `kill_tree`, at every leg end and every reap, removes
-it once no process of the run can run; boot recovery, under the deployment
-lock, removes whatever a crash left (`tests/adapters/test_leg_sandbox.py`,
-`tests/adapters/test_process_supervisor.py`).
+what it made; a launch that fails before its process group exists ends the run
+through `kill_tree`, as does every leg end and every reap, once no process of
+the run can run (directories a leg made read-only included); boot recovery,
+under the deployment lock, removes whatever a crash left
+(`tests/adapters/test_leg_sandbox.py`, `tests/adapters/test_process_supervisor.py`,
+the runner tests). The trade: a runaway leg's scratch is now bounded by the
+state filesystem's free space, not the unit's memory, and that filesystem holds
+the control store. The checkout and `CARGO_TARGET_DIR` already write the same
+disk unbounded, so the exposure is not new in kind. A sibling registry's
+leftover from a run that died before registering waits for that deployment's
+next boot.
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
 the act layer. Secrets reach the daemons as systemd encrypted

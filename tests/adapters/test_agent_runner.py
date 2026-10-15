@@ -778,6 +778,18 @@ def test_a_claude_leg_the_sandbox_refuses_never_starts(tmp_path, monkeypatch):
     assert started == []
 
 
+def test_a_claude_leg_whose_launch_fails_after_the_sandbox_leaves_no_leg_directory(tmp_path, monkeypatch):
+    _install_fake_sdk(monkeypatch, [_ResultMessage(structured_output={"status": "done"}, session_id="s1")])
+    sandbox = _Sandbox()
+    runner, _ = _supervised_cli_runner(tmp_path, monkeypatch, sandbox)
+    os.chmod(sandbox.launcher, 0o644)  # the supervisor's wrapper refuses an unexecutable command
+
+    with pytest.raises(ValueError):
+        asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
+
+    assert sandbox.launches and not os.path.exists(sandbox.launches[0]["tmp"])
+
+
 def test_a_sandbox_without_a_process_supervisor_is_a_wiring_error():
     with pytest.raises(ValueError):
         AgentRunner(leg_sandbox=_Sandbox())

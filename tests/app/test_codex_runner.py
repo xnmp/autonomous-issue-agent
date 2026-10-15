@@ -1248,6 +1248,29 @@ def test_a_sandboxed_codex_leg_runs_with_its_scratch_state_and_token_but_not_hom
     assert not any((tmp_path / "sup" / "leg-tmp").glob("*"))  # its disk-backed /tmp went with it
 
 
+def test_a_sandboxed_codex_leg_that_fails_to_spawn_leaves_no_leg_directory(tmp_path, monkeypatch):
+    from issue_agent.adapters.leg_sandbox import LegSandbox
+
+    if reason := LegSandbox(home="/x", repository="/x", writable=False).preflight():
+        pytest.skip(f"no usable bubblewrap: {reason}")
+    work = tmp_path / "work"
+    work.mkdir()
+
+    async def no_fork(*_args, **_kwargs):
+        raise BlockingIOError("fork: Resource temporarily unavailable")  # the unit's TasksMax
+
+    runner = CodexRunner(codex_bin=_fake_codex(work, _DONE), env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(work),
+                                                                   "HOME": str(tmp_path / "home")},
+                         process_supervisor=ProcessSupervisor(str(tmp_path / "sup")),
+                         leg_sandbox=_codex_sandbox(tmp_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", no_fork)
+
+    with pytest.raises(BlockingIOError):
+        asyncio.run(runner.run(RuntimePlan(prompt="x", schema=_STATUS_SCHEMA, cwd=str(work))))
+
+    assert not any((tmp_path / "sup" / "leg-tmp").glob("*"))
+
+
 def test_a_codex_leg_the_sandbox_refuses_never_spawns(tmp_path):
     marker = tmp_path / "spawned"
     runner = CodexRunner(codex_bin=_fake_codex(tmp_path, f'touch "{marker}"\n' + _DONE),

@@ -750,23 +750,28 @@ class CodexRunner(AgentRuntime):
             # differs): what malformed counters settle at.
             "max_budget_usd": task.max_budget_usd,
         }
-        write_spend_evidence(self.spend_evidence_dir, accounting_run_id, evidence)
-        if self.process_supervisor is not None:
-            spawn_argv = self.process_supervisor.supervised_command(supervision_run_id, spawn_argv)
-            proc_env.update(self.process_supervisor.launch_guard_env())
-        # A new session puts codex and every descendant (the test servers it
-        # spawns) in one process group the watchdogs kill whole; a leaked
-        # child holding stdout wedged the daemon (Myapp #310).
-        proc = await asyncio.create_subprocess_exec(
-            *spawn_argv,
-            stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=proc_env,
-            cwd=task.cwd or None,
-            start_new_session=True,
-            limit=_STDERR_STREAM_LIMIT,
-        )
+        try:
+            write_spend_evidence(self.spend_evidence_dir, accounting_run_id, evidence)
+            if self.process_supervisor is not None:
+                spawn_argv = self.process_supervisor.supervised_command(supervision_run_id, spawn_argv)
+                proc_env.update(self.process_supervisor.launch_guard_env())
+            # A new session puts codex and every descendant (the test servers it
+            # spawns) in one process group the watchdogs kill whole; a leaked
+            # child holding stdout wedged the daemon (Myapp #310).
+            proc = await asyncio.create_subprocess_exec(
+                *spawn_argv,
+                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+                cwd=task.cwd or None,
+                start_new_session=True,
+                limit=_STDERR_STREAM_LIMIT,
+            )
+        except BaseException:
+            if self.process_supervisor is not None:  # ends the run's leg directory too
+                self.process_supervisor.kill_tree(supervision_run_id)
+            raise
         feeder: asyncio.Task | None = None
         if stdin_payload is not None:
             # Fed concurrently: codex may emit stderr before reading stdin.

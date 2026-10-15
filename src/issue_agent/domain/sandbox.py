@@ -195,11 +195,9 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     cwd = _normal(facts.cwd)
     writable = Access.READ_WRITE if facts.writable else Access.READ_ONLY
 
-    # First, so no other fact can claim /tmp.
     tmp = _normal(facts.tmp)
-    required: list[Mount] = [Mount(path, Access.READ_WRITE, source=posixpath.join(tmp, name))
-                             for path, name in LEG_TMP]
-    required.append(Mount(_normal(facts.runtime_binary), Access.READ_ONLY))
+    leg_tmp = [Mount(path, Access.READ_WRITE, source=posixpath.join(tmp, name)) for path, name in LEG_TMP]
+    required: list[Mount] = [Mount(_normal(facts.runtime_binary), Access.READ_ONLY)]
     required += [Mount(_normal(p), Access.READ_WRITE) for p in (*facts.runtime_state, *facts.build_cache,
                                                                  *facts.scratch)]
     required.append(Mount(cwd, writable))
@@ -218,7 +216,7 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
             dot = posixpath.join(cwd, ".git")
             required += [Mount(dot, Access.READ_WRITE),
                          *(Mount(posixpath.join(dot, name), Access.READ_ONLY) for name in ("config", "hooks", "commondir"))]
-    for mount in (Mount(tmp, Access.READ_WRITE), *required):
+    for mount in (Mount(tmp, Access.READ_WRITE), *leg_tmp, *required):
         if exposed := exposes(mount.host, protected):
             raise UnsafeMount(f"{mount.access.value} mount {mount.host} would expose {exposed}")
 
@@ -238,11 +236,12 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     # /dev makes it a plain directory, and tauri's tests rely on the mount.
     private = [Mount(home, Access.PRIVATE), Mount("/tmp/.X11-unix", Access.PRIVATE),
                Mount("/dev/shm", Access.PRIVATE)]
-    # One mount per path, the first named winning: required facts over
+    # One mount per path, the first named winning: the leg's temp dirs (so no
+    # other fact, not even HOME, claims /tmp), then required facts over
     # optional conventions. A stable depth sort puts parents first and, at one
     # depth, private directories before binds.
     chosen: dict[str, Mount] = {}
-    for mount in (*private, *required, *optional):
+    for mount in (*leg_tmp, *private, *required, *optional):
         chosen.setdefault(mount.path, mount)
     ordered = sorted(chosen.values(), key=lambda m: (0 if m.path == "/" else m.path.count("/"),
                                                      m.access is not Access.PRIVATE))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -126,16 +127,24 @@ def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
 
 
 def _leg_tmp(supervisor, run_id: str) -> Path:
-    """A leg's temp directory as its sandbox leaves it: written, with a link out."""
+    """A leg's temp directory as its sandbox leaves it: written, with a link
+    out, directories it made read-only or closed, and /tmp itself read-only."""
     path = Path(supervisor.leg_tmp(RunId(run_id)))
-    (path / "tmp").mkdir(parents=True)
+    (path / "tmp/archive/deep").mkdir(parents=True)
     (path / "tmp/trace.json").write_text("{}")
+    (path / "tmp/archive/deep/file").write_text("x")
+    (path / "tmp/closed").mkdir()
+    (path / "tmp/closed/file").write_text("x")
     (path / "tmp/link").symlink_to(path.parent.parent.parent / "keep")
+    for directory, mode in (("tmp/archive/deep", 0o500), ("tmp/archive", 0o500), ("tmp/closed", 0o000),
+                            ("tmp", 0o500)):
+        (path / directory).chmod(mode)
     return path
 
 
 def test_a_legs_temp_directory_goes_with_its_process_group(tmp_path) -> None:
-    (tmp_path / "keep").mkdir()
+    (tmp_path / "keep").mkdir(mode=0o755)
+    (tmp_path / "keep").chmod(0o755)
     (tmp_path / "keep/file").write_text("kept")
     supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
     (process,) = _sleepers(supervisor, "leg", 1)
@@ -146,6 +155,7 @@ def test_a_legs_temp_directory_goes_with_its_process_group(tmp_path) -> None:
     _wait_dead(process)
     assert not tmp.exists()
     assert (tmp_path / "keep/file").read_text() == "kept"  # never follows the leg's link
+    assert stat.S_IMODE((tmp_path / "keep").stat().st_mode) == 0o755  # nor chmods through it
 
 
 def test_a_legs_temp_directory_goes_when_its_process_never_registered(tmp_path) -> None:

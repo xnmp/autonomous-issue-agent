@@ -153,10 +153,13 @@ def test_a_legs_temp_dirs_are_its_own_directories_on_disk_never_a_tmpfs():
     assert access(plan, HOME) is Access.PRIVATE
 
 
-def test_no_other_fact_claims_the_legs_tmp():
-    plan = leg_mount_plan(facts(build_cache=("/tmp",), search_path=("/tmp", "/var/tmp")))
+@pytest.mark.parametrize("override", [{"build_cache": ("/tmp",), "search_path": ("/tmp", "/var/tmp")},
+                                      {"home": "/tmp"}, {"home": "/var/tmp"}])
+def test_no_other_fact_claims_the_legs_tmp(override):
+    plan = leg_mount_plan(facts(**override))
 
     assert shown(plan, "/tmp") == f"{LEG_TMP}/tmp" and shown(plan, "/var/tmp") == f"{LEG_TMP}/var-tmp"
+    assert access(plan, "/tmp") is Access.READ_WRITE and access(plan, "/var/tmp") is Access.READ_WRITE
 
 
 def test_a_path_entry_under_tmp_still_shows_the_hosts_directory():

@@ -193,14 +193,16 @@ def test_a_temp_directory_that_already_exists_is_never_handed_to_a_leg(host):
 
 
 @needs_bwrap
-@pytest.mark.parametrize("tmp", ["", "relative/leg-tmp", "/", "bad\0path", "/huge/" + "a" * 5000])
+@pytest.mark.parametrize("tmp", ["", "relative/leg-tmp", "/", "bad\0path", "huge"])
 def test_an_absent_or_malformed_temp_path_refuses_the_leg(host, tmp):
+    if tmp == "huge":  # a writable parent: refused for its length alone
+        tmp = str(host["tmp"] / ("a" * 5000))
     with pytest.raises(SandboxRefused):
         sandbox(host).launch(["/bin/true"], tmp=tmp, cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
 
 
 @needs_bwrap
-def test_a_temp_path_inside_home_or_the_harness_refuses_the_leg(host):
+def test_a_temp_path_that_is_or_holds_home_or_the_harness_refuses_the_leg(host):
     for tmp in (host["home"], host["harness"], host["tmp"]):
         with pytest.raises(SandboxRefused, match="would expose"):
             sandbox(host).launch(["/bin/true"], tmp=str(tmp), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})

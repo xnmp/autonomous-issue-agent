@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -266,7 +268,7 @@ class ProcessSupervisor:
         recovered = self._reap_registered(self.grace_seconds)
         # Boot, under the deployment's lock: no leg of this registry is left,
         # so every temp directory is a crash's leftover.
-        shutil.rmtree(self.tmp_directory, ignore_errors=True)
+        _remove_tree(self.tmp_directory)
         return recovered
 
     def recover_abandoned_orphans(self) -> tuple[RunId, ...]:
@@ -347,9 +349,8 @@ class ProcessSupervisor:
         return self.directory / f"{self._safe_name(run_id)}.json"
 
     def _remove_tmp(self, run_id: RunId) -> None:
-        # Never follows a link the leg planted; a file a dying sandbox process
-        # still writes may survive until the next boot's sweep.
-        shutil.rmtree(self.tmp_directory / self._safe_name(run_id), ignore_errors=True)
+        # A file a dying sandbox process still writes may survive until the next boot's sweep.
+        _remove_tree(self.tmp_directory / self._safe_name(run_id))
 
     def _intent_path(self, run_id: RunId) -> Path:
         safe = str(run_id)
@@ -640,3 +641,21 @@ class ProcessSupervisor:
             )
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         cls._terminate_identities(tuple(owned.values()), 0.0, reason, run_id)
+
+
+def _remove_tree(path: Path) -> None:
+    """Remove a leg's temp directory, never following a link the leg planted.
+    A leg can leave a directory it made read-only (a permission test, an
+    extracted archive) that rmtree alone cannot empty, so every directory is
+    made the owner's first. Called once the run's processes are gone: the
+    check before each chmod is not atomic against a live writer."""
+    if not path.is_dir() or path.is_symlink():
+        return
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700)
+        for _root, dirs, _files, fd in os.fwalk(path):
+            for name in dirs:
+                with contextlib.suppress(OSError):
+                    if stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                        os.chmod(name, 0o700, dir_fd=fd)
+    shutil.rmtree(path, ignore_errors=True)
