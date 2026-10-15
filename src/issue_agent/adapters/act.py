@@ -3,10 +3,11 @@ Actions against GitHub.
 
 There is no command queue. Every write is either naturally idempotent (a
 label set, a merge bound to its head, an update-branch bound to its head, a
-PR opened only when the branch has no open one) or carries an idempotency key
-claimed in SQLite before the write and confirmed after a read-back (design
-rule 2: SQLite owns idempotency keys). A write whose read-back fails raises;
-the daemon logs it and the next tick re-derives from GitHub.
+PR opened only when the branch has no open one) or goes through
+`GitHubAct.keyed_write`: an idempotency key claimed in SQLite before the
+write and settled by GitHub's answer to it (design rule 2: SQLite owns
+idempotency keys; #440: the answer is the receipt). A write GitHub did not
+answer raises; the daemon logs it and the next tick reads the claim back.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from ..domain.policy import blocker_closed_comment, blocker_comment
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict
 from ..domain.triage import link_refusal
-from .github import FixObservationIncomplete, GhUnavailable
+from .github import Accepted, FixObservationIncomplete, Refused
 
 # A stored key's text is never changed: a rename orphans the keys already
 # claimed (the cutover carried them in this form), and a claimed key decides
@@ -57,15 +58,12 @@ def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bo
     """One review on exactly `head` under `bot`, the identity the review
     gateway acts as (checked at boot). GitHub's read-back is the idempotency:
     a standing bot verdict on `head` means it landed (a crash after the POST,
-    or a racing leg), so nothing is posted twice. False is GitHub's refusal (a
-    4xx), which no retry changes; no answer or no confirmation raises."""
+    or a racing leg), so nothing is posted twice. GitHub's answer is the
+    receipt: False is its refusal (a 4xx), which no retry changes; no answer
+    raises."""
     if gateway.reviewed_on(pr, head, bot):
         return True
-    if not gateway.submit_review(pr, verdict.event, verdict.body, head):
-        return False
-    if not gateway.reviewed_on(pr, head, bot):
-        raise RuntimeError(f"PR #{pr}: review of {head[:12]} not confirmed")
-    return True
+    return isinstance(gateway.submit_review(pr, verdict.event, verdict.body, head), Accepted)
 
 
 def relabel(
@@ -191,13 +189,14 @@ class GitHubAct:
         done = 0
         for run_id in stale:
             try:
-                self.gateway.cancel_run(run_id)
-                done += 1
-            except GhUnavailable as exc:  # throttled or down: the rest would only deepen it
+                answer = self.gateway.cancel_run(run_id)
+            except Exception as exc:  # noqa: BLE001 - throttled or down: the rest would only deepen it
                 failed.append(f"{run_id}: {exc}")
                 break
-            except Exception as exc:  # noqa: BLE001 - one run's 403/409 must not block the rest
-                failed.append(f"{run_id}: {exc}")
+            if isinstance(answer, Refused):  # one run's 403/409 must not block the rest
+                failed.append(f"{run_id}: refused (HTTP {answer.status}) {answer.message}")
+            else:
+                done += 1
         if stale:
             self.log(f"{label}: cancelled {done}/{len(stale)} workflow runs left on the merged branch"
                      + (f"; first failure {failed[0]}" if failed else ""))
@@ -210,7 +209,8 @@ class GitHubAct:
         for run_id, observed in action.runs:
             if self.gateway.run_attempt(run_id) > observed:
                 continue
-            self.gateway.rerun_failed_checks(run_id)
+            if isinstance(answer := self.gateway.rerun_failed_checks(run_id), Refused):
+                raise RuntimeError(f"run {run_id}: re-run refused (HTTP {answer.status}) {answer.message}")
             self.log(f"PR #{action.pr}: re-ran the failed jobs of run {run_id} on {action.head[:12]} "
                      "(the harness's one re-run of this head)")
 
@@ -221,32 +221,38 @@ class GitHubAct:
             remove=(action.remove.value,) if action.remove is not None else (),
         )
 
+    def keyed_write(self, key: str, present: Callable[[], bool], write: Callable[[], Accepted | Refused],
+                    what: str, state: str = "") -> Accepted | Refused | None:
+        """The one keyed write (ADR 0001), None when `present` finds it. A key
+        claimed (here, unless `state` is given) but never settled may have
+        landed unseen, and a settled one may have been deleted (#395), so
+        GitHub, read by `present`, decides; a new key writes unread. The answer
+        settles the key, a refusal with one line; no answer raises, the claim
+        standing for the next tick."""
+        state = state or self.control.claim_key(key)
+        if state != "new" and present():
+            self.control.confirm_key(key)
+            return None
+        answer = write()
+        self.control.confirm_key(key)
+        if isinstance(answer, Refused):
+            self.log(f"{what}: GitHub refused it (HTTP {answer.status}), not retried: {answer.message}")
+        elif state == "done":
+            self.log(f"{what} was deleted; written again")
+        return answer
+
     def post(self, action: PostComment) -> None:
         kind = "issue" if action.target is Target.ISSUE else "pr"
         # A stop comment on an unlabelled item reads as already released, so
         # it is posted only once its `needs-human` label is verified.
         if action.key.startswith("needs-human:") and not self.gateway.has_label(kind, action.number, Label.NEEDS_HUMAN.value):
             raise RuntimeError(f"{kind} #{action.number}: stop comment withheld until needs-human is applied")
-        key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
-        state = self.control.claim_key(key) if action.key else "new"
-        # GitHub, not the key, says whether the comment is there, under the
-        # current FIX_BOT: a copy under a previous login reads as human
-        # (Harness.wrote), so it is posted again rather than trusted (#424).
-        # A confirmed
-        # key is a read-back that once saw it, so a fresh read that does not is
-        # a deletion (derive asks again when its own, possibly stale,
-        # observation lacks the comment, and it may lack it while it is there); a claimed key may have landed unseen.
-        if state != "new":
-            if self.gateway.has_comment(kind, action.number, action.body, self.bot):
-                self.control.confirm_key(key)
-                return
-            if state == "done":
-                self.log(f"{kind} #{action.number}: comment {action.key} was deleted; posting it again")
-        self.gateway.comment(kind, action.number, action.body)
-        if action.key:
-            if not self.gateway.has_comment(kind, action.number, action.body, self.bot):
-                raise RuntimeError(f"{kind} #{action.number}: comment {action.key} not confirmed")
-            self.control.confirm_key(key)
+        # Present means under the current FIX_BOT: a copy under a previous
+        # login reads as human (Harness.wrote), so it is posted again (#424).
+        self.keyed_write(f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}",
+                         lambda: self.gateway.has_comment(kind, action.number, action.body, self.bot),
+                         lambda: self.gateway.comment(kind, action.number, action.body),
+                         f"{kind} #{action.number}: comment {action.key}")
 
     def report(self, action: ReportGap) -> None:
         """A harness gap in `action.repo` under the fix role's credential (ADR
@@ -254,11 +260,9 @@ class GitHubAct:
         (every daemon on the store) it raises: not taken, so no re-tick. Filed
         when this token has no open issue of the title there, else commented
         on the oldest; a closed or retitled one is a human's answer, so a
-        recurrence files afresh. GitHub refusing (an answer without the write,
-        or a write that does not read back) settles the key with one log
-        line; no answer raises for the next tick.
-        Crash points: a claim that never landed writes; a lost filing reply is
-        found by its exact body; a lost comment reply is read back."""
+        recurrence files afresh. A refusal settles the key with one log line;
+        no answer raises for the next tick, which finds a lost filing by its
+        exact body and a lost comment by its text."""
         key = f"{_REPORT_NAMESPACE}:{action.key}"
         state = self.control.claim_key_within(key, f"{_REPORT_NAMESPACE}:", GAP_REPORTS_PER_DAY)
         if state == "done":
@@ -266,51 +270,30 @@ class GitHubAct:
         if state == "full":
             raise RuntimeError(f"harness gap {action.title!r} not reported: {GAP_REPORTS_PER_DAY} gap reports "
                                "already today (the daily ceiling); it is retried tomorrow while it persists")
-        try:
-            self.log(f"harness gap {self._report(action, state)}: {action.title!r}")
-        except FixObservationIncomplete as exc:
-            self.log(f"harness gap {action.title!r} not reported to {action.repo}: GitHub refused it, not "
-                     f"retried: {str(exc)[:300]}")
-        self.control.confirm_key(key)
-
-    def _report(self, action: ReportGap, state: str) -> str:
-        """File or comment as `report` says; what it did."""
         gateway = self.gateway if action.repo == self.repository else self.gateway.for_repo(action.repo)
         found = sorted(n for n, status, title, _ in gateway.issue_index(1000, author="@me")
                        if status == "open" and title.strip() == action.title)
-        if not found:
-            number = gateway.create_issue(action.title, action.body)
-            if gateway.get_issue(number).title.strip() != action.title:
-                raise FixObservationIncomplete(f"{action.repo}#{number}: the filed issue did not read back")
-            return f"filed as {action.repo}#{number}"
-        if state == "claimed" and any(gateway.get_issue(n).body.strip() == action.body.strip() for n in found):
-            return "filing confirmed after a lost reply"
-        if not gateway.has_comment("issue", found[0], action.recurrence, self.bot):
-            gateway.comment("issue", found[0], action.recurrence)
-            if not gateway.has_comment("issue", found[0], action.recurrence, self.bot):
-                # `gh` answers a refusal (a locked issue) with nothing: only the read-back sees it.
-                raise FixObservationIncomplete(f"{action.repo}#{found[0]}: the recurrence comment did not read back")
-        return f"seen again, commented on {action.repo}#{found[0]}"
+        what = f"harness gap {action.title!r} in {action.repo}"
+        answer = self.keyed_write(
+            key, lambda: bool(found) and (any(gateway.get_issue(n).body.strip() == action.body.strip() for n in found)
+                                          or gateway.has_comment("issue", found[0], action.recurrence, self.bot)),
+            (lambda: gateway.comment("issue", found[0], action.recurrence)) if found
+            else (lambda: gateway.create_issue(action.title, action.body)), what, state)
+        if isinstance(answer, Accepted):
+            self.log(f"{what}: " + (f"seen again, commented on #{found[0]}" if found else f"filed as #{answer.id}"))
 
     def file_issue(self, action: FileIssue) -> None:
-        """Claimed before the write, confirmed once the issue reads back. As
-        `post`: the listing of this token's own issues (complete, and not the
-        search index), not the key, says whether the issue is there. Derive's
-        issue search can lag a filing, and an unconfirmed claim may have
-        landed; a confirmed key whose exact title the listing lacks was deleted
-        or retitled, and derive asks again (#395)."""
-        key = f"{_ISSUE_NAMESPACE}:{self.repository}:{action.key}"
-        if (state := self.control.claim_key(key)) != "new":
-            if action.title in {title for _, _, title, _ in self.gateway.issue_index(1000, author="@me")}:
-                self.control.confirm_key(key)
-                return
-            if state == "done":
-                self.log(f"issue for {action.title!r} was deleted or retitled; filing again")
-        number = self.gateway.create_issue(action.title, action.body)
-        if self.gateway.get_issue(number).title.strip() != action.title.strip():
-            raise RuntimeError(f"issue #{number}: filed issue {action.key} not confirmed")
-        self.control.confirm_key(key)
-        self.log(f"issue #{number}: filed {action.title!r}")
+        """Keyed. As `post`: the listing of this token's own issues (complete,
+        and not the search index), not the key, says whether the issue is
+        there. Derive's issue search can lag a filing, and an unconfirmed
+        claim may have landed; a confirmed key whose exact title the listing
+        lacks was deleted or retitled, and derive asks again (#395)."""
+        answer = self.keyed_write(
+            f"{_ISSUE_NAMESPACE}:{self.repository}:{action.key}",
+            lambda: action.title in {title for _, _, title, _ in self.gateway.issue_index(1000, author="@me")},
+            lambda: self.gateway.create_issue(action.title, action.body), f"issue {action.title!r}")
+        if isinstance(answer, Accepted):
+            self.log(f"issue #{answer.id}: filed {action.title!r}")
 
     def set_issue_state(self, action: SetIssueState) -> None:
         if self.gateway.is_issue_closed(action.number) != action.open:
@@ -326,53 +309,45 @@ class GitHubAct:
 
     def link_blocker(self, action: LinkBlockedBy) -> None:
         """A steward's "blocked by" claim, rechecked on fresh reads
-        (`triage.link_refusal`), linked and read back, then one comment saying
-        so or why not. Keyed: once done, nothing here runs again, so a link a
-        human deletes stays deleted (derive also stops at the comment)."""
+        (`triage.link_refusal`), linked, then one comment saying so or why
+        not, keyed. Once done, nothing here runs again, so a link a human
+        deletes stays deleted (derive also stops at the comment)."""
         key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
-        if self.control.claim_key(key) == "done":
+        if (state := self.control.claim_key(key)) == "done":
             # Derive asks again only when the harness's comment is gone (a
             # human deleted it). Say once more that the matter is closed, so
             # derive moves on; the link itself is never touched again.
             closed = blocker_closed_comment(self.marker, action.blocker)
-            if not self.gateway.has_comment("issue", action.issue, closed, self.bot):
-                self.log(f"issue #{action.issue}: closing comment for {action.key} not found; posting it")
-                self.gateway.comment("issue", action.issue, closed)
+            self.keyed_write(key, lambda: self.gateway.has_comment("issue", action.issue, closed, self.bot),
+                             lambda: self.gateway.comment("issue", action.issue, closed),
+                             f"issue #{action.issue}: blocked-by comment {action.key}", state)
             return
         try:
             refusal = self._link(action)
         except FixObservationIncomplete as exc:
-            # GitHub answered and would not read or write it (a deleted or
-            # transferred blocker, a refused mutation): retrying every tick
-            # changes nothing, so it is a refusal. GhUnavailable (no answer) raises.
+            # GitHub answered and would not read it (a deleted or transferred
+            # blocker): retrying every tick changes nothing, so it is a refusal.
             self.log(f"issue #{action.issue}: blocked-by #{action.blocker}: {str(exc)[:300]}")
             refusal = _GITHUB_REFUSED
         if refusal:
             self.log(f"issue #{action.issue}: steward's blocked-by #{action.blocker} refused: {refusal}")
         body = blocker_comment(self.marker, action.blocker, action.reason, refusal)
-        if not self.gateway.has_comment("issue", action.issue, body, self.bot):
-            self.gateway.comment("issue", action.issue, body)
-            if not self.gateway.has_comment("issue", action.issue, body, self.bot):
-                raise RuntimeError(f"issue #{action.issue}: blocked-by comment not confirmed")
-        self.control.confirm_key(key)
+        self.keyed_write(key, lambda: self.gateway.has_comment("issue", action.issue, body, self.bot),
+                         lambda: self.gateway.comment("issue", action.issue, body),
+                         f"issue #{action.issue}: blocked-by comment", state)
 
     def _link(self, action: LinkBlockedBy) -> str:
-        """Link it unless fresh reads refuse; the refusal, or "" once linked."""
+        """Link it unless fresh reads or GitHub refuse; the refusal, or "" once
+        linked. A claim left by no answer is read back here as `linked`."""
         facts = self.gateway.blocker_link(action.issue, action.blocker)
         if facts.linked:  # whatever changed since (a retry after a lost reply), the link is there
             return ""
         refusal = link_refusal(action.issue, action.blocker, facts.blocker_open, facts.blocker_blocked_by)
         if refusal:
             return refusal
-        try:
-            self.gateway.add_blocked_by(facts.issue_id, facts.blocker_id)
-        except FixObservationIncomplete:
-            # An error reply is not proof of no write (a commit before the
-            # error, an unclassified gh failure): only a read says it did not land.
-            if not self.gateway.blocker_link(action.issue, action.blocker).linked:
-                raise
-        if not self.gateway.blocker_link(action.issue, action.blocker).linked:
-            raise RuntimeError(f"issue #{action.issue}: blocked-by #{action.blocker} not confirmed")
+        if isinstance(answer := self.gateway.add_blocked_by(facts.issue_id, facts.blocker_id), Refused):
+            self.log(f"issue #{action.issue}: blocked-by #{action.blocker}: {answer.message}")
+            return _GITHUB_REFUSED
         self.log(f"issue #{action.issue}: linked blocked by #{action.blocker}")
         return ""
 
@@ -386,9 +361,9 @@ class GitHubAct:
         # steward's criteria, not this body.
         written = self.latest_resolve_summary(action.issue)
         body = written if written.strip() else f"Closes #{action.issue}"
-        self.gateway.open_pull_request(action.branch, self.base_branch, issue.title or action.branch, body)
-        if self.gateway.pull_request_for_branch(action.branch) is None:
-            raise RuntimeError(f"issue #{action.issue}: PR for {action.branch} not confirmed")
+        answer = self.gateway.open_pull_request(action.branch, self.base_branch, issue.title or action.branch, body)
+        if isinstance(answer, Refused):
+            raise RuntimeError(f"issue #{action.issue}: PR for {action.branch} refused (HTTP {answer.status}) {answer.message}")
         self.log(f"issue #{action.issue}: opened PR for {action.branch}")
 
     def latest_resolve_summary(self, issue: int) -> str:

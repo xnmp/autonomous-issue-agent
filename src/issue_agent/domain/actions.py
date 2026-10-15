@@ -57,8 +57,7 @@ class PostComment:
     target: Target
     number: int
     body: str
-    # Idempotency key: act posts at most one comment per key. Empty = no dedupe.
-    key: str = ""
+    key: str  # act posts at most one comment per key (#440: every comment is keyed)
 
 
 @dataclass(frozen=True)

@@ -12,18 +12,20 @@ from types import SimpleNamespace
 import pytest
 
 from issue_agent.adapters.github import (
+    Accepted,
     GhUnavailable,
+    Refused,
     GitHubGateway,
     Identity,
     _subprocess_runner,
     build_close_issue_args,
-    build_comment_args,
     build_enable_auto_merge_args,
     build_relabel_args,
     build_submit_review_args,
     classify_gh_failure,
     format_pr_discussion,
     parse_pr,
+    parse_write_answer,
 )
 from issue_agent.domain.checks import Unavailable
 from issue_agent.domain.labels import Label
@@ -129,7 +131,6 @@ class FakeRunner:
 
 def test_write_command_builders_are_pure_contracts():
     assert build_submit_review_args("o/r", 100, "APPROVE", "lgtm", "head") == [
-        "api",
         "repos/o/r/pulls/100/reviews",
         "--method",
         "POST",
@@ -155,7 +156,6 @@ def test_write_command_builders_are_pure_contracts():
         ["api", "--method", "DELETE", "repos/o/r/issues/7/labels/needs%20human%20review%3F"]
     ]
     assert build_relabel_args("o/r", "issue", 5, None, None) is None
-    assert build_comment_args("o/r", "pr", 100, "hi") == ["pr", "comment", "100", "--repo", "o/r", "--body", "hi"]
     assert build_close_issue_args("o/r", 5, "completed", "done") == [
         "issue",
         "close",
@@ -216,24 +216,39 @@ def test_enable_auto_merge_verifies_exact_head_was_merged(probe, merged):
     assert GitHubGateway("o/r", runner=runner).enable_auto_merge(100, "squash", "head") is merged
 
 
-def test_update_branch_argv():
-    class UpdateRunner(FakeRunner):
-        head = "head"
+def _http(status: int, body: object = None, **headers: str) -> str:
+    """What `gh api --include` prints: status line, headers, blank line, body."""
+    lines = [f"HTTP/2.0 {status} X", "Content-Type: application/json", *(f"{k}: {v}" for k, v in headers.items())]
+    return "\r\n".join(lines) + "\r\n\r\n" + ("" if body is None else json.dumps(body))
 
+
+@pytest.mark.parametrize("answer,merged", [(_http(202, {"message": "Updating pull request branch."}), True),
+                                           (_http(422, {"message": "expected head sha didn't match"}), False)])
+def test_update_branch_is_true_on_githubs_acceptance_without_reading_the_head_back(answer, merged):
+    class UpdateRunner(FakeRunner):
         def __call__(self, argv, token):
             self.calls.append((argv, token))
             if argv[1:4] == ["pr", "view", "100"]:
-                return json.dumps({"autoMergeRequest": None, "headRefOid": self.head, "mergeStateStatus": "CLEAN"})
-            if argv[1:3] == ["api", "repos/o/r/pulls/100/update-branch"]:
-                self.head = "updated-head"
-                return "ok"
-            return ""
+                return json.dumps({"autoMergeRequest": None, "headRefOid": "head"})  # the merge has not run yet
+            if argv[3:4] == ["repos/o/r/pulls/100/update-branch"]:
+                return answer
+            raise AssertionError(argv)
 
     fr = UpdateRunner()
-    assert GitHubGateway("o/r", runner=fr).update_branch(100, "head") is True
-    argv, _ = fr.calls[1]
-    assert argv[1:3] == ["api", "repos/o/r/pulls/100/update-branch"]
+    assert GitHubGateway("o/r", runner=fr).update_branch(100, "head") is merged
+    (argv, _), = (c for c in fr.calls if c[0][1] == "api")
+    assert argv[1:5] == ["api", "--include", "repos/o/r/pulls/100/update-branch", "--method"]
     assert "expected_head_sha=head" in argv
+
+
+def test_update_branch_no_longer_swallows_github_not_answering():
+    def runner(argv, token):
+        if argv[1:3] == ["pr", "view"]:
+            return json.dumps({"autoMergeRequest": None, "headRefOid": "head"})
+        raise GhUnavailable("network", "gh timed out")
+
+    with pytest.raises(GhUnavailable):
+        GitHubGateway("o/r", runner=runner).update_branch(100, "head")
 
 
 def test_update_branch_refuses_to_advance_when_legacy_arm_cannot_be_revoked():
@@ -252,9 +267,12 @@ def test_viewer_login_names_the_identity_the_credential_acts_as():
     assert GitHubGateway("o/r", runner=FakeRunner()).viewer_login() == ""  # GitHub refused to answer
 
 
-def test_submit_review_returns_false_on_failure():
-    # a failed POST (422/403) → runner returns "" (and logs stderr) → False.
-    assert GitHubGateway("o/r", runner=FakeRunner()).submit_review(100, "APPROVE", "lgtm", "head") is False
+def test_a_refused_review_is_githubs_refusal_and_an_unanswered_one_raises():
+    refused = FakeRunner({"api --include repos/o/r/pulls/100/reviews": _http(422, {"message": "Can not approve your own pull request"})})
+    assert GitHubGateway("o/r", runner=refused).submit_review(100, "APPROVE", "lgtm", "head") == Refused(
+        422, "Can not approve your own pull request")
+    with pytest.raises(GhUnavailable):  # gh printed no HTTP answer
+        GitHubGateway("o/r", runner=FakeRunner()).submit_review(100, "APPROVE", "lgtm", "head")
 
 
 def test_get_issue_parses_response():
@@ -483,15 +501,86 @@ def test_an_unreadable_run_raises(answer):
         GitHubGateway("o/r", runner=FakeRunner({"api repos/o/r/actions/runs/900": answer})).run_attempt(900)
 
 
-def test_a_rerun_posts_the_failed_jobs_rerun():
-    fr = FakeRunner({"api --method POST": "{}"})
-    GitHubGateway("o/r", runner=fr).rerun_failed_checks(900)
-    assert fr.calls[0][0][1:] == ["api", "--method", "POST", "repos/o/r/actions/runs/900/rerun-failed-jobs"]
+def test_a_rerun_posts_the_failed_jobs_rerun_and_returns_githubs_answer():
+    fr = FakeRunner({"api --include --method": _http(201, {})})
+    assert GitHubGateway("o/r", runner=fr).rerun_failed_checks(900) == Accepted()
+    assert fr.calls[0][0][1:] == ["api", "--include", "--method", "POST", "repos/o/r/actions/runs/900/rerun-failed-jobs"]
+    refused = FakeRunner({"api --include --method": _http(403, {"message": "Must have admin rights"})})
+    assert GitHubGateway("o/r", runner=refused).rerun_failed_checks(900) == Refused(403, "Must have admin rights")
 
 
-def test_a_refused_rerun_post_raises():
-    with pytest.raises(RuntimeError, match="refused"):
-        GitHubGateway("o/r", runner=FakeRunner({"api --method POST": ""})).rerun_failed_checks(900)
+# ── #440: a write's answer, read from GitHub's status and headers ─────────────
+@pytest.mark.parametrize("out,answer", [
+    (_http(201, {"id": 77, "user": {"login": "fixer"}}), Accepted(77)),
+    (_http(202, {}), Accepted()),  # a cancel: nothing created
+    (_http(204), Accepted()),  # no body at all
+    (_http(201, {"id": "77"}), Accepted()),  # a malformed id is no receipt id, still accepted
+    (_http(201, {"id": True}), Accepted()),
+    (_http(201, {"id": -3}), Accepted()),
+    (_http(201, ["not", "an", "object"]), Accepted()),
+    (_http(201, None) + "not json{", Accepted()),
+    (_http(404, {"message": "Not Found"}), Refused(404, "Not Found")),
+    (_http(410, {"message": "Issues are disabled for this repo"}), Refused(410, "Issues are disabled for this repo")),
+    # GitHub lists Retry-After among the headers it exposes on every answer: not a rate limit.
+    (_http(403, {"message": "Resource not accessible by integration"},
+           **{"Access-Control-Expose-Headers": "ETag, Link, Location, Retry-After, X-GitHub-OTP"}),
+     Refused(403, "Resource not accessible by integration")),
+    (_http(403, {"message": "Unable to create comment because issue is locked."}),
+     Refused(403, "Unable to create comment because issue is locked.")),
+    (_http(422, {"message": "Validation Failed", "errors": [{"code": "custom"}]}), Refused(422, "Validation Failed")),
+    (_http(422), Refused(422, "HTTP 422")),  # a refusal without a body
+    # GraphQL answers its refusals with a 200 that carries errors.
+    (_http(200, {"data": {"addBlockedBy": None}, "errors": [{"type": "NOT_FOUND", "message": "Could not resolve"}]}),
+     Refused(200, "Could not resolve")),
+    (_http(200, {"errors": ["a bare string error"]}), Refused(200, "HTTP 200")),
+    (_http(422, {"message": "x" * 100_000}), Refused(422, "x" * 299 + "…")),  # a huge reason is bounded
+])
+def test_a_write_answer_is_read_from_the_status_line_and_the_receipt_id(out, answer):
+    assert parse_write_answer(out, "id") == answer
+
+
+@pytest.mark.parametrize("out,kind,retry_after", [
+    ("", "network", None),  # no answer at all: a transport failure
+    ("gh: error connecting to api.github.com", "network", None),
+    (_http(502, {"message": "Bad Gateway"}), "server", None),  # it may have landed
+    (_http(500), "server", None),
+    (_http(401, {"message": "Bad credentials"}), "auth", None),
+    (_http(429, {"message": "Too Many Requests"}, **{"Retry-After": "30"}), "rate-limit", 30.0),
+    (_http(403, {"message": "You have exceeded a secondary rate limit."}), "rate-limit", None),
+    (_http(403, {"message": "Forbidden"}, **{"Retry-After": "60"}), "rate-limit", 60.0),
+    (_http(403, {"message": "API rate limit exceeded"}, **{"X-RateLimit-Remaining": "0"}), "rate-limit", None),
+    (_http(200, {"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded for user"}]}), "rate-limit",
+     None),
+])
+def test_a_write_github_did_not_answer_raises_with_its_kind(out, kind, retry_after):
+    with pytest.raises(GhUnavailable) as ei:
+        parse_write_answer(out, "id")
+    assert (ei.value.kind, ei.value.retry_after_s) == (kind, retry_after)
+
+
+def test_the_runner_hands_back_an_answered_writes_output_whatever_the_exit(monkeypatch):
+    refused = _http(422, {"message": "Validation Failed"})
+    monkeypatch.setattr(_subprocess, "run", lambda argv, capture_output, text, env, timeout: SimpleNamespace(
+        returncode=1, stdout=refused, stderr="gh: Validation Failed (HTTP 422)"))
+    assert _subprocess_runner(["gh", "api", "--include", "repos/o/r/issues"], None) == refused
+    assert _subprocess_runner(["gh", "api", "repos/o/r/issues"], None) == ""  # a read keeps its fail-soft ""
+
+
+@pytest.mark.parametrize("call,argv_tail,receipt", [
+    (lambda g: g.comment("pr", 5, "hello"), ["--method", "POST", "repos/o/r/issues/5/comments", "-f", "body=hello"], 9),
+    (lambda g: g.create_issue("T", "B"), ["--method", "POST", "repos/o/r/issues", "-f", "title=T", "-f", "body=B"], 9),
+    (lambda g: g.submit_review(5, "APPROVE", "ok", "h"),
+     ["repos/o/r/pulls/5/reviews", "--method", "POST", "-f", "event=APPROVE", "-f", "body=ok", "-f", "commit_id=h"], 9),
+])
+def test_creating_writes_return_the_created_objects_id_from_the_answer(call, argv_tail, receipt):
+    calls = []
+
+    def runner(argv, token):
+        calls.append(argv)
+        return _http(201, {"id": 9, "number": 9})
+
+    assert call(GitHubGateway("o/r", runner=runner)) == Accepted(receipt)
+    assert calls == [["gh", "api", "--include", *argv_tail]]
 
 
 @pytest.mark.parametrize("answer,expected", [

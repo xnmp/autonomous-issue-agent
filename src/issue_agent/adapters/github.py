@@ -55,7 +55,8 @@ class GhUnavailable(RuntimeError):
     exhaustion), as opposed to answering "nothing" (V10). Mapping every
     failure to "" once made a rate-limited poll observe an empty world and act
     on it; raising makes the daemon skip the tick, and the next poll retries.
-    `kind` is one of `_HEADLINES`."""
+    To a write it is NoAnswer: the write may have landed. `kind` is one of
+    `_HEADLINES`."""
 
     _HEADLINES = {
         "auth": "unavailable (authentication)",
@@ -77,6 +78,57 @@ class GhUnavailable(RuntimeError):
     @property
     def headline(self) -> str:
         return self._HEADLINES.get(self.kind, self.kind)
+
+
+@dataclass(frozen=True)
+class Accepted:
+    """GitHub's 2xx answer to a write, the receipt (#433, #440): `id` is the
+    created comment's, issue's number or review's, when the answer has one."""
+
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class Refused:
+    """GitHub answered (a 4xx, or GraphQL errors) and did not write: no retry changes it."""
+
+    status: int
+    message: str
+
+
+_HTTP_STATUS = re.compile(r"HTTP/\S+ (\d{3})\b")
+
+
+def parse_write_answer(out: str, receipt: str = "", argv: list[str] | None = None) -> Accepted | Refused:
+    """`gh api --include` output as GitHub's answer, read from its status
+    line and body, never gh's error text. No answer raises GhUnavailable: no
+    status line or a 5xx (the write may have landed); a 401 or a rate limit
+    (429, a 403 with `retry-after`, or an error saying "rate limit", as GitHub
+    documents), after which it did not land but the next tick may."""
+    head, _, body = out.replace("\r\n", "\n").partition("\n\n")
+    if (line := _HTTP_STATUS.match(head)) is None:
+        raise GhUnavailable("network", "the write got no HTTP answer", argv)
+    status = int(line[1])
+    try:
+        data = json.loads(body) if body.strip() else {}
+    except ValueError:
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+    first = errors[0] if errors and isinstance(errors[0], dict) else {}
+    message = _one_line(str(data.get("message") or first.get("message") or f"HTTP {status}"), 300)
+    if status == 401:
+        raise GhUnavailable("auth", message, argv)
+    retry_after = _retry_after(head)
+    if (status >= 400 or errors) and (status == 429 or "rate limit" in message.lower()
+                                      or status == 403 and retry_after is not None):
+        raise GhUnavailable("rate-limit", message, argv, retry_after_s=retry_after)
+    if not 200 <= status < 500:
+        raise GhUnavailable("server", message, argv)
+    if status >= 300 or errors:
+        return Refused(status, message)
+    raw = data.get(receipt)
+    return Accepted(raw if type(raw) is int and raw > 0 else None)
 
 
 def _one_line(text: str, limit: int = 200) -> str:
@@ -570,7 +622,7 @@ def _owed(node: dict) -> bool:
 
 # ── write command builders ──────────────────────────────────────────────────
 def build_submit_review_args(repo: str, pr: int, event: str, body: str, head: str) -> list[str]:
-    return ["api", f"repos/{repo}/pulls/{pr}/reviews", "--method", "POST",
+    return [f"repos/{repo}/pulls/{pr}/reviews", "--method", "POST",
             "-f", f"event={event}", "-f", f"body={body}", "-f", f"commit_id={head}"]
 
 
@@ -593,10 +645,6 @@ def build_relabel_args(
     if remove:
         commands.append(["api", "--method", "DELETE", f"repos/{repo}/issues/{number}/labels/{quote(remove, safe='')}"])
     return commands
-
-
-def build_comment_args(repo: str, kind: str, number: int, body: str) -> list[str]:
-    return [kind, "comment", str(number), "--repo", repo, "--body", body]
 
 
 def build_close_issue_args(repo: str, number: int, reason: str, comment: str) -> list[str]:
@@ -658,6 +706,11 @@ class GitHubGateway:
         finally:
             if self._progress is not None:
                 self._progress()
+
+    def _write(self, args: list[str], receipt: str = "") -> Accepted | Refused:
+        """One `gh api` write (`args` after `api`); GitHub's answer."""
+        argv = ["api", "--include", *args]
+        return parse_write_answer(self._gh(argv), receipt, argv)
 
     def _gh_json(self, args: list[str]) -> object:
         out = self._gh(args)
@@ -846,13 +899,10 @@ class GitHubGateway:
             required = None
         return BaseCI(runs, issues, required)
 
-    def create_issue(self, title: str, body: str) -> int:
-        """Open an unlabelled issue; its number, from the link gh prints."""
-        found = re.search(r"/issues/([0-9]+)$", self._gh(["issue", "create", "--repo", self.repo, "--title", title,
-                                                          "--body", body]).strip())
-        if found is None:
-            raise FixObservationIncomplete("issue creation answered no issue link")
-        return int(found[1])
+    def create_issue(self, title: str, body: str) -> Accepted | Refused:
+        """Open an unlabelled issue; the receipt carries its number."""
+        return self._write(["--method", "POST", f"repos/{self.repo}/issues", "-f", f"title={title}",
+                            "-f", f"body={body}"], "number")
 
     def reopen_issue(self, number: int, comment: str) -> None:
         self._gh(["issue", "reopen", str(number), "--repo", self.repo, "--comment", comment])
@@ -881,10 +931,11 @@ class GitHubGateway:
         page = self._repository_page(f"subject:issue(number:{issue}){{{fields}}} blocker:issue(number:{blocker}){{{fields}}}")
         return parse_blocker_link(page, self.repo, blocker)
 
-    def add_blocked_by(self, issue_id: str, blocker_id: str) -> None:
-        """GitHub's addBlockedBy; the caller reads the link back."""
-        self._graphql("mutation($issue:ID!,$blocker:ID!){addBlockedBy(input:{issueId:$issue,blockingIssueId:$blocker})"
-                      "{issue{number}}}", issue=issue_id, blocker=blocker_id)
+    def add_blocked_by(self, issue_id: str, blocker_id: str) -> Accepted | Refused:
+        """GitHub's addBlockedBy."""
+        return self._write(["graphql", "-f", "query=mutation($issue:ID!,$blocker:ID!){addBlockedBy(input:"
+                            "{issueId:$issue,blockingIssueId:$blocker}){issue{number}}}",
+                            "-f", f"issue={issue_id}", "-f", f"blocker={blocker_id}"])
 
     def pull_request_for_branch(self, branch: str) -> int | None:
         """The open PR whose head is `branch` in this repository. A closed one
@@ -898,20 +949,19 @@ class GitHubGateway:
                    and type(row.get("number")) is int]
         return min(numbers) if numbers else None
 
-    def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
-        self._gh(["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
-                  "--title", title, "--body", body])
+    def open_pull_request(self, branch: str, base: str, title: str, body: str) -> Accepted | Refused:
+        return self._write(["--method", "POST", f"repos/{self.repo}/pulls", "-f", f"head={branch}", "-f", f"base={base}",
+                            "-f", f"title={title}", "-f", f"body={body}"], "number")
 
     def viewer_login(self) -> str:
         """This credential's login, or "". GraphQL `viewer`, not REST `/user`:
         an App installation token answers it (as `slug[bot]`)."""
         return self._gh(["api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"]).strip()
 
-    def submit_review(self, pr: int, event: str, body: str, head: str) -> bool:
-        """True iff GitHub created the review. False is a 4xx refusal (422
-        self-approval, 403 without write) that retrying cannot change; an
-        outage raises `GhUnavailable`."""
-        return bool(self._gh(build_submit_review_args(self.repo, pr, event, body, head)).strip())
+    def submit_review(self, pr: int, event: str, body: str, head: str) -> Accepted | Refused:
+        """Refused is a 4xx (422 self-approval, 403 without write) that
+        retrying cannot change; the receipt carries the review id."""
+        return self._write(build_submit_review_args(self.repo, pr, event, body, head), "id")
 
     # ── writes ──
     def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> None:
@@ -951,8 +1001,10 @@ class GitHubGateway:
             and str(item.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED")
             for page in data for item in page)
 
-    def comment(self, kind: str, number: int, body: str) -> None:
-        self._gh(build_comment_args(self.repo, kind, number, body))
+    def comment(self, kind: str, number: int, body: str) -> Accepted | Refused:
+        """On an issue or PR (one REST endpoint); the receipt carries its id."""
+        return self._write(["--method", "POST", f"repos/{self.repo}/issues/{number}/comments", "-f", f"body={body}"],
+                           "id")
 
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self._gh(build_close_issue_args(self.repo, number, reason, comment))
@@ -1010,13 +1062,10 @@ class GitHubGateway:
             out.append((row["id"], row["status"], row["created_at"]))
         return tuple(out)
 
-    def cancel_run(self, run_id: int) -> None:
-        """Request the cancel; raises when GitHub refused it. GitHub answers
-        202 with a `{}` body, which `gh api` prints; the runner turns a refusal
-        (403 without actions:write, 409 on a finished run) into an empty
-        answer, so only a truly empty answer is a refusal."""
-        if not self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/cancel"]).strip():
-            raise RuntimeError(f"run {run_id}: cancel refused")
+    def cancel_run(self, run_id: int) -> Accepted | Refused:
+        """Request the cancel: 202, or refused (403 without actions:write,
+        409 on a finished run)."""
+        return self._write(["--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/cancel"])
 
     def run_attempt(self, run_id: int) -> int:
         """A workflow run's current attempt: the read-back of a re-run. Raises
@@ -1027,40 +1076,30 @@ class GitHubGateway:
             raise ValueError(f"run {run_id} is unreadable")
         return attempt
 
-    def rerun_failed_checks(self, run_id: int) -> None:
-        """Request a completed run's failed-jobs re-run (a new run attempt);
-        raises when GitHub refused it. A 2xx answer prints `{}`; the runner
-        turns a refusal (403, a run still going) into an empty answer. The
-        run read lags the POST, so the answer is the receipt, not a read-back."""
-        if not self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"]).strip():
-            raise RuntimeError(f"run {run_id}: re-run refused")
+    def rerun_failed_checks(self, run_id: int) -> Accepted | Refused:
+        """Request a completed run's failed-jobs re-run (a new run attempt),
+        or refused (403, a run still going). The run read lags the POST, so
+        the answer is the receipt, not a read-back (#433)."""
+        return self._write(["--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"])
 
     def update_branch(self, pr: int, expected_head: str) -> bool:
-        """Merge base into a BEHIND head. Fail-soft: an 'already up to date' or
-        conflict race is re-evaluated next tick."""
-        try:
-            if not self._without_auto_merge(pr, expected_head):
-                return False
-            if not self._gh(["api", f"repos/{self.repo}/pulls/{pr}/update-branch", "--method", "PUT",
-                             "-f", f"expected_head_sha={expected_head}"]).strip():
-                return False
-            data = self._view("pr", pr, "headRefOid,mergeStateStatus")
-            if not isinstance(data, dict):
-                return False
-            current = str(data.get("headRefOid") or "")
-            return (bool(current) and current != expected_head
-                    and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
-                    and self._without_auto_merge(pr, current))
-        except Exception:  # noqa: BLE001
+        """Merge base into a BEHIND head. True iff GitHub accepted it (the
+        merge runs after the 202, so a head read would lag it, #433); False if
+        refused (422: not behind, the head moved) or a legacy auto-merge arm
+        could not be revoked first. No answer raises."""
+        if not self._without_auto_merge(pr, expected_head):
             return False
+        return isinstance(self._write([f"repos/{self.repo}/pulls/{pr}/update-branch", "--method", "PUT",
+                                       "-f", f"expected_head_sha={expected_head}"]), Accepted)
 
 
 def _subprocess_runner(argv: list[str], token: str | None) -> str:
     """Run gh (with GH_TOKEN when given) under `_GH_TIMEOUT_S`. A non-zero exit
-    returns "" (callers such as `submit_review` read the empty answer) and is
-    written to stderr, since a silently swallowed 422 once made the reviewer
-    look idle. Infra failures (`classify_gh_failure`) raise `GhUnavailable`
-    instead (V10)."""
+    is written to stderr, since a silently swallowed 422 once made the
+    reviewer look idle. An `--include` write that GitHub answered returns its
+    output whatever the exit, for `parse_write_answer` to read the status.
+    Otherwise infra failures (`classify_gh_failure`) raise `GhUnavailable`
+    (V10) and any other non-zero exit returns ""."""
     env = dict(os.environ)
     if token:
         env["GH_TOKEN"] = token
@@ -1099,6 +1138,8 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
     truncated = "\n  [gh stderr truncated]" if logged != detail else ""
     # Written on the raise path too: some callers swallow GhUnavailable.
     sys.stderr.write(f"gh failed (exit {res.returncode}): {_printable_gh_argv(argv)}\n  {logged}{truncated}\n")
+    if "--include" in argv and _HTTP_STATUS.match(res.stdout):
+        return res.stdout
     kind = classify_gh_failure(detail)
     if kind is not None:
         raise GhUnavailable(kind, detail, argv=argv, retry_after_s=_retry_after(detail))

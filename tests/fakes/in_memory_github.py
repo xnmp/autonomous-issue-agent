@@ -1,3 +1,6 @@
+from issue_agent.adapters.github import Accepted
+
+
 class InMemoryGitHub:
     """Write-recording gateway for loop and composition tests."""
 
@@ -14,5 +17,6 @@ class InMemoryGitHub:
     def has_label(self, kind: str, number: int, label: str) -> bool:
         return label in self.labels.get((kind, number), set())
 
-    def comment(self, kind: str, number: int, body: str) -> None:
+    def comment(self, kind: str, number: int, body: str) -> Accepted:
         self.calls.append(("comment", kind, number, body))
+        return Accepted(len(self.calls))

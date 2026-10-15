@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_agent.adapters.github import GhUnavailable
+from issue_agent.adapters.github import Accepted, GhUnavailable, Refused
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.app.review import compose_review_daemon
@@ -60,14 +60,14 @@ class ReviewGitHub(FakeGitHub):
             for r in self.prs[pr].reviews
         )
 
-    def submit_review(self, pr: int, event: str, body: str, head: str) -> bool:
+    def submit_review(self, pr: int, event: str, body: str, head: str) -> Accepted | Refused:
         if self.fail_submit:
             self.fail_submit -= 1
             raise GhUnavailable("server", "HTTP 502 from the reviews endpoint")
         if self.refuse_submit:
             self.refuse_submit -= 1
             self.refused += 1
-            return False
+            return Refused(422, "Can not approve your own pull request")
         with self.lock:
             self.submitted.append((pr, event, body, head))
             state = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[event]
@@ -76,7 +76,7 @@ class ReviewGitHub(FakeGitHub):
                 p, reviews=(*p.reviews, Review(state, REVIEW_BOT, submitted_at=_now(), body=body, commit_id=head))
             )
         self._lossy("submit_review")
-        return True
+        return Accepted(len(self.submitted))
 
 
 class FakeCheckouts:

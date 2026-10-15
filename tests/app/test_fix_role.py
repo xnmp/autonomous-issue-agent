@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.github import BlockerLinkFacts
+from issue_agent.adapters.github import Accepted, BlockerLinkFacts, GhUnavailable
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
@@ -108,10 +108,11 @@ class FakeGitHub:
                                 BlockerRef(blocker) in mine.blocked_by,
                                 tuple(b.number for b in theirs.blocked_by if not b.repository))
 
-    def add_blocked_by(self, issue_id: str, blocker_id: str) -> None:
+    def add_blocked_by(self, issue_id: str, blocker_id: str) -> Accepted:
         issue, blocker = int(issue_id[1:]), int(blocker_id[1:])
         current = self.issues[issue]
         self.issues[issue] = replace(current, blocked_by=(*current.blocked_by, BlockerRef(blocker)))
+        return Accepted()
 
     def _owed(self, branch: str) -> bool:
         """GitHub's answer to "is this branch owed a PR": none ever, or pushed
@@ -155,16 +156,17 @@ class FakeGitHub:
     def run_attempt(self, run_id: int) -> int:
         return max(c.run_attempt or 1 for p in self.prs.values() for c in p.checks if c.run_id == run_id)
 
-    def rerun_failed_checks(self, run_id: int) -> None:
+    def rerun_failed_checks(self, run_id: int) -> Accepted:
         self.harness_reruns.append(run_id)
         number = next(n for n, p in self.prs.items() if any(c.run_id == run_id for c in p.checks))
         self.rerun(number, self.rerun_result)
+        return Accepted()
 
     # ── writes ──
     def _lossy(self, name: str) -> None:
         if name in self.lose_reply:
             self.lose_reply.discard(name)
-            raise RuntimeError(f"{name}: reply lost after the write landed")
+            raise GhUnavailable("network", f"{name}: reply lost after the write landed")
 
     def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> None:
         store = self.issues if kind == "issue" else self.prs
@@ -173,11 +175,12 @@ class FakeGitHub:
             labels.add(Label(add))
         store[number] = replace(store[number], labels=frozenset(labels))
 
-    def comment(self, kind: str, number: int, body: str, *, author: str = FIX_BOT) -> None:
+    def comment(self, kind: str, number: int, body: str, *, author: str = FIX_BOT) -> Accepted:
         store = self.issues if kind == "issue" else self.prs
         url = f"https://github.com/o/r/{'issues' if kind == 'issue' else 'pull'}/{number}#issuecomment-{len(store[number].comments) + 1}"
         store[number] = replace(store[number], comments=(*store[number].comments, Comment(author, body, _now(), url)))
         self._lossy("comment")
+        return Accepted(len(store[number].comments))
 
     def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
         with self.lock:
@@ -212,8 +215,9 @@ class FakeGitHub:
     def branch_runs(self, branch: str) -> tuple[tuple[int, str, str], ...]:
         return tuple((i, "in_progress", "2020-01-01T00:00:00Z") for i, b in self.runs.items() if b == branch)
 
-    def cancel_run(self, run_id: int) -> None:
+    def cancel_run(self, run_id: int) -> Accepted:
         self.cancelled.append(run_id)
+        return Accepted()
 
     def close_issue(self, number: int, reason: str, comment: str, *, author: str = FIX_BOT) -> None:
         self.closed.append(number)
@@ -227,11 +231,11 @@ class FakeGitHub:
         comments = (*current.comments, Comment(FIX_BOT, comment, _now()))
         self.issues[number] = replace(current, state="open", comments=comments)
 
-    def create_issue(self, title: str, body: str) -> int:
+    def create_issue(self, title: str, body: str) -> Accepted:
         number = max((*self.issues, *self.prs, 0)) + 1
         self.issues[number] = IssueView(number=number, title=title, body=body, author=FIX_BOT, updated_at=_now())
         self._lossy("create_issue")
-        return number
+        return Accepted(number)
 
     # ── test helpers ──
     def push(self, branch: str, head: str, ci: str = "pending") -> None:

@@ -105,7 +105,7 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
         lambda w: [
             Relabel(Target.ISSUE, 500, Label.NEEDS_HUMAN, Label.AI_READY),
             RunAgent(AgentKind.RESOLVE, 500),
-            PostComment(Target.PR, 537, "done"),
+            PostComment(Target.PR, 537, "done", key="done:537"),
             RunAgent(AgentKind.REBASE, 534),
         ],
         ex,
@@ -182,7 +182,7 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
         lambda: observations.append(len(observations) + 1) or WorldState(),
         lambda _world: (
             [RunAgent(AgentKind.RESOLVE, 7)]
-            + ([PostComment(Target.PR, 100, "rerun")] if len(observations) == 2 else [])
+            + ([PostComment(Target.PR, 100, "rerun", key="rerun:100")] if len(observations) == 2 else [])
         ),
         Executor(gateway, run_agent=run_agent),
         poll_seconds=1,
