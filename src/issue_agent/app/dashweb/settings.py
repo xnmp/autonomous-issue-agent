@@ -2,8 +2,10 @@
 
 ADR 0007 amendment. Only `live` knobs are shown or written, so no secret is
 ever read back or accepted. A write edits the one source file the operator
-chose (the repo overlay, or shared.env for every deployment), validates the
-whole composed candidate with the daemons' own parser before an atomic write,
+chose (the repo overlay, or shared.env for every deployment). The candidate
+is composed in a scratch directory and validated with the daemons' own
+parser; a save that would also change anything needing a restart is refused
+(`_vet`). Then an atomic write (refused over a concurrent hand edit)
 recomposes each affected launched deployment with `bin/compose-env.sh`,
 publishes the result to its installed service snapshot, and journals the
 change. The running daemons pick it up at their next tick (`LiveConfig`).
@@ -22,7 +24,8 @@ from ...domain.agent_task import RuntimeName
 from ...domain.pricing import CLAUDE_ALIASES, CLAUDE_DEFAULT_MODEL_RATES, with_default_model_rates
 from ...domain.routing import RUNTIME_EFFORTS, TIER_LADDER, ModelRoute, Tier
 from ...domain.world import Pickup
-from ..config import LIVE_KNOBS, HarnessConfig, from_env
+from ...adapters.github import FIX_MAX_ITEMS
+from ..config import LIVE_KNOBS, HarnessConfig, from_env, restart_part
 
 SCOPES = ("repo", "shared")
 
@@ -155,21 +158,61 @@ class WriteResult:
     warnings: tuple[str, ...] = ()
 
 
-def _candidate_errors(files: Files, texts: Mapping[str, str], environ: Mapping[str, str]) -> tuple[dict, list[str]]:
-    """The composed candidate env and its validation errors, the source files
-    replaced by `texts` (path -> content) and sourced like compose-env.sh."""
+def _vet(files: Files, target: str, after: str, key: str, value: str | None, scope: str,
+         environ: Mapping[str, str], open_issues: Callable[[str], int | None]) -> tuple[str, str]:
+    """`(refusal, warning)` for one deployment if `target` held `after`. The
+    candidate is composed with the real `compose-env.sh` in a scratch
+    directory and parsed the daemons' way. Refused: an invalid result; a
+    repo value that would not read back; a change to anything but live knobs
+    in a launched deployment (a pending hand edit would ship with this save
+    and restart its daemons, so it waits for the operator's own launch);
+    `ISSUE_PICKUP=open` past the fix observation's item bound."""
+    deployment = files.name
+    try:
+        shared, overlay = (after if path == target else config_files.read_text(path)
+                           for path in (files.shared, files.overlay))
+    except (OSError, ValueError) as exc:
+        return f"refused, {deployment}: {exc}", ""
     with tempfile.TemporaryDirectory(prefix="issue-agent-settings-") as scratch:
-        paths = []
-        for index, path in enumerate((files.shared, files.overlay)):
-            staged = os.path.join(scratch, f"{index}.env")
-            with open(staged, "w", encoding="utf-8") as handle:
-                handle.write(texts[path] if path in texts else config_files.read_text(path))
-            paths.append(staged)
+        staged, problem = config_files.compose_staged(files.harness_root, deployment, shared, overlay, environ,
+                                                      scratch)
+        if problem:
+            return f"refused, {deployment}: {problem}", ""
         try:
-            env = config_files.sourced(tuple(paths), environ)
+            env = config_files.sourced((staged,), environ)
+            pending = _pending(staged, files.active, environ)
         except ValueError as exc:
-            return {}, [str(exc)]
-    return env, list(from_env(env).validation_errors())
+            return f"refused, {deployment}: {exc}", ""
+    cfg = from_env(env)
+    if errors := cfg.validation_errors():
+        return f"refused, {deployment} would be invalid: " + "; ".join(errors), ""
+    if pending:
+        return (f"refused, {deployment}: saving would also apply changes that need a restart "
+                f"({', '.join(pending)}); roll those out with `issue-agent start` first"), ""
+    if key == "ISSUE_PICKUP" and cfg.pickup is Pickup.OPEN:
+        count = open_issues(deployment)
+        if count is None:
+            return f"refused, {deployment}: its open issues could not be counted", ""
+        if count >= FIX_MAX_ITEMS:
+            return (f"refused, {deployment}: {count}+ open issues; the fix observation reads at most "
+                    f"{FIX_MAX_ITEMS - 1}"), ""
+    if value is not None and env.get(key) != value:
+        if scope == "repo":
+            return f"{key} would read back as {env.get(key)!r}, not {value!r}", ""
+        return "", f"{deployment}: config/repos/{deployment}.env still sets {key}={env.get(key)!r}"
+    return "", ""
+
+
+def _pending(staged: str, active: str, environ: Mapping[str, str]) -> list[str]:
+    """The restart-requiring names that differ between a candidate and the
+    running composed file (none for a deployment never launched)."""
+    if not os.path.isfile(active):
+        return []
+    names: set[str] = set()
+    for role in ("fix", "review"):
+        new, old = restart_part(staged, environ, role), restart_part(active, environ, role)
+        names |= {name for name in new.keys() | old.keys() if new.get(name) != old.get(name)}
+    return sorted(names)
 
 
 def write_setting(
@@ -183,6 +226,7 @@ def write_setting(
     load: Callable[[str], HarnessConfig],
     environ: Mapping[str, str],
     home: str,
+    open_issues: Callable[[str], int | None],
     operator: str = "",
 ) -> WriteResult:
     """Set (or with None unset) one live knob in the repo overlay or shared.env."""
@@ -200,19 +244,17 @@ def write_setting(
     affected = (name,) if scope == "repo" else tuple(n for n in names if os.path.isfile(Files(harness_root, n).active))
     warnings: list[str] = []
     for deployment in dict.fromkeys((name, *affected)):
-        candidate = Files(harness_root, deployment)
-        env, errors = _candidate_errors(candidate, {target: after}, environ)
-        if errors:
-            return WriteResult(False, f"refused, {deployment} would be invalid: " + "; ".join(errors))
-        if value is not None and env.get(key) != value:
-            if scope == "repo":
-                return WriteResult(False, f"{key} would read back as {env.get(key)!r}, not {value!r}")
-            warnings.append(f"{deployment}: config/repos/{deployment}.env still sets {key}={env.get(key)!r}")
+        refusal, warning = _vet(Files(harness_root, deployment), target, after, key, value, scope, environ,
+                                open_issues)
+        if refusal:
+            return WriteResult(False, refusal)
+        warnings += [warning] if warning else []
     old = {deployment: _text(getattr(load(deployment), _FIELD[key])) for deployment in affected}
     try:
-        config_files.write_text(target, after)
-    except OSError as exc:
+        config_files.write_text(target, after, expected=before)
+    except (OSError, ValueError) as exc:
         return WriteResult(False, f"{target} not written: {exc}")
+
     def apply(deployment: str) -> tuple[str, list[str]]:
         """Compose `deployment` and publish it to its service snapshots."""
         if problem := config_files.compose(harness_root, deployment, environ):
@@ -226,7 +268,7 @@ def write_setting(
             continue  # never launched: nothing running reads a composed file
         problem, published = apply(deployment)
         if problem:
-            return WriteResult(False, f"{deployment}: {problem}; " + _roll_back(target, before, composed, apply))
+            return WriteResult(False, f"{deployment}: {problem}; " + _roll_back(target, before, after, composed, apply))
         composed.append(deployment)
         warnings += published
     who = operator or _operator()
@@ -240,14 +282,14 @@ def write_setting(
                        tuple(warnings))
 
 
-def _roll_back(target: str, before: str, composed: list[str],
+def _roll_back(target: str, before: str, after: str, composed: list[str],
                apply: Callable[[str], tuple[str, list[str]]]) -> str:
     """Restore the source file, then recompose AND republish every deployment
     already composed: an installed service reads its snapshot, so a
     recomposed `.active` alone would leave it running the refused value."""
     try:
-        config_files.write_text(target, before)
-    except OSError as exc:
+        config_files.write_text(target, before, expected=after)
+    except (OSError, ValueError) as exc:
         return f"{target} NOT restored ({exc}); fix it by hand"
     stuck = [f"{done}: {problem or '; '.join(published)}" for done in composed
              for problem, published in [apply(done)] if problem or published]

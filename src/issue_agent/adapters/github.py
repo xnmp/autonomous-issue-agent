@@ -295,8 +295,8 @@ def format_pr_discussion(
 # 5.3s, 10 1.1s; 100 refs 2.2-4.1s (per-ref PR association and compare), 50
 # 1.7s. The item ceilings are those of the old 10 pages of 100.
 _FIX_PAGE_SIZE = {"issues": 25, "pullRequests": 10, "refs": 50}
-_FIX_MAX_ITEMS = 1000
-_FIX_MAX_PAGES = {name: -(-_FIX_MAX_ITEMS // size) for name, size in _FIX_PAGE_SIZE.items()}
+FIX_MAX_ITEMS = 1000
+_FIX_MAX_PAGES = {name: -(-FIX_MAX_ITEMS // size) for name, size in _FIX_PAGE_SIZE.items()}
 _FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500, "contexts": 1000}
 _HARNESS_BRANCH_PREFIX = "fix/"
 _COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt url}}}}"

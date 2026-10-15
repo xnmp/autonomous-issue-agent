@@ -502,7 +502,7 @@ class Backend:
             result = settings.write_setting(
                 self.harness_root, name, key, value, scope, names=self.names(),
                 load=lambda deployment: self.deployment(deployment).cfg, environ=self.environ,
-                home=self.environ.get("HOME") or os.path.expanduser("~"))
+                home=self.environ.get("HOME") or os.path.expanduser("~"), open_issues=self._open_issues)
             if result.ok:
                 # The composed snapshots changed: re-read them, and observe again
                 # (the issue pickup decides what an observation lists).
@@ -510,6 +510,12 @@ class Backend:
                 for deployment in self.names():
                     self._observations.invalidate(deployment)
         return result.ok, result.detail, list(result.warnings)
+
+    def _open_issues(self, name: str) -> int | None:
+        """How many issues are open (the read the backlog uses); None unread."""
+        payload, error = self.gh.issues(self.deployment(name).cfg.repo)
+        return None if error or not isinstance(payload, list) else sum(
+            1 for issue in payload if isinstance(issue, dict) and ghdata.is_open(issue))
 
     # ── label writes ──
     def promote(self, name: str, number: int) -> tuple[bool, str]:

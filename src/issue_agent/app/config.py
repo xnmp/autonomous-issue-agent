@@ -605,14 +605,19 @@ def with_live(boot: HarnessConfig, candidate: HarnessConfig) -> HarnessConfig:
                    **{name: getattr(candidate, name) for name in LIVE_KNOBS})
 
 
-def reload_fingerprint(path: str, inherited: Mapping[str, str], role: str) -> str:
-    """The identity of what in an env file needs a restart: every assignment
-    but a live knob's, and the runtimes `role` binds (a live route onto a
-    runtime the process did not bind needs one). The deploy manifest lists
-    knob names, so a newly set live knob is dropped from it too."""
+def restart_part(path: str, inherited: Mapping[str, str], role: str) -> dict[str, str]:
+    """What in an env file needs a restart: every assignment but a live
+    knob's, and the runtimes `role` binds (a live route onto a runtime the
+    process did not bind needs one), as `{name: value}`. The deploy manifest
+    lists knob names, so a newly set live knob is dropped from it too."""
     assigned = source_env_file(path, inherited, assigned_only=True)
     kept = {key: value for key, value in assigned.items() if key not in LIVE_ENV_NAMES}
     if "HARNESS_DEPLOY_KNOBS" in kept:
         kept["HARNESS_DEPLOY_KNOBS"] = " ".join(sorted(set(kept["HARNESS_DEPLOY_KNOBS"].split()) - LIVE_ENV_NAMES))
-    runtimes = sorted(name.value for name in from_env(assigned).runtimes(role))
-    return hashlib.sha256(json.dumps([sorted(kept.items()), runtimes]).encode()).hexdigest()
+    kept[f"({role} runtimes)"] = " ".join(sorted(name.value for name in from_env(assigned).runtimes(role)))
+    return kept
+
+
+def reload_fingerprint(path: str, inherited: Mapping[str, str], role: str) -> str:
+    """The identity of `restart_part`: `ReloadWatch` restarts when it changes."""
+    return hashlib.sha256(json.dumps(sorted(restart_part(path, inherited, role).items())).encode()).hexdigest()

@@ -108,10 +108,18 @@ def test_a_write_is_atomic_keeps_the_mode_and_goes_through_a_symlink(tmp_path):
     real.chmod(0o600)
     link = tmp_path / "link.env"
     link.symlink_to(real)
-    write_text(str(link), "A=2\n")
+    write_text(str(link), "A=2\n", expected="A=1\n")
     assert link.is_symlink() and real.read_text() == "A=2\n"
     assert stat.S_IMODE(real.stat().st_mode) == 0o600
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_a_write_over_a_file_changed_since_it_was_read_is_refused(tmp_path):
+    path = tmp_path / "x.env"
+    path.write_text("A=1\n# a hand edit\n")
+    with pytest.raises(EditRefused):
+        write_text(str(path), "A=2\n", expected="A=1\n")
+    assert path.read_text() == "A=1\n# a hand edit\n"
 
 
 def test_publish_copies_to_matching_service_snapshots_only(tmp_path):

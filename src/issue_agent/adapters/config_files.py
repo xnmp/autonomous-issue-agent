@@ -123,10 +123,14 @@ def read_text(path: str) -> str:
         raise EditRefused(f"{path} is not UTF-8 text") from exc
 
 
-def write_text(path: str, text: str) -> None:
+def write_text(path: str, text: str, *, expected: str) -> None:
     """Replace the file atomically, keeping its mode (shared.env is 0600) and
-    writing through a symlink to its target."""
+    writing through a symlink to its target. Refused when the file no longer
+    holds `expected` (what the caller read): a hand edit made since is never
+    overwritten."""
     target = os.path.realpath(path)
+    if read_text(target) != expected:
+        raise EditRefused(f"{path} changed since it was read; reload and try again")
     atomic_write(target, text, mode=stat.S_IMODE(os.stat(target).st_mode))
 
 
@@ -147,6 +151,24 @@ def compose(harness_root: str, name: str, environ: Mapping[str, str]) -> str:
     except (OSError, subprocess.SubprocessError) as exc:
         return f"compose-env.sh could not run: {exc}"
     return "" if done.returncode == 0 else f"compose-env.sh failed: {done.stderr.strip()[-400:]}"
+
+
+def compose_staged(harness_root: str, name: str, shared: str, overlay: str, environ: Mapping[str, str],
+                   scratch: str) -> tuple[str, str]:
+    """Run `bin/compose-env.sh <name>` on candidate source texts in `scratch`
+    (a private directory) instead of the real config: `(composed path, "")`,
+    or `("", why it failed)`. Nothing a daemon reads is touched."""
+    for script in ("compose-env.sh", "point-at.sh"):
+        os.makedirs(os.path.join(scratch, "bin"), exist_ok=True)
+        shutil.copy(os.path.join(harness_root, "bin", script), os.path.join(scratch, "bin", script))
+    os.makedirs(os.path.join(scratch, "config", "repos"), exist_ok=True)
+    for path, text in ((os.path.join(scratch, "config", "shared.env"), shared),
+                       (os.path.join(scratch, "config", "repos", f"{name}.env"), overlay)):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    if problem := compose(scratch, name, environ):
+        return "", problem
+    return os.path.join(scratch, "config", f".active.{name}.env"), ""
 
 
 def _service_id(name: str) -> str:

@@ -16,6 +16,7 @@ pytest.importorskip("fastapi")
 
 from asgi_client import ASGITestClient as TestClient  # noqa: E402
 from issue_agent.adapters.reload import ReloadWatch  # noqa: E402
+from issue_agent.adapters.dashweb.ghdata import GhReader  # noqa: E402
 from issue_agent.app.config import LIVE_ENV_NAMES, from_env, reload_fingerprint  # noqa: E402
 from issue_agent.app.dashweb import server  # noqa: E402
 from issue_agent.app.dashweb.service import Backend  # noqa: E402
@@ -34,8 +35,18 @@ export FIX_MODEL_LOW=claude:sonnet:low  # the cheap tier
 """
 
 
+open_issues: list[dict] = [{"number": 1, "state": "OPEN"}]  # what the fake `gh issue list` answers
+gh_error = {"error": ""}
+
+
+def _gh(_args):
+    return ("", gh_error["error"]) if gh_error["error"] else (json.dumps(open_issues), "")
+
+
 @pytest.fixture
 def harness(tmp_path):
+    open_issues[:] = [{"number": 1, "state": "OPEN"}]
+    gh_error["error"] = ""
     root = tmp_path / "harness"
     (root / "config" / "repos").mkdir(parents=True)
     (root / "bin").mkdir()
@@ -53,7 +64,8 @@ def harness(tmp_path):
     snapshot = home / ".config" / "issue-agent" / "demo.env"  # an installed service reads this copy
     snapshot.parent.mkdir(parents=True)
     shutil.copy(root / "config" / ".active.demo.env", snapshot)
-    backend = Backend(harness_root=str(root), environ=environ)
+    backend = Backend(harness_root=str(root), gh=GhReader(run=_gh),
+                      environ=environ)
     app = server.create_app(backend=backend, harness_root=str(root), offload_backend=False)
     return root, snapshot, tmp_path, TestClient(app, headers=HEADERS, base_url=BASE_URL)
 
@@ -166,16 +178,16 @@ def test_a_shared_write_the_overlay_overrides_warns_and_unsetting_the_overlay_fa
     assert (root / "config" / "shared.env").stat().st_mode & 0o777 == 0o600
 
 
-def test_a_failed_compose_restores_the_source_file(harness):
+def test_a_candidate_that_cannot_compose_is_refused_before_anything_is_written(harness):
     root, snapshot, _, client = harness
     (root / "bin" / "point-at.sh").write_text("# the scrub floor is gone: compose refuses\n")
     before, published = _files(root), snapshot.read_text()
     body = client.post("/api/repos/demo/settings", json={"key": "ISSUE_PICKUP", "value": "open"}).json()
-    assert body["ok"] is False and "restored" in body["detail"]
+    assert body["ok"] is False and "refused" in body["detail"]
     assert _files(root) == before and snapshot.read_text() == published
 
 
-def test_a_shared_write_that_fails_for_one_deployment_republishes_the_ones_already_applied(harness):
+def test_a_shared_write_that_fails_for_one_deployment_republishes_the_ones_already_applied(harness, monkeypatch):
     """An installed service reads its snapshot, not `.active`: a rollback that
     only recomposed would leave it running the refused value."""
     root, snapshot, tmp_path, client = harness
@@ -185,7 +197,15 @@ def test_a_shared_write_that_fails_for_one_deployment_republishes_the_ones_alrea
                      f"REVIEW_STATE_DIR={tmp_path / 'later-review'}\n")
     subprocess.run(["bash", str(root / "bin" / "compose-env.sh"), "zz-later"], env=environ, check=True,
                    capture_output=True)
-    later.write_text(later.read_text() + "TARGET_ENV__X=1\n")  # compose refuses it; the parser ignores it
+    from issue_agent.adapters import config_files
+    compose = config_files.compose
+
+    def flaky(harness_root, name, env):  # the real compose fails after the candidate passed
+        if harness_root == str(root) and name == "zz-later":
+            return "compose-env.sh failed: disk full"
+        return compose(harness_root, name, env)
+
+    monkeypatch.setattr(config_files, "compose", flaky)
     before, published = _files(root), snapshot.read_text()
 
     body = client.post("/api/repos/demo/settings",
@@ -194,3 +214,58 @@ def test_a_shared_write_that_fails_for_one_deployment_republishes_the_ones_alrea
     assert body["ok"] is False and "restored" in body["detail"], body
     assert _files(root) == before
     assert snapshot.read_text() == published
+
+
+def test_a_save_is_refused_while_a_hand_edit_needing_a_restart_is_pending(harness):
+    """A non-live edit waits for the operator's own launch: shipping it with a
+    cap change would drain and restart every daemon behind 'next tick'."""
+    root, snapshot, _, client = harness
+    shared = root / "config" / "shared.env"
+    shared.write_text(shared.read_text() + "POLL_SECONDS=5\n")
+    before, published = _files(root), snapshot.read_text()
+
+    body = client.post("/api/repos/demo/settings", json={"key": "DAILY_SPEND_CAP_USD", "value": "7"}).json()
+
+    assert body["ok"] is False and "POLL_SECONDS" in body["detail"] and "restart" in body["detail"]
+    assert _files(root) == before and snapshot.read_text() == published
+
+
+def test_a_route_onto_a_runtime_the_daemons_did_not_bind_is_refused_as_needing_a_restart(harness):
+    root, *_, client = harness
+    before = _files(root)
+    body = client.post("/api/repos/demo/settings", json={"key": "FIX_MODEL_LOW", "value": "codex:gpt-6-luna:low"}).json()
+    assert body["ok"] is False and "runtimes" in body["detail"]
+    assert _files(root) == before
+
+
+def test_a_hand_edit_made_while_saving_is_never_overwritten(harness, monkeypatch):
+    root, *_, client = harness
+    overlay = root / "config" / "repos" / "demo.env"
+    from issue_agent.adapters import config_files
+    compose_staged = config_files.compose_staged
+
+    def racing(*args, **kwargs):
+        overlay.write_text(overlay.read_text() + "# the operator's edit\n")
+        return compose_staged(*args, **kwargs)
+
+    monkeypatch.setattr(config_files, "compose_staged", racing)
+    body = client.post("/api/repos/demo/settings", json={"key": "FIX_DISPATCH_CONCURRENCY", "value": "4"}).json()
+
+    assert body["ok"] is False and "changed since it was read" in body["detail"]
+    assert overlay.read_text().endswith("FIX_DISPATCH_CONCURRENCY=2\n# the operator's edit\n")
+
+
+@pytest.mark.parametrize("count,ok", [(999, True), (1000, False)])
+def test_open_pickup_is_refused_past_the_fix_observations_item_bound(harness, count, ok):
+    root, *_, client = harness
+    open_issues[:] = [{"number": n, "state": "OPEN"} for n in range(1, count + 1)]
+    body = client.post("/api/repos/demo/settings", json={"key": "ISSUE_PICKUP", "value": "open"}).json()
+    assert body["ok"] is ok, body
+    assert ("ISSUE_PICKUP" in _files(root)[1]) is ok
+
+
+def test_open_pickup_is_refused_when_the_open_issues_cannot_be_read(harness):
+    root, *_, client = harness
+    gh_error["error"] = "HTTP 502"
+    body = client.post("/api/repos/demo/settings", json={"key": "ISSUE_PICKUP", "value": "open"}).json()
+    assert body["ok"] is False and "could not be counted" in body["detail"]

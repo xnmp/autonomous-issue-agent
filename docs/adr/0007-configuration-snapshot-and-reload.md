@@ -62,6 +62,10 @@ exception carries that:
   admission caps (`AdmissionCaps`, read once per leg before its reservation
   transaction). Nothing in the composed graph is mutated; the reservation
   transaction itself is unchanged, so no new crash point exists.
+- A leg's model is its live route's. No runtime keeps a boot default model
+  (the codex runner used to bake in the boot `FIX_MODEL`/`REVIEW_MODEL`, so
+  an unset applied only after a restart); a route without a model means the
+  runtime's own default.
 - The snapshot hash a leg ran under is the effective snapshot's
   `config_version` (it covers the live values): the leg's environment carries
   it as before, and its receipt now records it as `config`. The charge's
@@ -75,9 +79,20 @@ exception carries that:
 - The dashboard writes settings by editing `config/shared.env` or
   `config/repos/<name>.env` in place (the last top-level `KEY=` or
   `export KEY=` line, comments and order kept; a missing key is appended;
-  an indented or compound assignment is refused). It validates the whole
-  composed candidate with `from_env`/`validation_errors()` before an atomic
-  write that keeps the file's mode, then runs `bin/compose-env.sh` for every
+  an indented or compound assignment is refused). It composes the candidate
+  with the real `bin/compose-env.sh` in a private scratch directory and
+  validates the result with `from_env`/`validation_errors()`. It refuses,
+  naming the keys, when the candidate's restart-requiring part
+  (`config.restart_part`, what `ReloadWatch` fingerprints) differs from the
+  running `.active`: a pending hand edit, or a route onto an unbound runtime,
+  would otherwise ship with the save and drain and restart the daemons while
+  the dashboard said "next tick". `.active` stays recomposed only by the
+  operator's launch for such changes. `ISSUE_PICKUP=open` is refused when the
+  repository has `FIX_MAX_ITEMS` open issues or more, or they cannot be
+  counted. The write is atomic, keeps the file's mode, and is refused if the
+  file changed since it was read (a concurrent hand edit is never
+  overwritten; the rollback checks the same way). Then it runs
+  `bin/compose-env.sh` for every
   affected launched deployment and publishes the composed file byte for byte
   to any installed service snapshot whose REPO and TARGET_DIR match. A
   failed compose restores the source file and re-applies (recomposes and
@@ -98,9 +113,10 @@ a fix leg can open issues that the next tick takes up. The owner accepts this
 per deployment; the bounds are the per-issue and daily spend caps and the
 existing leg sandbox. It belongs on repositories whose issue authors the
 owner trusts. Open mode observes every open issue under the same
-`_FIX_MAX_ITEMS` bound as ready mode: a repository with more open issues than
-that fails its fix observation every tick (merges and repairs included) until
-the pickup returns to `ready`. The steward still orders only `ai-ready`
+`FIX_MAX_ITEMS` bound as ready mode: a repository with more open issues than
+that fails its fix observation every tick (merges and repairs included), so
+the dashboard refuses open mode at that count; a hand edit or a backlog that
+grows past it afterwards still stalls until the pickup returns to `ready`. The steward still orders only `ai-ready`
 issues.
 
 Exit: the exception is the `live` metadata. Removing a knob's flag returns it
