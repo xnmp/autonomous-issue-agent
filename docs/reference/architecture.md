@@ -541,6 +541,9 @@ idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`, `adapters/atomic_file.py`,
 `adapters/child_env.py`,
+`adapters/config_files.py` (the dashboard's settings writes: one assignment
+edited in place, `compose-env.sh`, publish to service snapshots; ADR 0007
+amendment),
 `adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
 once per leg; native sub-agents disabled in the isolated profile),
 `adapters/control_path.py`, `adapters/control_store.py`,
