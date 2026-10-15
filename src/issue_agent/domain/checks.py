@@ -99,11 +99,7 @@ class BaseIssue:
     title: str
     closed_at: str = ""  # "" while open
     closed_by: str = ""  # the commit that closed it: a merged PR's merge commit, or a pushed commit
-    by_fixer: bool = False  # closed by the fixer's own login with no commit: the harness's close
-
-    def __post_init__(self) -> None:
-        if self.by_fixer and (self.closed_by or not self.closed_at):
-            raise ValueError("a close by the fixer has no closing commit")
+    note: str = ""  # with no closing commit: the fixer's comment the close came with (`gh issue close --comment`)
 
 
 @dataclass(frozen=True)

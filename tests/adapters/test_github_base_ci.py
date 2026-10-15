@@ -265,7 +265,7 @@ def test_a_workflow_named_apart_from_its_runs_on_the_base_leaves_the_listing_unr
 def test_the_commit_that_closed_an_issue_is_read_with_it_and_unreadable_is_none():
     def closed(closer):
         return {**found(1, "t", "CLOSED", closed="2026-10-15T11:55:46Z"),
-                "timelineItems": {"nodes": [{"createdAt": "2026-10-15T11:55:46Z", "closer": closer}]}}
+                "timelineItems": {"nodes": [{"__typename": "ClosedEvent", "closer": closer}]}}
     nodes = [closed({"mergeCommit": {"oid": "d20c058"}}), closed({"oid": "abc"}), closed(None), closed({}),
              closed({"mergeCommit": None}), closed("x"), {**closed(None), "timelineItems": {"nodes": "x"}},
              {**closed(None), "timelineItems": None}, found(2, "t")]
@@ -281,13 +281,17 @@ def test_a_workflow_listing_with_an_unhashable_path_is_unread_and_the_tick_goes_
     assert base.workflows is None and base.runs is not None
 
 
-def test_a_close_by_the_fixer_with_no_closing_commit_is_the_harnesss_own():
-    def closed(event):
-        return {**found(1, "t", "CLOSED", closed="2026-10-15T11:55:46Z"), "timelineItems": {"nodes": [event]}}
-    nodes = [closed({"actor": {"login": "Fix-Bot"}, "closer": None}),  # the harness's close
-             closed({"actor": {"login": "fix-bot"}, "closer": {"oid": "abc"}}),  # its push closed it
-             closed({"actor": {"login": "someone"}, "closer": None}), closed({"actor": None, "closer": None}),
-             closed({"actor": {"login": "fix-bot"}}),  # the closer unread
-             closed({"actor": {"login": 7}, "closer": None}), found(2, "t")]
-    assert [(i.closed_by, i.by_fixer) for i in base_issues(search(*nodes), "fix-bot")] == [
-        ("", True), ("abc", False), ("", False), ("", False), ("", False), ("", False), ("", False)]
+def test_the_comment_the_fixer_closed_an_issue_with_is_read_and_any_other_is_not():
+    def closed(*events):
+        return {**found(1, "t", "CLOSED", closed="2026-10-15T11:55:46Z"), "timelineItems": {"nodes": list(events)}}
+
+    def said(login, body="m"):
+        return {"__typename": "IssueComment", "author": {"login": login}, "body": body}
+    close, merged = {"__typename": "ClosedEvent", "closer": None}, {"__typename": "ClosedEvent", "closer": {"oid": "abc"}}
+    nodes = [closed(said("Fix-Bot"), close),  # `gh issue close --comment` by the fixer
+             closed(said("fix-bot"), merged),  # a commit closed it: the commit rules
+             closed(said("someone"), close), closed(said("fix-bot"), {"__typename": "ReopenedEvent"}),
+             closed({"__typename": "ReopenedEvent"}, close),  # reopened since its comment, closed by someone
+             closed(said(None), close), closed(said("fix-bot", None), close), closed(close), found(2, "t")]
+    assert [(i.closed_by, i.note) for i in base_issues(search(*nodes), "fix-bot")] == [
+        ("", "m"), ("abc", ""), ("", ""), ("", ""), ("", ""), ("", ""), ("", ""), ("", ""), ("", "")]

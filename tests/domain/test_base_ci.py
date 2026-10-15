@@ -62,7 +62,7 @@ def test_an_open_issue_of_the_workflow_files_nothing_and_green_closes_it():
         assert _act(_br(2, "failure"), issues=[BaseIssue(40, title)]) == ()
         (closed,) = _act(_br(9, "success"), issues=[BaseIssue(40, title)])
         assert closed == SetIssueState(40, False, "<!-- m -->\n**macOS Smoke** passes on `dev` again: "
-                                                  "https://x/runs/9 (head `sha9`).")
+                                                  "https://x/runs/9 (head `sha9`, created `2026-10-14T00:00:09Z`).")
     assert _act(_br(9, "success"), issues=[BaseIssue(40, PREFIX, CLOSED_AT)]) == ()
 
 
@@ -103,17 +103,31 @@ def test_a_run_created_between_the_ticks_read_and_its_green_close_still_files():
     # The tick read G green and settled; in the same tick it merged a PR at 10:00:02, whose run X was
     # created at 10:00:04, and its close landed at 10:00:06. X fails: the base must get an issue.
     green, x = _run(1, "success", "09:30:00", "09:59:00"), _run(2, "failure", "10:00:04", "10:20:00")
-    harness = BaseIssue(40, f"{PREFIX} since sha0", "2026-10-14T10:00:06Z", by_fixer=True)
+    (close,) = _act(green, issues=[BaseIssue(40, f"{PREFIX} since sha0")])
+    harness = BaseIssue(40, f"{PREFIX} since sha0", "2026-10-14T10:00:06Z", note=close.comment)
     (filed,) = _act(green, x, issues=[harness])
     assert filed.title == f"{PREFIX} since sha2"
-    # A human's or a merge's close in the same place anchors on the close: X tested older code.
-    assert _act(green, x, issues=[replace(harness, by_fixer=False)]) == ()
     # The closing green itself, re-run and failing, is the base red again: it files.
-    (filed,) = _act(_run(3, "success", "08:00:00", "08:30:00"), _run(1, "failure", "09:30:00", "10:40:00"),
-                    issues=[harness])
+    (filed,) = _act(_run(1, "failure", "09:30:00", "10:40:00"), issues=[harness])
     assert filed.title == f"{PREFIX} since sha1"
-    with pytest.raises(ValueError):
-        BaseIssue(40, PREFIX, "2026-10-14T10:00:06Z", "abc", by_fixer=True)  # a commit closed it, not the harness
+    # Any other close anchors on the close: X tested older code. No comment, another's words (a leg's
+    # forgery is the residual), a comment naming no green run, or a closing commit.
+    for other in ("", close.comment.replace("<!-- m -->", "<!-- other -->"), close.comment.replace(", created", ""),
+                  close.comment.replace("2026-10-14T09:30:00Z", "never"), "<!-- m -->\nIts fix merged, but ..."):
+        assert _act(green, x, issues=[replace(harness, note=other)]) == ()
+    assert _act(green, x, issues=[replace(harness, closed_by="abc")]) == ()
+
+
+def test_an_issue_whose_workflow_passes_settled_or_not_is_held_from_every_dispatch():
+    unsettled = BaseHealth("dev", (), (_br(2, "failure"), _br(3, "success", hour=1), _br(4, "", hour=2)),
+                           tuple(OPEN), frozenset({"macOS Smoke"}))
+    issue = _issue(40)  # already `ai-ready`
+    assert issue_key(40) not in derive(WorldState(issues=(issue,), now=NOW.isoformat(), base=unsettled), Local(NOW, {}), H)
+    settled = replace(unsettled, runs=unsettled.runs[:2])
+    assert derive(WorldState(issues=(issue,), now=NOW.isoformat(), base=settled), Local(NOW, {}), H) == {}  # closing now
+    red = replace(unsettled, runs=(*unsettled.runs[:1], _br(4, "", hour=2)))
+    assert derive(WorldState(issues=(issue,), now=NOW.isoformat(), base=red), Local(NOW, {}), H)[issue_key(40)] == \
+        Dispatch(AgentKind.RESOLVE)
 
 
 def test_after_any_close_only_a_failure_created_at_or_after_the_last_close_files():

@@ -1390,7 +1390,7 @@ def test_a_flaky_suite_gets_one_issue_per_red_streak_each_closed_on_green(role):
     gh.base_runs.append(base_run("macOS Smoke", 4, "success", -5))
     tick(composed)
     (note,) = gh.comments_with("issue", issue.number, "passes on `dev` again")
-    assert gh.issues[issue.number].state == "closed" and "actions/runs/4 (head `sha4`)" in note.body
+    assert gh.issues[issue.number].state == "closed" and "actions/runs/4 (head `sha4`," in note.body
     tick(composed)
     assert gh.closed == [issue.number]  # closed once
 

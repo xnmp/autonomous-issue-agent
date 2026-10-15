@@ -20,7 +20,7 @@ from .actions import (
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
 from .checks import BaseHealth, BaseIssue, BaseRun
-from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_title, base_verdicts, parse_timestamp, workflow_issues
+from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_unsettled, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
@@ -153,17 +153,15 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     `needs-human`: renamed or removed, it would never pass."""
     if health is None or health.runs is None:
         return ()
-    base = health.ref
+    base, unsettled = health.ref, base_unsettled(health.runs)
     out: list[Action] = []
     for latest, since, bounded in base_verdicts(health.runs):
         issues, name = workflow_issues(health, latest.workflow), _inert(" ".join(latest.workflow.split())[:200])
         opened = [i for i in issues if not i.closed_at]
         if latest.conclusion in GREEN_CONCLUSIONS:
-            settled = not any(r.workflow == latest.workflow and not r.conclusion and _created(r) > _created(latest)
-                              for r in health.runs)  # a newer run still running may yet fail
-            out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
-                                                      f"{latest.url} (head `{latest.head_sha}`).")
-                       for i in opened if settled)
+            out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: {latest.url} "
+                                                      f"(head `{latest.head_sha}`, created `{latest.created_at}`).")
+                       for i in opened if latest.workflow not in unsettled)
             continue
         streak = sorted((r for r in health.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
                          and _created(r) >= _created(since)), key=_created)
@@ -178,7 +176,7 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
                        for n, r in sorted(ended.items()))
             continue
         # The commit whose merge or push closed the last issue tested the fix, whenever GitHub dates the close.
-        after, closer = max(((_anchor(i, at, latest.workflow, health.runs), i.closed_by) for i in issues
+        after, closer = max(((_anchor(i, at, marker, base), i.closed_by) for i in issues
                              if (at := parse_timestamp(i.closed_at))), default=(None, ""))
         first = min(ended.values(), key=_created) if ended else next((
             r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
@@ -205,16 +203,17 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     return tuple(out)
 
 
-def _anchor(issue: BaseIssue, closed_at: datetime, workflow: str, runs: Iterable[BaseRun]) -> datetime:
+def _anchor(issue: BaseIssue, closed_at: datetime, marker: str, base: str) -> datetime:
     """What a red run must be created at or after to file once `issue`
-    closed. The harness's green close (by the fixer, no closing commit): its
-    green run's creation, since a run created between the tick's read and the
-    close landing must still file. The harness's other closes need no care:
-    a merged fix's issue closes only once the next is open, and an orphan's
-    workflow no longer runs. Any other close: the close itself (#442)."""
-    green = max((r for r in runs if r.workflow == workflow and r.conclusion in GREEN_CONCLUSIONS
-                 and _created(r)[0] <= closed_at), key=_created, default=None) if issue.by_fixer else None
-    return _created(green)[0] if green is not None else closed_at
+    closed. The harness's green close, known by the comment it closed with:
+    its green run's creation, since a run created between the tick's read and
+    the close landing must still file. The harness's other closes need no
+    care: a merged fix's issue closes only once the next is open, and an
+    orphan's workflow no longer runs. Any other close: the close itself (#442)."""
+    green = None if issue.closed_by else re.fullmatch(
+        rf"{re.escape(marker)}\n.* passes on `{re.escape(base)}` again: \S+ \(head `\S*`, created `([^`]+)`\)\.",
+        issue.note, re.S)
+    return (parse_timestamp(green[1]) if green else None) or closed_at
 
 
 def _created(run: BaseRun) -> tuple[datetime, int]:

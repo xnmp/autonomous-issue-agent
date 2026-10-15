@@ -154,18 +154,22 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 
-def _closer(node: dict, filer: str) -> tuple[str, bool]:
-    """The commit that closed an issue, and whether the fixer closed it with
-    none (the harness's own close) (#442); ("", False) when unreadable."""
+def _closer(node: dict, filer: str) -> tuple[str, str]:
+    """The commit that closed an issue, else the comment by `filer` posted
+    right before the close (#442); "" for either when absent or unreadable."""
     events = (node.get("timelineItems") or {}).get("nodes") if isinstance(node.get("timelineItems"), dict) else None
-    event = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else {}
-    closer, actor = event.get("closer"), event.get("actor")
+    *before, event = events if isinstance(events, list) and events and all(isinstance(e, dict) for e in events) else [{}]
+    if event.get("__typename") != "ClosedEvent":
+        return "", ""
+    closer = event.get("closer")
     oid = ((closer.get("mergeCommit") or {}).get("oid") if isinstance(closer.get("mergeCommit"), dict)
            else closer.get("oid")) if isinstance(closer, dict) else None
     if isinstance(oid, str) and oid:
-        return oid, False
-    login = actor.get("login") if isinstance(actor, dict) else None
-    return "", "closer" in event and closer is None and isinstance(login, str) and login_eq(login, filer)
+        return oid, ""
+    comment = before[-1] if before and before[-1].get("__typename") == "IssueComment" else {}
+    author = comment.get("author")
+    login, body = author.get("login") if isinstance(author, dict) else None, comment.get("body")
+    return "", body if isinstance(login, str) and login_eq(login, filer) and isinstance(body, str) else ""
 
 
 def active_workflows(payload, listing) -> frozenset[str] | None:
