@@ -274,8 +274,7 @@ def compose_review_daemon(
             raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
         checkouts = ReviewCheckouts(cfg.target_dir, worktree_root=cfg.worktree_root)
     harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
-    task_config = tasks.ReviewTaskConfig(cfg.repo, cfg.base_branch, cfg.review_prompt, cfg.review_budget_usd,
-                                         cfg.review_model)
+    task_config = tasks.ReviewTaskConfig(cfg.repo, cfg.base_branch, cfg.review_prompt, cfg.review_budget_usd)
 
     def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> ReviewLegs:
         return ReviewLegs(gateway, control, ReviewSettings(cfg.repo, owner_id, harness), runtime=runtime,

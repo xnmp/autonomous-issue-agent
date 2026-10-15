@@ -384,7 +384,7 @@ def compose_fix_daemon(
                            triage_cwd=os.path.join(cfg.state_dir, "triage"),
                            harness_repo=harness_repo, target_public=target_public)
     task_config = tasks.FixTaskConfig(cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,
-                                      cfg.fix_model, runtime=cfg.fixer_runtime)
+                                      runtime=cfg.fixer_runtime)
 
     def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> FixLegs:
         return FixLegs(gateway, control, replace(settings, owner_id=owner_id), runtime=runtime,

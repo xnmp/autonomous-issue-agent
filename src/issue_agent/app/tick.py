@@ -976,8 +976,9 @@ def bind_runtime(
 
     fix = role == "fix"
     state_dir = cfg.state_dir_for(role)
-    # The runner's default model; every routed leg carries its own.
-    model = ((cfg.fix_model if cfg.fixer_runtime is RuntimeName.CODEX else None) if fix else cfg.review_model) or None
+    # No default model: every leg carries its live route's model, and a route
+    # without one means the runtime's own default (a boot FIX_MODEL baked in
+    # here outlived its unset; ADR 0007 amendment).
     codex = CodexRunner(
         codex_bin=cfg.codex_bin,
         provider=CodexProvider(provider_id=cfg.codex_provider_id, name=cfg.codex_provider_name,
@@ -994,7 +995,6 @@ def bind_runtime(
         spend_evidence_dir=spend_evidence_dir(state_dir),
         rate_table=rate_table(cfg, RuntimeName.CODEX.value),
         leg_sandbox=leg_sandbox(cfg, role),
-        **({"default_model": model} if model else {}),
     )
     reason = codex.preflight()
     log(f"codex: NOT READY at startup — {reason}" if reason is not None

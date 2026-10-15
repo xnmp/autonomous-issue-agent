@@ -1770,6 +1770,50 @@ def test_a_settings_change_applies_at_the_next_tick_without_a_restart(role, tmp_
     assert sorted(a.number for a in dispatched(taken, AgentKind.RESOLVE)) == [5, 6]
 
 
+@pytest.mark.parametrize("knob", ["DAILY_SPEND_CAP_USD", "ISSUE_SPEND_CAP_USD"])
+def test_a_lowered_live_cap_holds_the_next_leg_at_the_tick(role, tmp_path, knob):
+    """The money path's tick facts (headroom, lifetime cap) read the live
+    snapshot, not the boot one."""
+    env = tmp_path / "live.env"
+    env.write_text(f"{knob}=100\n")
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, live_file=env, FIX_BUDGET_USD="3", **{knob: "100"})
+
+    env.write_text(f"{knob}=1\n")  # below one leg's $3
+
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == []
+    assert agent.tasks == []
+
+
+@pytest.mark.parametrize("knob", ["DAILY_SPEND_CAP_USD", "ISSUE_SPEND_CAP_USD"])
+def test_a_cap_lowered_after_dispatch_refuses_the_legs_admission(role, tmp_path, knob):
+    """Admission reads the live caps as the leg starts: a cap lowered between
+    the tick that dispatched a leg and its reservation refuses the leg."""
+    env = tmp_path / "live.env"
+    env.write_text(f"{knob}=100\n")
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, worktrees = role(gh, agent, live_file=env, FIX_BUDGET_USD="3", **{knob: "100"})
+    at_checkout, release = threading.Event(), threading.Event()
+    ensure = worktrees.ensure
+
+    def held(issue, branch):
+        at_checkout.set()
+        assert release.wait(timeout=10)
+        return ensure(issue, branch)
+
+    worktrees.ensure = held
+    taken = composed.daemon.tick()
+    assert len(dispatched(taken, AgentKind.RESOLVE)) == 1 and at_checkout.wait(timeout=10)
+    env.write_text(f"{knob}=1\n")
+    composed.daemon.tick()  # the next observation applies the lowered cap
+    release.set()
+    composed.daemon.wait_for_dispatches()
+
+    assert agent.tasks == []
+
+
 def test_an_invalid_settings_change_keeps_the_daemon_on_its_previous_settings(role, tmp_path):
     env = tmp_path / "live.env"
     env.write_text("ISSUE_PICKUP=ready\n")
