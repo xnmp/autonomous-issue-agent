@@ -101,7 +101,10 @@ Xvfb `-nolisten local`.
   and its output. The harness keeps it with this leg's record and files an
   issue in its own repository that points at it. It is no
   question: report it whatever your status, and block only if it stops you,
-  with `needs` saying what this item needs from a human.
+  with `needs` saying what this item needs from a human. What the harness
+  withholds on purpose (repository admin, branch protection, repo settings,
+  credentials for external systems such as deploy accounts) is no defect: ask
+  for it in `needs` only.
 - After the push that follows your review (or your first push, if the review
   found nothing), end the leg: the harness watches CI and dispatches a new leg if
   it fails. Never wait for CI inside a leg (`gh run watch`, `gh pr checks
