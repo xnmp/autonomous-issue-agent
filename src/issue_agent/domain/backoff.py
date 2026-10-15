@@ -51,9 +51,9 @@ class LegEnd:
     # layer's ASKED class), bounded and neutralised; None when it did not ask.
     # Always None for a machine end.
     question: str | None = None
-    # When the leg started, if known. Comments inside a leg's window are the
-    # agent's own (it may comment under the bot's login, without the harness
-    # marker), so they never reset attempts.
+    # When the leg started, if known. FIX_BOT comments inside a leg's window are
+    # the agent's own (it comments without the harness marker), so they never
+    # reset attempts; other authors' comments in the window still do.
     started_at: datetime | None = None
     # A TRIAGE agent end's laundered result; None when it returned nothing usable.
     triage: Triage | None = None
