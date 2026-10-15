@@ -52,6 +52,12 @@ unchanged; name what it removes before writing it.
   exit (automatic or typed operator re-arm).
 - Check earlier rather than recover later; unify parallel mechanisms instead
   of adding another.
+- Always prefer the change that leaves less surface for future gaps: every
+  rule, check, and code path is a place the next gap can hide. When something
+  misfires, first ask what can be deleted. Remove the faulty check rather than
+  add a second check to guard it. Drop a source of truth that went stale
+  rather than validate against it. Delete a special case rather than add
+  another beside it.
 - Fix PRs and agent reports state net `src/` lines and mechanisms removed and
   added; reviewers reject unjustified additions. Incident history:
   [manager reference](docs/reference/manager.md) surface-area test.
