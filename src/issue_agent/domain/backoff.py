@@ -107,10 +107,9 @@ class LegEnd:
         ):
             raise ValueError("only a TRIAGE agent end carries a triage result")
         if self.steward is not None and (
-            not isinstance(self.steward, Steward) or self.kind not in (AgentKind.STEWARD, AgentKind.TRIAGE)
-            or self.machine
+            not isinstance(self.steward, Steward) or self.kind is not AgentKind.STEWARD or self.machine
         ):
-            raise ValueError("only a STEWARD or TRIAGE agent end carries a steward result")
+            raise ValueError("only a STEWARD agent end carries a steward result")
         if self.tier is not None and not isinstance(self.tier, Tier):
             raise ValueError("leg tier must be a Tier")
         if not isinstance(self.evidence, frozenset) or any(not isinstance(k, str) or not k for k in self.evidence) or (

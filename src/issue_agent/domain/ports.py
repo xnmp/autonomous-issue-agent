@@ -106,9 +106,3 @@ class StaleReservationReconciler(Protocol):
     """
 
     def reconcile_stale_reservations(self) -> int: ...
-
-
-class WorktreeRecovery(Protocol):
-    """Idempotent local checkout recovery; any validation failure is fatal."""
-
-    def prune_validate(self) -> int: ...

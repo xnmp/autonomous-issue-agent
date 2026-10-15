@@ -95,7 +95,7 @@ class LegRow:
     verdict_body: str = ""
     tier: str = ""  # the routed tier the leg ran at (a TRIAGE leg: the tier it graded)
     triage: Triage | None = None  # a TRIAGE leg's laundered result
-    steward: Steward | None = None  # a STEWARD leg's (or a legacy TRIAGE leg's) laundered result
+    steward: Steward | None = None  # a STEWARD leg's laundered result
 
     @property
     def running(self) -> bool:
@@ -165,10 +165,9 @@ def issue_triage(legs: Iterable[LegRow]) -> Triage | None:
 
 
 def issue_steward(legs: Iterable[LegRow]) -> Steward | None:
-    """The steward result derive reads: the newest agent-ended STEWARD leg's,
-    or a legacy combined TRIAGE leg's (see `state.latest_steward`)."""
+    """The steward result derive reads: the newest agent-ended STEWARD leg's."""
     stewarded = [leg for leg in legs if leg.derived and leg.leg_class in ("agent", "asked")
-                 and (leg.kind == AgentKind.STEWARD.name or leg.steward is not None)]
+                 and leg.kind == AgentKind.STEWARD.name]
     latest = max(stewarded, key=lambda leg: leg.at, default=None)
     return latest.steward if latest is not None else None
 

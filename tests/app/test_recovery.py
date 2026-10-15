@@ -85,17 +85,12 @@ class _Spend:
         return run_id in self.settled
 
 
-class _Worktrees:
-    def prune_validate(self):
-        return 2
-
-
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
 OWNER = "o/r:fix"
 
 
 def _coordinator(control, spend=None, **kwargs) -> RecoveryCoordinator:
-    return RecoveryCoordinator(_Supervisor(), control, _Worktrees(), spend or _Spend(), OWNER, **kwargs)
+    return RecoveryCoordinator(_Supervisor(), control, spend or _Spend(), OWNER, **kwargs)
 
 
 def test_recovery_reconciles_dead_reservation_before_unknown_release():
@@ -106,7 +101,6 @@ def test_recovery_reconciles_dead_reservation_before_unknown_release():
 
     assert report.killed_orphans == ()
     assert report.reclaimed_leases == (RunId("recovered"),)
-    assert report.validated_worktrees == 2
     assert report.spend_unknown == ()
     assert spend.seen == [RunId("recovered")]
     assert control.released == []
@@ -148,15 +142,10 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
             calls.append("read_stale_reservations")
             return ()
 
-    class Worktrees:
-        def prune_validate(self):
-            calls.append("validate_worktrees")
-            return 0
-
-    coordinator = RecoveryCoordinator(Supervisor(), Control(), Worktrees(), _Spend(), OWNER)
+    coordinator = RecoveryCoordinator(Supervisor(), Control(), _Spend(), OWNER)
 
     coordinator.reconcile(RecoveryTrigger.WAKE)
-    assert calls == ["reap_abandoned", "reclaim_leases", "validate_worktrees", "read_leases", "read_stale_reservations"]
+    assert calls == ["reap_abandoned", "reclaim_leases", "read_leases", "read_stale_reservations"]
 
     calls.clear()
     coordinator.reconcile(RecoveryTrigger.PERIODIC)
@@ -164,7 +153,7 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
 
     calls.clear()
     coordinator.reconcile(RecoveryTrigger.BOOT)
-    assert calls == ["reclaim_leases", "validate_worktrees", "read_leases", "read_stale_reservations"]
+    assert calls == ["reclaim_leases", "read_leases", "read_stale_reservations"]
 
 
 def _store(tmp_path, now=NOW) -> SQLiteControlStore:

@@ -277,14 +277,11 @@ class FakeWorktrees:
     def sync(self, issue: int, branch: str, head: str) -> str:
         return self.ensure(issue, branch)
 
-    def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str:
-        return preferred or fallback
+    def branch_for_issue(self, issue: int) -> str:
+        return ""
 
     def remove(self, issue: int) -> None:
         self.removed.append(issue)
-
-    def prune_validate(self) -> int:
-        return 0
 
 
 class Agent:
@@ -1056,26 +1053,6 @@ def test_a_suspected_duplicate_stops_before_triage_and_a_reply_lets_it_continue(
     tick(composed)  # triage comment
     assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.LOW)]
     assert Label.NEEDS_HUMAN not in gh.issues[5].labels
-
-
-def test_a_combined_result_recorded_before_the_split_is_not_stewarded_again(role):
-    gh = FakeGitHub(issues={5: ready()})
-    legacy = {"tier": "high", "acceptance_criteria": ["Legacy criterion"], "duplicate_of": None,
-              "duplicate_reason": "", "rationale": "Old combined act."}
-    agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1"))
-    composed, _ = role(gh, agent, triaged=False, **ROUTES)
-    composed.control.record_unpaid_leg(
-        RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
-        issue=5, number=5, head="", runtime="claude", leg_class="agent", result={"triage": legacy})
-    taken = tick(composed)
-    assert not dispatched(taken, AgentKind.STEWARD) and not dispatched(taken, AgentKind.TRIAGE)
-    (comment,) = gh.comments_with("issue", 5, "Acceptance criteria")
-    assert "Legacy criterion" in comment.body
-    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.HIGH)]
-    assert "Legacy criterion" in agent.tasks[0].prompt
-
-
-# ── The light acts hold no dispatch slot (owner, 2026-10-14) ───────────────────────
 
 
 class SplitAgent:

@@ -70,11 +70,6 @@ def done(tier: Tier | None = Tier.MED, minute: float = 0, **steward) -> tuple[Le
     return steward_leg(minute - 0.5, **steward), triage_leg(minute, tier)
 
 
-def legacy_leg(minute: float = 0, tier: Tier = Tier.MED, *, steward: Steward = Steward(), **fields) -> LegEnd:
-    """A TRIAGE leg recorded by the combined act: its result carries both halves."""
-    return LegEnd(AgentKind.TRIAGE, at(minute), False, triage=Triage(tier, **fields), steward=steward)
-
-
 def fix_leg(kind: AgentKind, minute: float, tier: Tier | None = None, *, machine: bool = False) -> LegEnd:
     return LegEnd(kind, at(minute), machine, head=HEAD if kind is not AgentKind.RESOLVE else "", tier=tier)
 
@@ -170,24 +165,6 @@ def test_neither_light_act_holds_a_heavy_dispatch_slot():
 
 
 # ── derive: combined-result legs recorded before the split ──────────────────
-
-
-def test_a_combined_triage_leg_satisfies_both_acts_and_keeps_its_comment_key():
-    leg = legacy_leg(0, Tier.LOW, steward=Steward(("Esc closes it",)), rationale="One handler.")
-    legs = {issue_key(3): (leg,)}
-    world = WorldState(issues=(ready(),))
-    assert state_of(world, legs) == TriageNote(leg.triage, iso(0), leg.steward)
-    (comment,) = actions(derive(world, Local(now=NOW, legs=legs), H), H)
-    assert comment.key == f"triage:issue:3:{iso(0)}" and "- [ ] Esc closes it" in comment.body
-
-    posted = WorldState(issues=(ready(comments=(noted(),)),))
-    assert state_of(posted, legs) == Dispatch(AgentKind.RESOLVE, tier=Tier.LOW)
-
-
-def test_a_combined_triage_leg_with_a_duplicate_stops_for_a_human():
-    leg = legacy_leg(0, steward=Steward((), 2, "Same"))
-    stop = state_of(WorldState(issues=(ready(),)), {issue_key(3): (leg,)})
-    assert stop == NeedsHuman(StopReason.DUPLICATE, iso(0), duplicate_of=2, detail="Same")
 
 
 def test_a_triage_leg_with_no_usable_result_is_stewarded():

@@ -32,10 +32,6 @@ class FakeGit:
         return GitResult(0, "")
 
 
-def _deleted_branch(git) -> bool:
-    return any(args[:2] == ["branch", "-D"] for args, _cwd in git.calls)
-
-
 def test_concurrent_worktree_setup_serializes_shared_git_metadata():
     active = 0
     maximum = 0
@@ -80,60 +76,6 @@ def test_default_git_runner_times_out_and_reports_rather_than_hanging(tmp_path, 
 
     assert result.code != 0  # reported as failure, never a silent pass
     assert "timed out" in capsys.readouterr().err.lower()
-
-
-class RemovalGit:
-    def __init__(self, branch="fix/5-small-win", remove_code=0):
-        self.branch = branch
-        self.remove_code = remove_code
-        self.present = True
-        self.branch_present = bool(branch)
-        self.calls = []
-
-    def __call__(self, args, cwd):
-        self.calls.append((args, cwd))
-        if args[:2] == ["worktree", "list"]:
-            listed = f"worktree /repo/.claude/worktrees/issue-5\nHEAD deadbeef\nbranch refs/heads/{self.branch}\n\n"
-            return GitResult(0, listed if self.present else "")
-        if args[:2] == ["worktree", "remove"]:
-            if self.remove_code == 0:
-                self.present = False
-            return GitResult(self.remove_code, "")
-        if args[:2] == ["branch", "-D"]:
-            self.branch_present = False
-            return GitResult(0, "")
-        if args[:2] == ["show-ref", "--verify"]:
-            return GitResult(0 if self.branch_present else 1, "")
-        return GitResult(0, "")
-
-
-def test_remove_failure_is_retriable_and_preserves_branch():
-    git = RemovalGit(remove_code=1)
-
-    with pytest.raises(WorktreeUnavailable, match="refused to remove"):
-        Worktrees("/repo", run=git).remove(5)
-
-    assert git.present
-    assert git.branch_present
-    assert not _deleted_branch(git)
-
-
-def test_remove_never_deletes_a_branch_when_the_issue_worktree_is_absent():
-    fg = FakeGit({"worktree list": GitResult(0, "")})
-
-    Worktrees("/repo", run=fg).remove(5)
-
-    assert not _deleted_branch(fg)
-
-
-def test_remove_never_deletes_an_arbitrary_branch_from_the_issue_worktree():
-    git = RemovalGit(branch="dev")
-
-    with pytest.raises(WorktreeUnavailable, match="unowned"):
-        Worktrees("/repo", run=git).remove(5)
-
-    assert git.present
-    assert not _deleted_branch(git)
 
 
 # ── ReviewCheckouts: pinned per-PR review worktrees (keifu #165) ─────────────

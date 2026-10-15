@@ -106,9 +106,8 @@ def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | N
     receipt = run.receipt or {}
     ran = leg is not LegClass.MACHINE
     triage = parse_triage(receipt.get("triage")) if kind is AgentKind.TRIAGE and ran else None
-    # A legacy combined TRIAGE record carries the steward's fields too.
-    raw = receipt.get("steward" if kind is AgentKind.STEWARD else "triage")
-    steward = steward_from_record(raw, run.issue) if kind in (AgentKind.STEWARD, AgentKind.TRIAGE) and ran else None
+    raw = receipt.get("steward")
+    steward = steward_from_record(raw, run.issue) if kind is AgentKind.STEWARD and ran else None
     if log is not None and steward is not None and steward != steward_from_record(raw):
         log(f"issue #{run.issue}: a recorded steward claim names the issue itself; dropped")
     evidence = recorded_keys(receipt.get("evidence")) if kind is AgentKind.FIX_CI and ran else frozenset()
@@ -128,9 +127,9 @@ _RUNTIMES = frozenset(r.value for r in RuntimeName)
 
 def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:
     """The acceptance criteria of the issue's latest agent-ended STEWARD leg
-    (or legacy combined TRIAGE leg), as derive reads it, as a prompt list:
+    as derive reads it, as a prompt list:
     agent text the steward's parser laundered, so still untrusted."""
-    ends = tuple(end for r in runs if r.kind in (AgentKind.STEWARD.name, AgentKind.TRIAGE.name)
+    ends = tuple(end for r in runs if r.kind == AgentKind.STEWARD.name
                  and (end := leg_end(r)) is not None)
     found = latest_steward(ends)
     criteria = found.steward.acceptance_criteria if found is not None and found.steward is not None else ()
@@ -1052,7 +1051,7 @@ def compose_role(
     owner_id = owner_identity(cfg, role)
     supervisor = ProcessSupervisor(supervision_dir(cfg, role))
     spend = spend_reconciler(cfg, control)
-    recovery = RecoveryCoordinator(supervisor, control, worktrees, spend, owner_id)
+    recovery = RecoveryCoordinator(supervisor, control, spend, owner_id)
 
     def cap(value: float) -> Money | None:
         return Money.from_major("USD", value) if value > 0 else None

@@ -3,10 +3,7 @@
 STEWARD writes testable acceptance criteria, flags a suspected duplicate,
 proposes a genuine dependency ("blocked by");
 TRIAGE grades the difficulty tier that routes the issue (owner, 2026-10-14:
-one act each, on its own model). Before the split one TRIAGE result carried
-all of it, and such legacy records still read back: `steward_from_record`
-accepts any record with the steward's keys, so a combined TRIAGE leg satisfies
-both acts.
+one act each, on its own model).
 
 Provenance: the agent's structured output is an untrusted claim. It becomes a
 `Triage` or `Steward` only through `parse_triage` / `parse_steward`, which the
@@ -94,8 +91,7 @@ def _text(raw: object, limit: int) -> str | None:
 
 def parse_triage(raw: object) -> Triage | None:
     """The agent's output, or a recorded (already laundered) result read back
-    from SQLite, as a Triage; None if malformed. Keys of the legacy combined
-    result (criteria, duplicate) are ignored."""
+    from SQLite, as a Triage; None if malformed."""
     if not isinstance(raw, Mapping):
         return None
     tier = parse_tier(raw.get("tier"))
@@ -155,11 +151,8 @@ def parse_steward(
 
 
 def steward_from_record(raw: object, issue: int | None = None) -> Steward | None:
-    """A recorded (already laundered) steward result for `issue`. A legacy
-    combined TRIAGE record has the same keys, so it reads as one; a tier-only
-    record (post-split TRIAGE) lacks the criteria list and reads as None.
-    Records always carry the list (`Steward.record`), even when empty. A claim
-    naming the issue itself (a corrupt record: the write-time parse forbids
+    """A recorded (already laundered) steward result for `issue`. Records always carry the
+    list (`Steward.record`), even when empty. A claim naming the issue itself (a corrupt record: the write-time parse forbids
     it) is dropped, never acted on."""
     def other(n: int) -> bool:
         return n != issue

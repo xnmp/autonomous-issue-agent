@@ -232,7 +232,7 @@ class FixLegs:
 
     def _resolve_branch(self, issue: int, title: str) -> str:
         fallback = f"fix/{issue}-{slugify(title) or 'issue'}"
-        recovered = self.worktrees.branch_for_issue(issue, fallback)
+        recovered = self.worktrees.branch_for_issue(issue)
         return recovered if recovered and harness_branch_issue(recovered) == issue else fallback
 
     async def _light(self, action: RunAgent, subject) -> None:

@@ -53,11 +53,6 @@ class _Supervisor:
         return ()
 
 
-class _Worktrees:
-    def prune_validate(self) -> int:
-        return 0
-
-
 class _NoTrustedUsage:
     """No request evidence remains, so terminal recovery uses a zero estimate."""
 
@@ -142,7 +137,7 @@ def _live_leg(store, run_id: str, cap: Money) -> RunId:
 
 def _sweeper(store, now: datetime, spend=None):
     return RecoveryCoordinator(
-        _Supervisor(), store, _Worktrees(), spend or _NoTrustedUsage(), OWNER, reservation_grace=GRACE, now=lambda: now
+        _Supervisor(), store, spend or _NoTrustedUsage(), OWNER, reservation_grace=GRACE, now=lambda: now
     )
 
 
