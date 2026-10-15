@@ -33,6 +33,7 @@ from ...adapters.dashweb import ghdata, system, usage, verification
 from ...adapters.dashweb.legs import read_legs
 from ...adapters.github import GitHubGateway
 from ...adapters.operator_effects import GitHubOperatorEffects, build_operator_effects
+from ...adapters.reload import remote_repo
 from ...domain import dashboard as dash
 from ...domain.backoff import LegEnd
 from ...domain.contracts import daily_budget_scope
@@ -212,7 +213,7 @@ class Backend:
         self._observations = _Observations(ttl_s=observe_ttl_s, **(
             {"executor": observe_executor} if observe_executor is not None else {}))
         self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
-        self._self_repo = system.remote_repo(self.harness_root)
+        self._self_repo = remote_repo(self.harness_root)
 
     # ── configuration ──
     @property

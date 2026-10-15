@@ -88,6 +88,7 @@ class LegRun:
     started_at: datetime | None
     completed_at: datetime
     receipt: Mapping[str, object] | None
+    leg_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -795,7 +796,7 @@ class SQLiteControlStore:
             for start in range(0, len(wanted), 500):
                 chunk = wanted[start:start + 500]
                 rows = db.execute(
-                    "SELECT kind, issue, number, head, runtime, started_at, ended_at, leg_class, "
+                    "SELECT leg_id, kind, issue, number, head, runtime, started_at, ended_at, leg_class, "
                     "session_id, result_json FROM legs WHERE repository=? AND role IN ('fix', 'review') "
                     f"AND ended_at IS NOT NULL AND issue IN ({','.join('?' for _ in chunk)}) "
                     "ORDER BY ended_at, rowid",
@@ -972,6 +973,36 @@ class SQLiteControlStore:
                 (key, self._stamp_now()),
             )
             return "new"
+
+    def claim_key_within(self, key: str, prefix: str, per_day: int) -> str:
+        """`claim_key`, except that a new claim under `prefix` is refused,
+        answering "full", once `per_day` keys under it were claimed this UTC
+        day. One transaction, so daemons sharing the store share the ceiling."""
+        if not key.startswith(prefix) or not prefix or per_day < 0:
+            raise ValueError("a bounded key lies under a non-empty prefix with a non-negative ceiling")
+        now = self._now()
+        midnight = _stamp(now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0))
+        with self._transaction() as db:
+            row = db.execute("SELECT state FROM idempotency WHERE key=?", (key,)).fetchone()
+            if row is not None:
+                return str(row["state"])
+            claimed = db.execute(
+                "SELECT COUNT(*) FROM idempotency WHERE key >= ? AND key < ? AND claimed_at >= ?",
+                (*_prefix_range(prefix), midnight),
+            ).fetchone()[0]
+            if claimed >= per_day:
+                return "full"
+            db.execute("INSERT INTO idempotency(key, state, claimed_at) VALUES (?, 'claimed', ?)", (key, _stamp(now)))
+            return "new"
+
+    def done_keys(self, prefix: str) -> frozenset[str]:
+        """The confirmed keys under `prefix`."""
+        if not prefix:
+            raise ValueError("a key prefix is required")
+        with self._read() as db:
+            rows = db.execute("SELECT key FROM idempotency WHERE key >= ? AND key < ? AND state = 'done'",
+                              _prefix_range(prefix)).fetchall()
+        return frozenset(str(row["key"]) for row in rows)
 
     def confirm_key(self, key: str) -> None:
         with self._transaction() as db:
@@ -1253,6 +1284,7 @@ def _leg_run(row: sqlite3.Row) -> LegRun:
         _parse_stamp(row["started_at"]) if row["started_at"] else None,
         _parse_stamp(row["ended_at"]),
         receipt,
+        str(row["leg_id"]),
     )
 
 
@@ -1518,6 +1550,11 @@ def _json_value(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [_json_value(item) for item in value]
     raise TypeError(f"{type(value).__name__} is not JSON-serializable control data")
+
+
+def _prefix_range(prefix: str) -> tuple[str, str]:
+    """The key range holding exactly the keys under `prefix`: a primary-key range scan."""
+    return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
 def _stamp(value: datetime) -> str:

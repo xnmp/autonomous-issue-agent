@@ -29,8 +29,11 @@ from ..domain.outcome import (
     LegClass,
     classify_leg,
     leg_cap,
+    machine_end,
     resumable_session,
 )
+from ..domain.actions import ROUTED_ACTS
+from ..domain.gaps import parse_harness_gap
 from ..domain.policy import question_text
 from ..domain.review import parse_verdict
 from ..domain.triage import criteria_wanted, offered_blockers, offered_duplicates, parse_steward, parse_triage
@@ -57,6 +60,7 @@ from .control_store import (
 )
 
 LEG_ROLES = frozenset({"fix", "review"})
+_FIX_KINDS = frozenset(kind.name for kind in ROUTED_ACTS)
 _UNLIMITED_ACCOUNTING_MICROS = 9_000_000_000_000_000_000
 _SUMMARY_LIMIT = 20000
 
@@ -288,6 +292,10 @@ class AccountingRuntime(AgentRuntime):
                         steward = parse_steward(result.structured, offered_duplicates(task.schema), issue,
                                                 criteria_wanted(task.schema), offered_blockers(task.schema))
             verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
+            # A fix leg's harness defect report, bounded here; the fix role reports that one exists (`domain.gaps`).
+            gap = (parse_harness_gap(result.structured.get("harness_issue"))
+                   if kind in _FIX_KINDS and leg is not LegClass.MACHINE and isinstance(result.structured, dict)
+                   else None)
             # Synchronous: an await here would let a drain's cancel skip the receipt and settlement. Never
             # raises (`Worktrees.remote_head`); "" when unread, and derive then decides on what GitHub shows.
             end_head = self.remote_head(task.branch) if task.branch and self.remote_head else ""
@@ -300,6 +308,10 @@ class AccountingRuntime(AgentRuntime):
                 # A review's parsed verdict: the harness submits it (and can
                 # resubmit it after a crash) without buying the review again.
                 **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
+                # Kept on this host only: a gap report publishes none of it (`domain.gaps`).
+                **({"harness_issue": gap.record()} if gap is not None else {}),
+                # A machine end's class, from a fixed vocabulary: what a stall report names.
+                **({"end": machine_end(result)} if leg is LegClass.MACHINE else {}),
                 # Triage's laundered result: the tier. Steward's: criteria, suspected duplicate.
                 **({"triage": triage.record()} if triage is not None else {}),
                 **({"steward": steward.record()} if steward is not None else {}),

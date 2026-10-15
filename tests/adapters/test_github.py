@@ -492,3 +492,27 @@ def test_a_rerun_posts_the_failed_jobs_rerun():
 def test_a_refused_rerun_post_raises():
     with pytest.raises(RuntimeError, match="refused"):
         GitHubGateway("o/r", runner=FakeRunner({"api --method POST": ""})).rerun_failed_checks(900)
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ({"visibility": "public", "permissions": {"push": True}, "has_issues": True, "archived": False}, ("public", True)),
+    ({"visibility": "private", "permissions": {"push": False}, "has_issues": True, "archived": False}, ("private", False)),
+    ({"visibility": "public", "permissions": {"push": True}, "has_issues": False, "archived": False}, ("public", False)),
+    ({"visibility": "public", "permissions": {"push": True}, "has_issues": True, "archived": True}, ("public", False)),
+    ({"visibility": "internal"}, ("internal", False)),  # no permissions block: cannot file
+])
+def test_filing_facts_read_visibility_and_whether_this_credential_can_file_issues(answer, expected):
+    import json as _json
+
+    from issue_agent.adapters.github import GitHubGateway
+    calls = []
+    gw = GitHubGateway("o/r", runner=lambda argv, token: calls.append(argv) or _json.dumps(answer))
+    assert gw.for_repo("x/h").filing_facts() == expected
+    assert calls == [["gh", "api", "repos/x/h"]]
+
+
+@pytest.mark.parametrize("answer", ["", "[]", '{"visibility": "secret"}', '{"name": "r"}'])
+def test_unreadable_filing_facts_raise(answer):
+    from issue_agent.adapters.github import FixObservationIncomplete, GitHubGateway
+    with pytest.raises(FixObservationIncomplete):
+        GitHubGateway("o/r", runner=lambda argv, token: answer).filing_facts()

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -188,24 +187,3 @@ def scan_proc_daemons(proc_root: str = "/proc") -> tuple[dict[str, set[str]], bo
             continue
         roles.update(argument for argument in argv if argument in ROLE_NAMES)
     return found, read_foreign
-
-
-def remote_repo(root: str) -> str:
-    """Return the origin as owner/name; an unavailable origin is cosmetic."""
-    try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return ""
-    if result.returncode:
-        return ""
-    url = result.stdout.strip().removesuffix(".git")
-    if url.startswith("git@") and ":" in url:
-        return url.split(":", 1)[1]
-    marker = "github.com/"
-    return url.split(marker, 1)[1] if marker in url else ""

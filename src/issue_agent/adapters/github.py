@@ -634,6 +634,22 @@ class GitHubGateway:
         self._run = runner or _subprocess_runner
         self._progress = progress
 
+    def for_repo(self, repo: str) -> "GitHubGateway":
+        """The same identity on another repository: the fix role files harness
+        gaps into the harness's own repository with its credential (ADR 0001)."""
+        return GitHubGateway(repo, self.identity, self._run, self._progress)
+
+    def filing_facts(self) -> tuple[str, bool]:
+        """The repository's visibility ("public", "internal" or "private") and
+        whether this credential can file issues there (push permission,
+        issues enabled, not archived). An unreadable answer raises."""
+        data = self._gh_json(["api", f"repos/{self.repo}"])
+        if not isinstance(data, dict) or data.get("visibility") not in ("public", "internal", "private"):
+            raise FixObservationIncomplete(f"{self.repo}: visibility unreadable")
+        permissions = data.get("permissions")
+        push = isinstance(permissions, dict) and permissions.get("push") is True
+        return str(data["visibility"]), push and data.get("has_issues") is True and data.get("archived") is False
+
     def _gh(self, args: list[str]) -> str:
         try:
             return self._run(["gh", *args], self.identity.env_token())

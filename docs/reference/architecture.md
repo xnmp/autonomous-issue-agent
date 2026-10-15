@@ -253,6 +253,17 @@ that matters is not "wrong answer" but "loop that bills forever":
   `fix-infra-outcome` receipt; a run ended without a normal-return receipt is a
   machine end. Nothing is stored for it, and only the money caps bound the
   retries. Pre-admission refusals mint no run, so they retry each poll at $0.
+- harness gaps (`domain/gaps.py`, `policy.gap_actions`): a fix leg's
+  `harness_issue` report (bounded into its receipt and the journal, never
+  published) and a live item's act whose machine-end streak reached
+  `STALL_STREAK` (teardowns and provider windows aside) become a keyed
+  `ReportGap` of harness facts into the harness's own repository. Act files
+  it when the token has no open issue of that title (gap kind and target)
+  there and otherwise comments, once per item per gap, at most
+  `GAP_REPORTS_PER_DAY` new keys per UTC day (`claim_key_within`); a
+  confirmed key reaches policy as a local fact (`Local.reported`) and is never
+  asked for again. Judgment stops are never filed; only a human's `ai-ready`
+  queues a gap issue (ADR 0001).
 - derived attempt caps (`domain/state.py`): consecutive agent legs of one act
   without progress, REVIEW counted per head, and bot change-request rounds,
   each stopping at `needs-human`; nothing is stored for them.
@@ -484,6 +495,9 @@ change request; neither constructible empty),
 `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),
+`domain/gaps.py` (harness gaps the harness files about itself: an agent's
+bounded `harness_issue` report, kept on the host, and how a report names its
+target),
 `domain/labels.py`, `domain/leg.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),

@@ -6,7 +6,7 @@ never on a mock call log.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Union
 
@@ -140,6 +140,26 @@ class FileIssue:
 
 
 @dataclass(frozen=True)
+class ReportGap:
+    """Report one harness gap (`domain.gaps`) in `repo`, the harness's own
+    repository (ADR 0001): file it when no open issue of `title` is there,
+    else comment `recurrence` on that issue; either write once per key, ever.
+    Harness-generated text only: no agent text is published."""
+
+    repo: str
+    title: str
+    key: str
+    # Out of the repr the daemon logs for every decided and every failed action.
+    body: str = field(repr=False)
+    recurrence: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(v, str) or not v.strip() for v in (self.repo, self.title, self.key, self.body,
+                                                                  self.recurrence)):
+            raise ValueError("a gap report names its repository, title, key, body and recurrence")
+
+
+@dataclass(frozen=True)
 class SetIssueState:
     """Reopen or close an issue with one comment; act writes only when a fresh
     read shows the other state, then reads it back."""
@@ -210,6 +230,7 @@ Action = Union[
     RerunFailedJobs,
     LinkBlockedBy,
     FileIssue,
+    ReportGap,
     SetIssueState,
     RunAgent,
 ]
@@ -234,4 +255,5 @@ __all__ = [
     "Target",
     "UpdateBranch",
     "RerunFailedJobs",
+    "ReportGap",
 ]

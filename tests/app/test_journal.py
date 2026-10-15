@@ -315,3 +315,17 @@ def test_status_summary_without_a_repo_pairs_the_cap_with_the_global_total():
     out = "\n".join(spend_status_lines(50.0, all_repositories_spent=12.5))
 
     assert "$12.50" in out and "$50.00 cap" in out
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ({"title": "Sandbox lacks libglib", "body": "$ ldd app"}, {"title": "Sandbox lacks libglib", "body": "$ ldd app"}),
+    ({"title": "t" * 10_000}, None),  # malformed: not journalled
+    (None, None),
+])
+def test_a_legs_harness_report_is_journalled_on_this_host(tmp_path, raw, expected):
+    """A gap issue publishes no agent text; the report stays in the receipt and here."""
+    structured = {"status": "pushed", "summary": "s", **({"harness_issue": raw} if raw is not None else {})}
+    rt, journal = _runtime(tmp_path, AgentResult(False, status="pushed", structured=structured))
+    rt.set_context("fix", "RESOLVE", 5, 5)
+    _leg(rt)
+    assert _settled(journal.path)[0].get("harness_issue") == expected

@@ -26,7 +26,8 @@ from ..domain.evidence import ChangeRequest, CiFailures
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
-from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order
+from ..domain.gaps import GapTarget
+from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order, gap_actions
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, ModelRoute, Tier
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, pr_key
@@ -34,6 +35,7 @@ from ..domain.triage import states_criteria
 from ..domain.trust import as_untrusted
 from ..domain.world import Comment, WorldState
 from ..adapters.act import GitHubAct
+from ..adapters.reload import remote_repo
 from .config import HarnessConfig
 from .planners import tasks
 from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, steward_criteria, stderr_log
@@ -99,6 +101,10 @@ class FixSettings:
     triage_budget_usd: float = 2.0
     # An empty scratch directory: the light acts read only their prompt.
     triage_cwd: str = ""
+    # Where harness gaps are filed: the harness checkout's GitHub origin, or ""
+    # (off: `harness_gap_repo`); and whether a report may name and link the target.
+    harness_repo: str = ""
+    target_public: bool = False
 
     def route(self, tier: Tier | None) -> ModelRoute:
         return self.routes.get(tier or DEFAULT_TIER) or ModelRoute(RuntimeName(self.runtime), None)
@@ -341,9 +347,35 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
                 waiting[pr_key(pr.number)] = waiting[issue_key(issue)]
         # The base branch's own CI is not an item: one issue per failing workflow, no lifecycle.
         base = base_ci_actions(world.base_ci, settings.base_branch, settings.harness.marker)
+        gaps = gap_actions(local.legs, states, GapTarget(settings.repository, settings.target_public),
+                           settings.harness_repo, settings.harness.marker, local.reported)
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
-                           light=slots.light, waiting_since=waiting) + base
+                           light=slots.light, waiting_since=waiting) + base + gaps
     return choose
+
+
+def harness_gap_repo(cfg: HarnessConfig, gateway, log: Callable[[str], None]) -> tuple[str, bool]:
+    """Where the fix role files harness gaps, and whether the target is public
+    (a report then names and links it; else it is only "a private target"). The
+    harness checkout's GitHub origin, written with FIX_BOT_TOKEN (ADR 0001);
+    "" (off, logged) when the checkout has no GitHub origin, the credential
+    cannot file issues there (no push, issues off, archived: a clone of
+    someone else's harness files nothing upstream), or either repository's
+    facts are unreadable. Read once per daemon start."""
+    harness = remote_repo(cfg.harness_root) if cfg.harness_root else ""
+    if not harness:
+        log("fix: harness gaps are not filed: the harness checkout has no GitHub origin")
+        return "", False
+    try:
+        (_, writable), (visibility, _) = gateway.for_repo(harness).filing_facts(), gateway.filing_facts()
+    except Exception as exc:  # noqa: BLE001 - unknown facts fail toward not filing
+        log(f"fix: harness gaps are not filed: repository facts unreadable: {str(exc)[:200]}")
+        return "", False
+    if not writable:
+        log(f"fix: harness gaps are not filed: the fix credential cannot file issues in {harness}")
+        return "", False
+    log(f"fix: harness gaps are filed in {harness}")
+    return harness, visibility == "public"
 
 
 def compose_fix_daemon(
@@ -352,12 +384,14 @@ def compose_fix_daemon(
     """The fix role: every Action but REVIEW, paid legs up to
     FIX_DISPATCH_CONCURRENCY."""
     log = log or stderr_log("fix")
+    harness_repo, target_public = harness_gap_repo(cfg, gateway, log)
     settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, cfg.fixer_runtime.value,
                            "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
                            routes={tier: cfg.fix_route(tier) for tier in Tier}, triage_route=cfg.triage_route(),
                            steward_route=cfg.steward_route(),
                            triage_budget_usd=cfg.triage_budget_usd,
-                           triage_cwd=os.path.join(cfg.state_dir, "triage"))
+                           triage_cwd=os.path.join(cfg.state_dir, "triage"),
+                           harness_repo=harness_repo, target_public=target_public)
     task_config = tasks.FixTaskConfig(cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,
                                       cfg.fix_model, runtime=cfg.fixer_runtime)
 
@@ -378,4 +412,5 @@ def compose_fix_daemon(
     return role
 
 
-__all__ = ["FixLegs", "FixSettings", "compose_fix_daemon", "fix_actions", "fix_choose", "human_reply"]
+__all__ = ["FixLegs", "FixSettings", "compose_fix_daemon", "fix_actions", "fix_choose", "harness_gap_repo",
+           "human_reply"]

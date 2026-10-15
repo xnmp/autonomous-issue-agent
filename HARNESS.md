@@ -254,7 +254,21 @@ of base, and has no PR or was pushed after a human closed its PR), with the
 agent's summary, unchanged, as the description (AGENT.md step 9 has the agent
 write the whole of it). An agent's question is recorded with its
 leg and carried by the `needs-human` stop comment; reply on that thread to
-answer it. Harness comments are recognised by the marker and a harness login
+answer it. A harness defect is not a question: a fix leg reports it in
+`harness_issue`, kept on the harness host only (the leg receipt in the control
+store, and the journal). The fix role then files an issue titled
+`Harness gap: …` in the harness's own repository (the checkout's GitHub
+origin, written with `FIX_BOT_TOKEN`, which needs Issues write there), as it
+does for an act whose legs keep ending as machine ends past the one-hour
+backoff cap (teardowns and provider quota windows aside). The issue holds
+harness facts only: the gap kind, the target and item (a non-public target only
+as "a private target": no name, digest or link), the leg id, kind and runtime, and the end class;
+never agent text. One issue per gap kind and target, a comment per further
+item, at most `GAP_REPORTS_PER_DAY` (10) reports a day; a report GitHub
+refuses is logged once and dropped. The daemon logs at start whether it
+files: off when the checkout has no GitHub origin, or the credential lacks
+push there or issues are off. No automatic pickup takes a gap issue up; a
+human may mark one `ai-ready` (ADR 0001). Harness comments are recognised by the marker and a harness login
 together. The review role writes through the same `act` step: one GitHub
 review per head under the review bot, keyed in SQLite and read back before
 submission (slice 5c).

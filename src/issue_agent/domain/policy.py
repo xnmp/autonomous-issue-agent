@@ -14,14 +14,18 @@ from datetime import datetime, timezone
 
 from .actions import (
     ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel,
-    RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
+    ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
+from .backoff import STALL_STREAK, LegEnd, machine_streak
 from .checks import BaseCI
 from .ci import GREEN_CONCLUSIONS, base_verdicts, parse_timestamp
+from .gaps import GapTarget
+from .outcome import OUTSIDE_ENDS
 from .labels import Label
 from .state import (
     Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Rerun,
-    Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP, BLOCKER_TAG, REVIEW_ROUND_CAP, TRIAGE_TAG,
+    Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP, BLOCKER_TAG, HARNESS_GAP_PREFIX, REVIEW_ROUND_CAP,
+    TRIAGE_TAG,
 )
 
 _WHY = {
@@ -157,6 +161,62 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str) -> tuple[Act
     return tuple(out)
 
 
+_GAP_FOOTER = ("Filed by the harness from its own records: no agent-written text is published here. No automatic "
+               "pickup takes this issue up; a human judges it and may mark it `ai-ready`.")
+
+
+def gap_actions(
+    legs: Mapping[ItemKey, tuple[LegEnd, ...]], live: Iterable[ItemKey], target: GapTarget, harness_repo: str,
+    marker: str, reported: frozenset[str] = frozenset(),
+) -> tuple[Action, ...]:
+    """The harness gaps to report into `harness_repo` ("" = off; `domain.gaps`):
+    each agent end on an item `legs` holds that reported a harness defect,
+    and each act of a `live` item whose machine ends (teardowns and provider
+    windows aside) reached STALL_STREAK in a row. One issue per gap kind and
+    target (its generated title), so several items share it; one report per
+    item per gap, ever: a key in `reported` (act's confirmed keys) is not
+    asked for again. Nothing here looks at a judgment stop. Harness facts
+    only: the item, the leg's id, kind and runtime, an end class from a fixed
+    vocabulary; a non-public target unnamed and unlinked."""
+    if not harness_repo:
+        return ()
+    out: dict[str, ReportGap] = {}
+
+    def report(item: ItemKey, slug: str, kind: str, leg: LegEnd, what: str, details: str) -> None:
+        key = f"gap:{harness_repo}:{target.repo}:{item.target.name.lower()}:{item.number}:{slug}"
+        if key in out or key in reported:
+            return
+        link = target.link(item.number)
+        facts = (f"`{target.label}#{item.number}` ({'issue' if item.target is Target.ISSUE else 'PR'})"
+                 f"{f', {link}' if link else ''}: the {leg.kind.name} leg `{leg.leg_id or 'unrecorded'}` "
+                 f"({leg.runtime or 'runtime unrecorded'}), ended {leg.ended_at.isoformat()}: {what}.")
+        title = f"{HARNESS_GAP_PREFIX} {kind} in {target.label}"
+        out[key] = ReportGap(harness_repo, title, key,
+                             f"{marker}\n**Harness gap**: {kind}.\n\n- {facts}\n\n{details}\n\n{_GAP_FOOTER}",
+                             f"{marker}\n**Seen again**: {facts}\n\n{details}")
+
+    for item in sorted(legs, key=lambda k: k.sort_key):
+        for leg in legs[item]:
+            if leg.harness_gap:
+                ended = ("it asked a human too" if leg.question is not None
+                         else "stopped at a per-leg cap" if leg.capped else "returned")
+                report(item, "agent-report", "agent-reported harness defect", leg, ended,
+                       f"The agent's report is in the leg receipt `{leg.leg_id or 'unrecorded'}` on the harness "
+                       "host (the control store's `harness_issue`) and in that deployment's journal.")
+    for item in sorted(live, key=lambda k: k.sort_key):
+        ends = legs.get(item, ())
+        for act in sorted({end.kind for end in ends}, key=lambda k: k.name):
+            run = [end for end in machine_streak(ends, act) if end.end not in OUTSIDE_ENDS]  # newest first
+            if len(run) >= STALL_STREAK:
+                # The leg that reached the streak, and the streak's start: stable while it grows.
+                report(item, f"machine-{act.name.lower()}", f"{act.name}: {STALL_STREAK} consecutive machine ends",
+                       run[-STALL_STREAK], f"machine end `{run[-STALL_STREAK].end or 'no receipt'}`",
+                       f"Its {act.name} legs have ended without an agent result since {run[-1].ended_at.isoformat()}, "
+                       "so their retry backoff is at its one-hour cap. Each leg's end class and receipt are on "
+                       "the harness host (control store and journal).")
+    return tuple(out.values())
+
+
 def _inert(text: str) -> str:
     # A zero-width space breaks an @mention and Markdown image syntax, and an
     # escaped `<` any raw HTML (an <img>), without changing what a reader sees.
@@ -211,5 +271,5 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
 
 
 __all__ = ["QUESTION_LIMIT", "actions", "base_ci_actions", "base_title",
-           "blocker_closed_comment", "blocker_comment", "dispatch_order", "needs_human_key",
+           "blocker_closed_comment", "blocker_comment", "dispatch_order", "gap_actions", "needs_human_key",
            "question_text", "triage_comment"]

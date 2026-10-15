@@ -15,6 +15,17 @@ FIX_SCHEMA: dict = {
         "status": {"type": "string", "enum": ["pushed", "blocked", "failed"]},
         "summary": {"type": "string"},
         "needs": {"type": "string", "description": "if blocked, exactly what is needed"},
+        # Not a question for a human: the harness files it in its own repository (domain.gaps).
+        "harness_issue": {
+            "type": "object",
+            "description": "a defect in what the harness gives you (sandbox, toolchain, credentials, rules), "
+                           "never the repository's code; the harness files it",
+            "properties": {
+                "title": {"type": "string", "description": "one line naming the defect"},
+                "body": {"type": "string", "description": "the reproduction: the command you ran and its output"},
+            },
+            "required": ["title", "body"],
+        },
     },
     "required": ["status", "summary"],
 }

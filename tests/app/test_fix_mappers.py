@@ -27,7 +27,7 @@ H = Harness("fix-bot", "review-bot")
 def run(kind="RESOLVE", number=5, issue=5, head="", leg="agent", minute=1, started=0, **kw) -> LegRun:
     receipt = kw.pop("receipt", {"leg": leg, "session": "s1", "runtime": "claude"} if leg else None)
     start = T0 + timedelta(minutes=started) if started is not None else None
-    return LegRun(kind, number, issue, head, start, T0 + timedelta(minutes=minute), receipt)
+    return LegRun(kind, number, issue, head, start, T0 + timedelta(minutes=minute), receipt, kw.pop("leg_id", ""))
 
 
 # ── recorded runs → leg ends ─────────────────────────────────────────────────
@@ -52,7 +52,7 @@ def test_each_run_belongs_to_its_issue_or_pr_item(recorded, item):
 
 def test_a_returned_agent_leg_is_one_attempt_with_its_window():
     end = leg_end(run("FIX_CI", number=100, head="h1", leg="agent", started=0, minute=3))
-    assert end == LegEnd(AgentKind.FIX_CI, T0 + timedelta(minutes=3), False, "h1", started_at=T0)
+    assert end == LegEnd(AgentKind.FIX_CI, T0 + timedelta(minutes=3), False, "h1", started_at=T0, runtime="claude")
 
 
 @pytest.mark.parametrize("kind,leg,raw,keys", [
@@ -74,6 +74,15 @@ def test_a_fix_ci_agent_end_reads_back_the_failures_it_was_handed(kind, leg, raw
 def test_an_agent_end_reads_back_the_remote_head_it_left(leg, raw, head):
     end = leg_end(run("FIX_CI", number=100, head="h1", receipt={"leg": leg, "end_head": raw}))
     assert end is not None and end.end_head == head
+
+
+@pytest.mark.parametrize(("raw", "runtime"), [
+    ("codex", "codex"), ("claude", "claude"),
+    ("Codex", ""), ("<img src=x>", ""), ("c" * 10_000, ""), (None, ""), (7, ""), (["codex"], ""), ({}, ""),
+])
+def test_only_a_known_runtime_name_is_read_back_for_publication(raw, runtime):
+    end = leg_end(run("RESOLVE", receipt={"leg": "agent", "runtime": raw}))
+    assert end is not None and end.runtime == runtime
 
 
 def _after_capped_resume(capped: object, leg: str = "agent"):
@@ -335,6 +344,9 @@ class _Control:
     def held_targets(self, repository):
         return frozenset()
 
+    def done_keys(self, prefix):
+        return frozenset()
+
 
 def test_an_unreadable_lifetime_read_holds_paid_work_and_says_so():
     def unreadable(_issue):
@@ -353,3 +365,85 @@ def test_an_unreadable_lifetime_read_holds_paid_work_and_says_so():
     loc = facts(WorldState(issues=(IssueView(5, labels=frozenset({Label.AI_READY})),)))
     assert loc.headroom is False and loc.lifetime_capped == frozenset()
     assert len(lines) == 1 and "spend snapshot unavailable" in lines[0]
+
+
+# ── harness gaps: recorded legs reach the tick as harness-fact reports ───────
+
+
+def _choose_gaps(runs, live_numbers, harness_repo="xnmp/autonomous-issue-agent", target_public=True):
+    from issue_agent.app.fix import FixSettings, fix_choose
+    from issue_agent.app.tick import Slots
+    from issue_agent.domain.actions import ReportGap
+
+    world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in live_numbers))
+    loc = Local(now=T0 + timedelta(days=1), legs=local_legs(runs))
+    settings = FixSettings("o/r", True, "dev", "claude", "", H, harness_repo=harness_repo, target_public=target_public)
+    chosen = fix_choose(settings, lambda _m: None)(world, derive(world, loc, H), Slots(0, 0), loc)
+    return [a for a in chosen if isinstance(a, ReportGap)]
+
+
+def test_a_recorded_harness_report_reaches_the_tick_as_one_report_of_harness_facts():
+    report = {"title": "Sandbox lacks libglib", "body": "$ ldd app"}
+    runs = [run(receipt={"leg": "asked", "question": "Release once fixed", "harness_issue": report},
+                leg_id="leg-7"),
+            run(number=6, issue=6, receipt={"leg": "agent", "harness_issue": {"title": 7}}),  # malformed record
+            run(number=8, issue=8, receipt={"leg": "machine", "harness_issue": report})]  # a machine end reports nothing
+    (filed,) = _choose_gaps(runs, (5, 6, 8))
+    assert filed.title == "Harness gap: agent-reported harness defect in o/r" and "`leg-7`" in filed.body
+    assert "libglib" not in filed.title + filed.body + filed.recurrence  # agent text stays on the host
+    assert _choose_gaps(runs, (5, 6, 8), harness_repo="") == []  # no harness repository resolved: nothing
+
+
+def test_a_recorded_machine_stall_reaches_the_tick_with_its_end_class_and_teardowns_do_not():
+    from issue_agent.domain.backoff import STALL_STREAK
+
+    def ends(end):
+        return [run(minute=m, receipt={"leg": "machine", "end": end}, leg_id=f"l{m}") for m in range(STALL_STREAK)]
+
+    (filed,) = _choose_gaps(ends("runtime_unavailable"), (5,), target_public=False)
+    assert "machine end `runtime_unavailable`" in filed.body and "o/r" not in filed.title + filed.body
+    assert _choose_gaps(ends("operator_cancelled"), (5,)) == []
+    (unrecorded,) = _choose_gaps(ends("Traceback /home/op/x.py"), (5,))  # an unknown class is never published
+    assert "machine end `no receipt`" in unrecorded.body and "Traceback" not in unrecorded.body
+
+
+class _Facts:
+    """The fix credential's view of each repository: (visibility, can file issues); a missing repo is unreadable."""
+
+    def __init__(self, facts: dict[str, tuple[str, bool]], repo: str = "o/r"):
+        self.facts, self.repo = facts, repo
+
+    def for_repo(self, repo):
+        return _Facts(self.facts, repo)
+
+    def filing_facts(self):
+        return self.facts[self.repo]
+
+
+PUBLIC, PRIVATE = ("public", True), ("private", True)
+
+
+@pytest.mark.parametrize("origin,facts,expected", [
+    ("https://github.com/xnmp/aia.git", {"xnmp/aia": PUBLIC, "o/r": PUBLIC}, ("xnmp/aia", True)),
+    ("git@github.com:xnmp/aia.git", {"xnmp/aia": PUBLIC, "o/r": PRIVATE}, ("xnmp/aia", False)),  # opaque, unlinked
+    ("ssh://git@github.com/xnmp/aia.git", {"xnmp/aia": PRIVATE, "o/r": ("internal", True)}, ("xnmp/aia", False)),
+    ("https://github.com/upstream/aia", {"upstream/aia": ("public", False), "o/r": PUBLIC}, ("", False)),  # not ours
+    ("https://github.com/xnmp/aia", {"o/r": PUBLIC}, ("", False)),  # unreadable facts fail toward not filing
+    ("git@gitlab.com:xnmp/aia.git", {"xnmp/aia": PUBLIC, "o/r": PUBLIC}, ("", False)),  # not GitHub
+    ("https://evil.example/github.com/xnmp/aia", {"xnmp/aia": PUBLIC, "o/r": PUBLIC}, ("", False)),
+    (None, {"o/r": PUBLIC}, ("", False)),  # no origin at all
+])
+def test_gaps_file_into_the_harness_checkouts_origin_only_when_the_credential_can_file_there(
+        tmp_path, origin, facts, expected):
+    import subprocess
+    from types import SimpleNamespace
+
+    from issue_agent.app.fix import harness_gap_repo
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    if origin:
+        subprocess.run(["git", "-C", str(tmp_path), "remote", "add", "origin", origin], check=True)
+    lines: list[str] = []
+    cfg = SimpleNamespace(harness_root=str(tmp_path), repo="o/r")
+    assert harness_gap_repo(cfg, _Facts(facts), lines.append) == expected  # type: ignore[arg-type]
+    assert len(lines) == 1 and ("not filed" in lines[0]) == (expected[0] == "")
