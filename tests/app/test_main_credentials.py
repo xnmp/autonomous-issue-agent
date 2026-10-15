@@ -38,3 +38,16 @@ def test_a_reload_after_the_plaintext_was_removed_refuses_when_the_credential_is
 
     with pytest.raises(ValueError, match="FIX_BOT_TOKEN"):
         _validate_reload_candidate(env, "fix")
+
+
+@pytest.mark.parametrize(("role", "name"), [("fix", "FIX_BOT_TOKEN"), ("review", "REVIEW_BOT_TOKEN")])
+def test_a_reload_candidate_without_the_roles_credential_is_refused_offline(tmp_path, role, name):
+    """#443: the restarted daemon would refuse to start; refusing the reload keeps the running one."""
+    env_file = tmp_path / "agent.env"
+    env_file.write_text('REPO=o/r\nFIX_BOT=fix-bot\nREVIEW_BOT=review-bot\n')
+    env = {"AGENT_ENV": str(env_file), "HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"}
+
+    with pytest.raises(ValueError, match=f"{name} is not set"):
+        _validate_reload_candidate(env, role)
+    env_file.write_text(f'REPO=o/r\nFIX_BOT=fix-bot\nREVIEW_BOT=review-bot\n{name}=ghp_x\n')
+    _validate_reload_candidate(env, role)

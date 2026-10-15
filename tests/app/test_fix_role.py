@@ -58,10 +58,6 @@ class FakeGitHub:
     runs: dict[int, str] = field(default_factory=dict)  # run id -> branch; all in progress
     cancelled: list[int] = field(default_factory=list)
     pushed_at: dict[str, str] = field(default_factory=dict)  # name -> last push
-    login: str = FIX_BOT  # who the fix credential acts as
-
-    def viewer_login(self) -> str:
-        return self.login
     closed_at: dict[int, str] = field(default_factory=dict)  # PR -> when a human closed it
     merged: list[tuple[int, str]] = field(default_factory=list)
     closed: list[int] = field(default_factory=list)
@@ -423,19 +419,6 @@ def open_pr(gh: FakeGitHub, issue: int = 5, *, head: str = "h1", ci: str = "pass
         **kw,
     )
     return 100
-
-
-# ── #424: the credential must be FIX_BOT ─────────────────────────────────────
-
-
-def test_the_fix_role_starts_when_its_credential_is_fix_bot_in_either_bot_spelling(role):
-    role(FakeGitHub(login=FIX_BOT + "[bot]"), Agent())
-
-
-@pytest.mark.parametrize("login", ["someone-else", "", "   "])
-def test_the_fix_role_refuses_to_start_when_its_credential_is_not_fix_bot(role, login):
-    with pytest.raises(ValueError, match="FIX_BOT"):
-        role(FakeGitHub(login=login), Agent())
 
 
 # ── RESOLVE → push → PR (Q11) ────────────────────────────────────────────────

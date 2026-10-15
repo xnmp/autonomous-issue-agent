@@ -206,7 +206,8 @@ _placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
 # fields the operator is CORRECT to leave untouched:
 #   REVIEW_BOT_TOKEN set → static-token path; the GH_APP_* block is unused
 #   no token             → GitHub App path; the App fields are required
-# (app/main.py `_app_identity` resolves App token → static token → ambient.)
+# (app/identity.py resolves the reviewer as App token → REVIEW_BOT_TOKEN, else
+# the role refuses to start; there is no ambient fallback.)
 _placeholder_vars="$_placeholder_vars REVIEW_BOT"
 # REVIEW_BOT_TOKEN may live as a systemd credential (encrypted file, readable
 # only inside the unit): then it is set, though not in this shell.
@@ -268,7 +269,24 @@ if command -v gh >/dev/null 2>&1; then
       && ok "gh pr list works ($REPO)" \
       || bad "gh pr list failed for $REPO (fix gh auth/network first)"
 
-    # Everything above ran as the FIXER (ambient gh auth). The reviewer uses a
+    # The fix role refuses to start unless FIX_BOT_TOKEN acts as FIX_BOT
+    # (app/identity.py); say so before the service learns it at boot.
+    if [ -z "${FIX_BOT_TOKEN:-}" ] && [ -f "$HOME/.config/credstore.encrypted/FIX_BOT_TOKEN" ]; then
+      warn "FIX_BOT_TOKEN is a systemd credential: its identity is not probed here (the fix role verifies it at start)"
+    elif [ -n "${FIX_BOT_TOKEN:-}" ]; then
+      _fix_login=$(GH_TOKEN="$FIX_BOT_TOKEN" gh api user --jq '.login' 2>/dev/null | head -1 | tr -d '[:space:]')
+      case "$_fix_login" in *[!A-Za-z0-9_-]*) _fix_login="" ;; esac
+      if [ -z "$_fix_login" ]; then
+        bad "FIX_BOT_TOKEN is invalid, expired, or lacks read:user (gh api user failed)"
+      elif [ "$(_normalize_login "$_fix_login")" != "$(_normalize_login "${FIX_BOT:-}")" ]; then
+        bad "FIX_BOT_TOKEN belongs to '$_fix_login' but FIX_BOT says '${FIX_BOT:-unset}' — the fix role refuses to start"
+      else
+        ok "fix identity '$_fix_login' authenticates as FIX_BOT"
+      fi
+    fi
+
+    # The repo checks above ran as the operator's ambient gh login (the CLI's own
+    # writes; no daemon uses it). The reviewer uses a
     # different identity, and nothing checked it could reach the repo at all —
     # a bot account whose collaborator invite was never accepted authenticates
     # fine and then 404s on every PR, which surfaces as "the reviewer silently
@@ -280,12 +298,12 @@ if command -v gh >/dev/null 2>&1; then
     elif [ -n "${REVIEW_BOT_TOKEN:-}" ]; then
       # gh prints its error BODY to stdout on a bad token, so an unguarded
       # capture yields `{ "message": ...` and reports it as a login. A GitHub
-      # login is [A-Za-z0-9-] only, so charset-validating the first line both
+      # login is [A-Za-z0-9_-] only, so charset-validating the first line both
       # sanitises the value and detects the failure.
       _bot_login=$(GH_TOKEN="$REVIEW_BOT_TOKEN" gh api user --jq '.login' 2>/dev/null \
                    | head -1 | tr -d '[:space:]')
       case "$_bot_login" in
-        *[!A-Za-z0-9-]*) _bot_login="" ;;
+        *[!A-Za-z0-9_-]*) _bot_login="" ;;
       esac
       if [ -z "$_bot_login" ]; then
         bad "REVIEW_BOT_TOKEN is invalid, expired, or lacks read:user (gh api user failed)"

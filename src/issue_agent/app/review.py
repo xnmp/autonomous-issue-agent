@@ -265,22 +265,14 @@ def compose_review_daemon(
 
     `checkouts` pins each leg to its head; by default a detached per-PR
     worktree of TARGET_DIR (keifu #165: reviews of the operator's live
-    checkout produced phantom change requests under fresh SHAs). Two
-    misconfigurations no retry can fix refuse to start (ValueError, so `main`
-    exits INVALID_CONFIG): no TARGET_DIR, and a review credential that is not
-    REVIEW_BOT (it posted a duplicate review on every retry, since the
-    read-back looked for the wrong login)."""
+    checkout produced phantom change requests under fresh SHAs). No TARGET_DIR
+    refuses to start (ValueError, so `main` exits INVALID_CONFIG); `main` has
+    already verified the credential acts as REVIEW_BOT (`identity.py`)."""
     log = log or stderr_log("review")
     if checkouts is None:
         if not cfg.target_dir:
             raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
         checkouts = ReviewCheckouts(cfg.target_dir, worktree_root=cfg.worktree_root)
-    acting_as = gateway.viewer_login()
-    if not login_eq(acting_as, cfg.review_bot):
-        raise ValueError(
-            f"REVIEW_BOT is {cfg.review_bot!r} but the review credential acts as "
-            f"{acting_as or 'nobody GitHub would name'!r}: set REVIEW_BOT to the "
-            "credential's login, or give the review role REVIEW_BOT's credential")
     harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
     task_config = tasks.ReviewTaskConfig(cfg.repo, cfg.base_branch, cfg.review_prompt, cfg.review_budget_usd,
                                          cfg.review_model)

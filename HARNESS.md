@@ -67,7 +67,13 @@ Important fields:
   reserved in its own scopes (they never block the new one) until a deployment
   of that repository runs again. Prefer a different `--name` for another
   repository.
-- `FIX_BOT` must differ from `REVIEW_BOT`.
+- `FIX_BOT` must differ from `REVIEW_BOT`. Each role acts only on its own
+  credential (`app/identity.py`, ADR 0001): the fix role on `FIX_BOT_TOKEN`,
+  the review role on its GitHub App when `GH_APP_KEY_FILE` is readable, else
+  `REVIEW_BOT_TOKEN`. A role without one refuses to start (`INVALID_CONFIG`);
+  neither falls back to the operator's `gh` login. At start each role asks
+  GitHub for its credential's login and refuses unless it is its `FIX_BOT` /
+  `REVIEW_BOT`; both stay configured because each role reads the other's.
   Changing either login re-posts a stop comment under the new login on the next tick (a copy under the old
   login reads as human); older harness comments under the old login then count as human replies, so
   prefer draining in-flight items first (#424).
@@ -409,8 +415,8 @@ change request is answered by an `ADDRESS_REVIEW` leg, and three attempts on
 one head (unusable verdicts, refusals), or repeated bot
 change-request rounds, stop the pull request at `needs-human`. To buy a fresh
 review of the same head, dismiss the bot's review on GitHub. The role refuses
-to start without `TARGET_DIR`, or when its credential's login is not
-`REVIEW_BOT`.
+to start without `TARGET_DIR`, without a review credential, or when its
+credential's login is not `REVIEW_BOT`.
 
 ### Family activation (deleted)
 

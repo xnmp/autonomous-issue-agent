@@ -375,6 +375,7 @@ def test_build_role_does_not_reload_env_when_already_provided(tmp_path, monkeypa
             {
                 "REPO": "o/r",
                 "FIX_BOT": "fix-bot",
+                "FIX_BOT_TOKEN": "ghp_fix",  # the fix role refuses to start without it (#443)
                 "STATE_DIR": str(state / "fix"),
                 "REVIEW_STATE_DIR": str(state / "review"),
             },
@@ -399,6 +400,7 @@ def test_build_role_self_loads_env_when_called_standalone_without_one(tmp_path, 
     state = _machine_state(monkeypatch, tmp_path)
     monkeypatch.setenv("REPO", "o/r")
     monkeypatch.setenv("FIX_BOT", "fix-bot")  # required since review P1R-7
+    monkeypatch.setenv("FIX_BOT_TOKEN", "ghp_fix")  # the fix role refuses to start without it (#443)
     monkeypatch.setenv("STATE_DIR", str(state / "fix"))
     monkeypatch.setenv("REVIEW_STATE_DIR", str(state / "review"))
     monkeypatch.delenv("AGENT_ENV", raising=False)

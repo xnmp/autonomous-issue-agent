@@ -38,6 +38,7 @@ from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
 from .config import default_state_dir as config_default_state_dir
 from .doctor import doctor_findings, identity_findings
+from .identity import LOGIN
 
 # …/src/issue_agent/app/cli.py → the harness checkout (plugin/ and config/).
 HARNESS_ROOT = os.path.dirname(
@@ -279,9 +280,6 @@ def detect_base_branch(target_dir: str, repo: str = "", sample: int = 20) -> tup
 
 
 # ── identity prompts (init) ──────────────────────────────────────────────────
-# A login is [A-Za-z0-9-], an App bot adds `[bot]`; the filter also rejects
-# the JSON error body gh prints to stdout for a bad token.
-_LOGIN_CHARSET = re.compile(r"\A[A-Za-z0-9-]+(\[bot\])?\Z")
 # Ceiling on every operator re-prompt loop (ADR 0012).
 _PROMPT_ATTEMPTS = 3
 
@@ -302,7 +300,7 @@ def _gh_login(env: dict[str, str] | None = None) -> tuple[str, bool]:
         return "", False
     first = (proc.stdout or "").strip().splitlines()[:1]
     login = first[0].strip() if first else ""
-    valid = proc.returncode == 0 and login != "null" and bool(_LOGIN_CHARSET.match(login))
+    valid = proc.returncode == 0 and login != "null" and bool(LOGIN.fullmatch(login))
     return (login if valid else ""), True
 
 
@@ -357,8 +355,8 @@ def prompt_token(var: str, expected_login: str = "") -> str:
         if not login:
             warn("GitHub rejected that token (expired, revoked, or lacking read:user). It will NOT be stored.")
         elif expected_login and normalize_login(login) != normalize_login(expected_login):
-            warn(f"that token belongs to '{login}', not '{expected_login}' — GitHub 422s every approval "
-                 "from the wrong account. It will NOT be stored.")
+            warn(f"that token belongs to '{login}', not '{expected_login}' — the role refuses to start "
+                 "on another account's credential. It will NOT be stored.")
         else:
             ok(f"{var} authenticates as '{login}'")
             return token
@@ -426,9 +424,9 @@ def cmd_init(args) -> int:
                    ("GH_APP_KEY_FILE", _ask("GH App private-key .pem path"))]
     else:
         fields.append(("REVIEW_BOT_TOKEN", prompt_token("REVIEW_BOT_TOKEN", review_bot)))
-    # The App covers review only; without FIX_BOT_TOKEN the fixer acts as the
-    # ambient human account and spends its rate-limit pool (keifu).
-    fields.append(("FIX_BOT_TOKEN", prompt_token("FIX_BOT_TOKEN")))
+    # The App covers review only. The fix role refuses to start without
+    # FIX_BOT_TOKEN or when it is not FIX_BOT's (app/identity.py).
+    fields.append(("FIX_BOT_TOKEN", prompt_token("FIX_BOT_TOKEN", fix_bot)))
     # The same identity findings doctor renders, at config time.
     for finding in identity_findings({k: v for k, v in fields if v}):
         (err if finding.level == "error" else warn)(finding.message)

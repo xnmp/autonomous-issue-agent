@@ -203,9 +203,22 @@ def _levels(findings, needle):
     return {f.level for f in findings if needle in f.message}
 
 
-@pytest.mark.parametrize("env", [{"FIX_BOT_TOKEN": "same", "REVIEW_BOT_TOKEN": "same"}, {}])
-def test_fix_and_review_on_one_credential_is_an_error(env):
+def test_fix_and_review_on_one_credential_is_an_error():
+    env = {"FIX_BOT_TOKEN": "same", "REVIEW_BOT_TOKEN": "same"}
     assert _levels(identity_findings(env), "same credential") == {"error"}
+
+
+@pytest.mark.parametrize("env", [{}, {"GH_APP_ID": "<id>", "GH_APP_INSTALL_ID": "<i>", "GH_APP_KEY_FILE": "/no.pem"}])
+def test_no_credential_for_either_role_says_both_refuse_to_start(env):
+    findings = identity_findings(env)
+    assert _levels(findings, "FIX_BOT_TOKEN is not set: the fix role refuses to start") == {"error"}
+    assert _levels(findings, "the review role refuses to start") == {"error"}
+
+
+def test_an_unreadable_app_key_with_a_review_token_warns_that_the_token_is_used(tmp_path):
+    env = {"FIX_BOT_TOKEN": "a", "REVIEW_BOT_TOKEN": "b", "GH_APP_ID": "1", "GH_APP_INSTALL_ID": "2",
+           "GH_APP_KEY_FILE": str(tmp_path / "missing.pem")}
+    assert [(f.level, "uses REVIEW_BOT_TOKEN" in f.message) for f in identity_findings(env)] == [("warn", True)]
 
 
 @pytest.mark.parametrize("var", ["FIX_BOT_TOKEN", "REVIEW_BOT_TOKEN"])
