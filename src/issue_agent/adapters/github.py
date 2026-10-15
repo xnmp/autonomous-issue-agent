@@ -251,7 +251,7 @@ _LABELS = "labels(first:100){totalCount nodes{name}}"
 # "not merged" (which would re-RESOLVE a done issue). No totalCount: whether
 # it honours `itemTypes` is undocumented, so completeness rests on paging.
 _TIMELINE = ("timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:100{before}){{pageInfo{{hasPreviousPage startCursor}} "
-             "nodes{{... on CrossReferencedEvent{{source{{... on PullRequest{{number state headRefName "
+             "nodes{{... on CrossReferencedEvent{{source{{... on PullRequest{{number state mergedAt headRefName "
              "repository{{nameWithOwner}}}}}}}}}}}}")
 # The newest label applications: when `needs-human` was last applied.
 _LABELED = ("labeled:timelineItems(itemTypes:[LABELED_EVENT],last:100){pageInfo{hasPreviousPage} "
@@ -486,7 +486,9 @@ def parse_merged_harness_prs(items: list, repository: str) -> tuple[PRView, ...]
         if (not isinstance(repo, str) or repo.casefold() != repository.casefold() or type(source.get("number")) is not int
                 or not isinstance(head, str) or not head.startswith(_HARNESS_BRANCH_PREFIX)):
             continue
-        out.append(PRView(number=source["number"], head_ref_name=head, state="MERGED", content_known=False))
+        merged_at = source.get("mergedAt")
+        out.append(PRView(number=source["number"], head_ref_name=head, state="MERGED", content_known=False,
+                          merged_at=merged_at if isinstance(merged_at, str) else ""))
     return tuple(out)
 
 

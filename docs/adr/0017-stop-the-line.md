@@ -26,7 +26,13 @@ risk and little the required checks did not already give.
   close before a streak never holds it back, so whenever a workflow's latest
   completed run is red its issue is open or filed. An open issue whose
   harness PR merged (into a non-default base, where `Closes #` closes
-  nothing) is closed while the base stays red. An open issue from before (no
+  nothing) is closed once a failing run created at or after the merge has
+  completed, and that run files the next issue in the same tick. A run
+  created before the merge never tested the fix, so it neither closes the
+  issue nor files the next one; if the merge's own run passes, green closes
+  the issue as fixed. `needs-human` keeps the issue open: a human's reopen
+  alone is not stable, since the post-merge failure that closed it persists
+  and would close it again. An open issue from before (no
   `since`) counts as its workflow's current streak.
 - **A required workflow's issue is the harness's to fix.** A workflow is
   required when one of its check runs on the base tip carries a context the

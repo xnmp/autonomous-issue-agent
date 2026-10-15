@@ -1503,12 +1503,15 @@ def test_402_a_fix_merged_into_a_non_default_base_that_leaves_it_red_files_the_n
     (issue,) = base_issues(gh).values()
     tick(composed)
     open_pr(gh, issue=issue.number)
-    gh.prs[100] = replace(gh.prs[100], state="MERGED")  # merged outside the harness; `Closes #` closes nothing on dev
+    # merged outside the harness; `Closes #` closes nothing on dev
+    gh.prs[100] = replace(gh.prs[100], state="MERGED", merged_at=_now())
+    gh.base_runs.append(base_run("Smoke", 3, "failure", -1))  # created before the merge: says nothing of the fix
+    tick(composed)
+    assert gh.issues[issue.number].state == "open" and len(base_issues(gh)) == 1
+    gh.base_runs.append(base_run("Smoke", 4, "failure", 5))  # the merge's run is red
     tick(composed)
     assert gh.issues[issue.number].state == "closed"  # not left open and shadowed by its merged PR
-    gh.base_runs.append(base_run("Smoke", 3, "failure", 5))
-    tick(composed)
-    fresh = base_issues(gh)["CI: Smoke failing on dev since sha3"]
+    fresh = base_issues(gh)["CI: Smoke failing on dev since sha4"]
     tick(composed)
     assert [a.number for a in dispatched(tick(composed), AgentKind.RESOLVE)] == [fresh.number]
 

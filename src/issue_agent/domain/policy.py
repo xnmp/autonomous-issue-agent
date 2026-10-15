@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
+from types import MappingProxyType
 
 from .actions import (
     ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel,
@@ -127,23 +128,26 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
             "the harness will not write that link again.")
 
 
-def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str, admitted: Iterable[int] = (),
-                    merged: Iterable[int] = ()) -> tuple[Action, ...]:
+def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
+                    labels: Mapping[int, frozenset[Label]] = MappingProxyType({}),
+                    merged: Mapping[int, str] = MappingProxyType({})) -> tuple[Action, ...]:
     """One issue per workflow per red streak on the base branch, required or
     not (#402, ADR 0017). Green closes the workflow's open issues. A red
     verdict with none open files one, named and keyed by the streak's first
     failing run; once an issue filed for this streak is closed while it stays
     red (a human, a fix's merge), by the first failing run that completed
     after that close. A close by the green before the streak never holds it
-    back. An open issue whose harness PR merged (`merged`; a fix into a
-    non-default base that `Closes #` does not close) is closed while the base
-    stays red, so the next red run files. A required workflow's open issue is
-    readied (`ai-ready`) unless it carries `ai-ready` or `needs-human`
-    (`admitted`)."""
+    back. An open issue whose harness PR merged (`merged`: issue -> merged at;
+    a fix into a non-default base that `Closes #` does not close) is closed
+    once a failing run created at or after the merge has completed, and that
+    run files the next issue in the same tick; a run from before the merge
+    counts for neither, and `needs-human` keeps it open. A required
+    workflow's open issue is readied (`ai-ready`) unless it carries
+    `ai-ready` or `needs-human` (`labels`, of the open issues the fix role
+    reads)."""
     if base_ci is None:
         return ()
     out: list[Action] = []
-    done = frozenset(merged)
     for latest, since, bounded in base_verdicts(base_ci.runs):
         issues, name = workflow_issues(base_ci, latest.workflow, base), _inert(" ".join(latest.workflow.split())[:200])
         opened = [i for i in issues if not i.closed_at]
@@ -151,18 +155,23 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str, admitted: It
             out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
                                                       f"{latest.url} (head `{latest.head_sha}`).") for i in opened)
             continue
-        if opened:
-            out.extend(SetIssueState(i.number, False, f"{marker}\nIts fix merged, but **{name}** still fails on "
-                                                      f"`{base}`: {latest.url}. The next failing run files a fresh "
-                                                      "issue.") for i in opened if i.number in done)
-            continue
         streak = sorted((r for r in base_ci.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
                          and _created(r) >= _created(since)), key=_created)
         closed = {i.title: at for i in issues if (at := parse_timestamp(i.closed_at))}
+        failed = {i.number: next((r for r in streak if _created(r)[0] >= at), None) for i in opened
+                  if (at := parse_timestamp(merged.get(i.number, ""))) and Label.NEEDS_HUMAN not in labels.get(
+                      i.number, frozenset())}
+        ended = {n: r for n, r in failed.items() if r is not None}  # its fix merged, and a later run still fails
+        out.extend(SetIssueState(n, False, f"{marker}\nIts fix merged, but **{name}** still fails on `{base}` "
+                                           f"after it: {r.url}. That failure has an issue of its own.")
+                   for n, r in sorted(ended.items()))
+        if len(ended) < len(opened):
+            continue
         after = max((closed[t] for r in streak if (t := base_title(latest.workflow, base, r.head_sha)) in closed),
                     default=None)
-        first = next((r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed and (
-            after is None or (parse_timestamp(r.completed_at) or after) >= after)), None)
+        first = min(ended.values(), key=_created) if ended else next((
+            r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed and (
+                after is None or (parse_timestamp(r.completed_at) or after) >= after)), None)
         if first is None:
             continue  # closed after every listed failure of the streak: the next failing run files
         title = base_title(latest.workflow, base, first.head_sha)
@@ -170,8 +179,9 @@ def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str, admitted: It
         out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {lead} failing run: {first.url} "
                                     f"(head `{first.head_sha}`).\n\nThe harness closes this issue when it passes; a "
                                     "later failure gets an issue of its own.", f"base-ci:{base}:{title}"))
+    admitted = {n for n, held in labels.items() if Label.AI_READY in held or Label.NEEDS_HUMAN in held}
     out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
-               for n in sorted(base_fix(base_ci, base) - frozenset(admitted)))
+               for n in sorted(base_fix(base_ci, base) - admitted))
     return tuple(out)
 
 

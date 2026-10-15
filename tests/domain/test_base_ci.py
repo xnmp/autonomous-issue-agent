@@ -25,8 +25,9 @@ def _br(run: int, conclusion: str, name: str = "macOS Smoke", hour: int = 0) -> 
     return BaseRun(name, run, f"https://x/runs/{run}", f"sha{run}", conclusion, at, at)
 
 
-def _act(*runs, issues=(), required=None, admitted=()):
-    return base_ci_actions(BaseCI(tuple(runs), tuple(issues), required), "dev", "<!-- m -->", admitted)
+def _act(*runs, issues=(), required=None, labels=None, merged=None):
+    return base_ci_actions(BaseCI(tuple(runs), tuple(issues), required), "dev", "<!-- m -->", labels or {},
+                           merged or {})
 
 
 def _filed(actions) -> list[FileIssue]:
@@ -99,11 +100,47 @@ def test_after_a_close_mid_streak_a_failure_completing_at_or_after_it_files():
     assert filed.title == f"{PREFIX} since sha4"
 
 
-def test_an_open_issue_whose_fix_merged_is_closed_while_red_so_the_next_failure_files():
-    issues = [BaseIssue(40, f"{PREFIX} since sha2")]  # a fix into a non-default base: `Closes #` closed nothing
-    (closed,) = base_ci_actions(BaseCI((_br(2, "failure"),), tuple(issues)), "dev", "<!-- m -->", merged=(40,))
-    assert isinstance(closed, SetIssueState) and closed.number == 40 and not closed.open
-    assert base_ci_actions(BaseCI((_br(2, "failure"),), tuple(issues)), "dev", "<!-- m -->", merged=(41,)) == ()
+MERGED_AT = "2026-10-14T10:00:00Z"
+FIXED = [BaseIssue(40, f"{PREFIX} since sha1")]  # a fix into a non-default base: `Closes #` closed nothing
+FIRST = _run(1, "failure", "09:00:00", "09:30:00")
+BEFORE = _run(2, "failure", "09:50:00", "10:30:00")  # created before the merge, red after it
+
+
+def _closes(actions) -> list[int]:
+    return [a.number for a in actions if isinstance(a, SetIssueState) and not a.open]
+
+
+def test_a_run_created_before_the_fix_merged_neither_closes_its_issue_nor_files():
+    assert _act(FIRST, BEFORE, issues=FIXED, merged={40: MERGED_AT}) == ()
+    # the merge's own run then passes: the issue closes as fixed, and nothing is filed
+    actions = _act(FIRST, BEFORE, _run(3, "success", "10:00:00", "10:40:00"), issues=FIXED, merged={40: MERGED_AT})
+    assert _closes(actions) == [40] and "passes on `dev` again" in actions[0].comment and _filed(actions) == []
+
+
+def test_a_failure_created_at_or_after_the_merge_closes_its_issue_and_files_the_next():
+    after = _run(3, "failure", "10:00:00", "10:40:00")  # the merge's own run
+    actions = _act(FIRST, BEFORE, after, issues=FIXED, merged={40: MERGED_AT})
+    assert _closes(actions) == [40] and "still fails" in actions[0].comment and "runs/3" in actions[0].comment
+    (filed,) = _filed(actions)
+    assert filed.title == f"{PREFIX} since sha3" and filed.key == f"base-ci:dev:{PREFIX} since sha3"
+    # closed, and the next issue open: nothing more
+    closed = [BaseIssue(40, f"{PREFIX} since sha1", "2026-10-14T10:41:00Z"), BaseIssue(41, filed.title)]
+    assert _act(FIRST, BEFORE, after, issues=closed, merged={40: MERGED_AT}) == ()
+
+
+def test_only_an_issue_whose_own_fix_merged_with_a_readable_time_is_closed():
+    after = _run(3, "failure", "10:00:00", "10:40:00")
+    for merged in ({41: MERGED_AT}, {40: ""}, {40: "not a time"}):
+        assert _act(FIRST, after, issues=FIXED, merged=merged) == ()
+
+
+def test_needs_human_keeps_an_issue_open_after_its_fix_merged():
+    # A human reopened it and parked it: the post-merge failure persists, so only the label holds it open.
+    after = _run(3, "failure", "10:00:00", "10:40:00")
+    parked = {40: frozenset({Label.NEEDS_HUMAN})}
+    assert _act(FIRST, after, issues=FIXED, labels=parked, merged={40: MERGED_AT}) == ()
+    assert _closes(_act(FIRST, after, issues=FIXED, labels={40: frozenset({Label.AI_READY})},
+                        merged={40: MERGED_AT})) == [40]  # a reopen without the label is closed again
 
 
 def test_a_title_stays_within_githubs_limit_whatever_the_base_branch():
@@ -132,7 +169,9 @@ OPEN = [BaseIssue(40, f"{PREFIX} since sha2")]
 
 def test_a_required_workflows_open_issue_is_readied_unless_already_ready_or_parked():
     assert READY in _act(_br(2, "failure"), issues=OPEN, required=frozenset({"macOS Smoke"}))
-    assert _act(_br(2, "failure"), issues=OPEN, required=frozenset({"macOS Smoke"}), admitted=(40,)) == ()
+    for held in (Label.AI_READY, Label.NEEDS_HUMAN):
+        assert _act(_br(2, "failure"), issues=OPEN, required=frozenset({"macOS Smoke"}),
+                    labels={40: frozenset({held})}) == ()
 
 
 def test_a_non_required_or_unmapped_workflows_issue_is_not_readied():
