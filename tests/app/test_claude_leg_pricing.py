@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from issue_agent.adapters.accounting_runtime import AccountingRuntime
+from issue_agent.adapters.accounting_runtime import AccountingRuntime, AdmissionCaps
 from issue_agent.adapters.agent_runner import AgentRunner
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -243,7 +243,7 @@ def _accounting(tmp_path, inner, repository="o/r"):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
     wrapper = AccountingRuntime(
-        inner, store, repository, "fix", Money("USD", 50_000_000), None, None, "cfg", "claude",
+        inner, store, repository, "fix", lambda: AdmissionCaps(Money("USD", 50_000_000), None, None, "cfg"), "claude",
         BudgetPolicy({("fix", "RESOLVE"): Money("USD", 10_000_000)}), CLAUDE,
     )
     wrapper.set_context("fix", "RESOLVE", 1, 1)

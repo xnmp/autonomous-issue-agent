@@ -12,7 +12,8 @@ a `warnings` entry, because a dashboard that 500s during an incident is a
 dashboard that is not there during incidents. The only non-200s are 404 (a
 deployment or issue that does not exist) and 400 (a refused label change).
 
-The only writes are two label changes (promote, unblock).
+The writes are two label changes (promote, unblock) and the live settings
+(`settings.write_setting`, ADR 0007 amendment): a refused write is a 400.
 """
 
 from __future__ import annotations
@@ -215,6 +216,23 @@ def create_app(
     )
     async def api_unblock(name: str, number: int):
         return await label_write("unblock", backend.unblock, name, number)
+
+    @app.get("/api/repos/{name}/settings", response_model=contracts.SettingsPayload)
+    async def api_settings(name: str):
+        await require_known(name)
+        try:
+            return await invoke(backend.settings, name)
+        except Exception as exc:  # noqa: BLE001
+            return degraded("settings", exc, settings=[], runtimes=[], efforts={}, models={}, files={})
+
+    @app.post("/api/repos/{name}/settings", response_model=contracts.SettingWriteResult)
+    async def api_set_setting(name: str, body: contracts.SettingWrite):
+        await require_known(name)
+        try:
+            ok, detail, warnings = await invoke(backend.set_setting, name, body.key, body.value, body.scope)
+        except Exception as exc:  # noqa: BLE001
+            ok, detail, warnings = False, f"settings write unavailable ({type(exc).__name__}: {exc})", []
+        return JSONResponse({"ok": ok, "detail": detail, "warnings": list(warnings)}, status_code=200 if ok else 400)
 
     @app.get("/{full_path:path}")
     async def spa(full_path: str):

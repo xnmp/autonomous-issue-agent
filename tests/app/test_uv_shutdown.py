@@ -52,7 +52,7 @@ def sleep(seconds):
 daemon = Daemon("private", lambda: WorldState(),
     lambda w: [RunAgent(AgentKind.RESOLVE, 1)] if active else [],
     ImmediateExecutor(InMemoryGitHub(), run_agent=run), poll_seconds=1,
-    dispatch_capacity=1, shutdown_timeout_seconds=2, cancel_active_dispatches=cancel,
+    dispatch_capacity=lambda: 1, shutdown_timeout_seconds=2, cancel_active_dispatches=cancel,
     terminalize=lambda: print("TERMINALIZED", flush=True), log=lambda s: print(s, flush=True))
 daemon.run_forever(sleep=sleep, now=lambda: 0)
 """

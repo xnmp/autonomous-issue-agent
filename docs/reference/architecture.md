@@ -434,7 +434,11 @@ worktree paths, and resume tokens cannot enter domain objects. Operator
 configuration follows the same ownership rule: `HarnessConfig` field metadata
 is the sole env/coercion/choice table, drives `from_env`, and generates
 `config/agent.env.example`. The immutable config snapshot hash is recorded on
-every reservation and run.
+every reservation and run. Knobs marked `live` (routes, dispatch concurrency,
+the issue and daily caps, the issue pickup) are re-read each tick from the
+same composed env file and swapped in as a new immutable snapshot
+(`app/live_config.py`, ADR 0007 amendment); each leg's receipt names the
+snapshot (`config`) it was admitted under.
 
 Untrusted repository, issue, review, and CI text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
@@ -567,6 +571,8 @@ session),
 `app/identity.py` (each role's GitHub credential, verified against its
 configured login at boot; no credential refuses to start, ADR 0001),
 `app/launchd_main.py`,
+`app/live_config.py` (the live knobs' per-tick snapshot: hash-gated re-read,
+validated, previous kept on refusal),
 `app/main.py`,
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict

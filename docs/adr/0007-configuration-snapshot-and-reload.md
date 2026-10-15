@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/app/config.py src/issue_agent/app/main.py src/issue_agent/adapters/reload.py bin/point-at.sh config/
+Governs: src/issue_agent/app/config.py src/issue_agent/app/main.py src/issue_agent/app/live_config.py src/issue_agent/adapters/reload.py src/issue_agent/adapters/config_files.py src/issue_agent/app/dashweb/settings.py bin/point-at.sh config/
 
 ## Context
 
@@ -34,6 +34,77 @@ code changes are detected from committed HEAD, while the gitignored composed
 env is content-hashed. A valid change closes paid admission, lets active work
 drain while observation continues, and restarts between ticks. Invalid
 candidate configuration does not replace the running snapshot.
+
+### Amendment 2026-10-15: live knobs and dashboard settings
+
+The owner edits operational settings per repo from the dashboard and expects
+them to apply at the next tick, without a restart or a drain. A narrow, typed
+exception carries that:
+
+- A `HarnessConfig` field whose metadata is `live` is a dispatch-only knob:
+  the model routes (`FIX_MODEL`, `FIX_MODEL_<TIER>`, `TRIAGE_MODEL`,
+  `STEWARD_MODEL`, `REVIEW_MODEL`), `FIX_DISPATCH_CONCURRENCY` (at most
+  `MAX_DISPATCH_CONCURRENCY`, the size of a daemon's lazily filled dispatch
+  pool), `ISSUE_SPEND_CAP_USD`, `DAILY_SPEND_CAP_USD` and `ISSUE_PICKUP`.
+  Nothing else is live.
+- Each tick's observation re-reads the same composed `AGENT_ENV` file,
+  only when its bytes changed (`LiveConfig.refresh`). The candidate is parsed
+  by `from_env` and validated with `validation_errors()`, both as a whole and
+  as the boot snapshot with its live knobs (`with_live`). Valid: that merged
+  value becomes the current snapshot, a new immutable object. The re-read is
+  strict: a file that cannot be sourced keeps the current snapshot and is
+  retried next tick, never read back from the inherited environment (which
+  under `point-at.sh` holds every launch-time value). Invalid, or
+  needing a runtime the process did not bind: the previous snapshot stays and
+  the refusal is logged once per file hash.
+- Readers take one whole snapshot: the tick's observation (pickup), local
+  facts (headroom, lifetime cap), dispatch capacity, and each leg's route and
+  admission caps (`AdmissionCaps`, read once per leg before its reservation
+  transaction). Nothing in the composed graph is mutated; the reservation
+  transaction itself is unchanged, so no new crash point exists.
+- The snapshot hash a leg ran under is the effective snapshot's
+  `config_version` (it covers the live values): the leg's environment carries
+  it as before, and its receipt now records it as `config`. The charge's
+  rate-card version still names the boot snapshot's rates, which are not
+  live.
+- `ReloadWatch` fingerprints the env file's restart-requiring part only:
+  every assignment but a live knob's (the deploy manifest without live
+  names) plus the runtimes the role binds (`reload_fingerprint`). A live-only
+  change never reloads; any other change, including a live route onto an
+  unbound runtime, takes the drain-and-restart path above.
+- The dashboard writes settings by editing `config/shared.env` or
+  `config/repos/<name>.env` in place (the last top-level `KEY=` or
+  `export KEY=` line, comments and order kept; a missing key is appended;
+  an indented or compound assignment is refused). It validates the whole
+  composed candidate with `from_env`/`validation_errors()` before an atomic
+  write that keeps the file's mode, then runs `bin/compose-env.sh` for every
+  affected launched deployment and publishes the composed file byte for byte
+  to any installed service snapshot whose REPO and TARGET_DIR match. A
+  failed compose restores the source file and re-applies (recomposes and
+  republishes) every deployment already applied, so an installed service
+  never runs a refused value. Only live knobs are writable and
+  shown, so no secret is ever read or written; each change is journaled
+  (who, key, old and new value) to the deployment's fix journal. The write
+  inherits the dashboard's loopback binding and `x-issue-agent-dashboard`
+  header guard.
+
+`ISSUE_PICKUP=open` moves a trust boundary (ADR 0001): `ai-ready` was the
+human act that authorised paid legs on an issue. In open mode every open
+issue is the harness's to work, except `needs-human` ones (parked) and the
+harness's own gap reports (`domain.state.harness_gap`, so its reports never
+feed back into legs). Whoever can open an issue on the target can then start
+paid legs that hold `FIX_BOT_TOKEN` and read that issue's untrusted text, and
+a fix leg can open issues that the next tick takes up. The owner accepts this
+per deployment; the bounds are the per-issue and daily spend caps and the
+existing leg sandbox. It belongs on repositories whose issue authors the
+owner trusts. Open mode observes every open issue under the same
+`_FIX_MAX_ITEMS` bound as ready mode: a repository with more open issues than
+that fails its fix observation every tick (merges and repairs included) until
+the pickup returns to `ready`. The steward still orders only `ai-ready`
+issues.
+
+Exit: the exception is the `live` metadata. Removing a knob's flag returns it
+to restart semantics; removing every flag deletes the mechanism.
 
 ## Consequences
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 
@@ -31,13 +31,15 @@ from ..domain.gaps import GapTarget
 from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order, gap_actions
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, ModelRoute, Tier
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, pr_key
+from ..domain.state import (DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key,
+                            picked_up, pr_key)
 from ..domain.triage import states_criteria
 from ..domain.trust import as_untrusted
-from ..domain.world import Comment, WorldState
+from ..domain.world import Comment, Pickup, WorldState
 from ..adapters.act import GitHubAct
 from ..adapters.reload import remote_repo
 from .config import HarnessConfig
+from .live_config import LiveConfig
 from .planners import tasks
 from .tick import Choose, Role, Slots, compose_role, dispatch_item, local_legs, run_leg, steward_criteria, stderr_log
 
@@ -90,14 +92,13 @@ class FixSettings:
     repository: str
     auto_merge: bool
     base_branch: str
-    runtime: str
     owner_id: str
     harness: Harness
-    # The route per tier (FIX_MODEL_<TIER>), for TRIAGE (TRIAGE_MODEL) and for
-    # STEWARD (STEWARD_MODEL).
-    routes: Mapping[Tier, ModelRoute] = field(default_factory=dict)
-    triage_route: ModelRoute | None = None
-    steward_route: ModelRoute | None = None
+    # The route of a leg of this kind at this tier (FIX_MODEL_<TIER>,
+    # TRIAGE_MODEL, STEWARD_MODEL), read as the leg starts: routes are live.
+    route: Callable[[AgentKind, Tier | None], ModelRoute]
+    # The issue pickup now in force: the pre-launch re-check applies derive's rule.
+    pickup: Callable[[], Pickup] = lambda: Pickup.READY
     # The reservation of each light leg, STEWARD and TRIAGE alike.
     triage_budget_usd: float = 2.0
     # An empty scratch directory: the light acts read only their prompt.
@@ -106,9 +107,6 @@ class FixSettings:
     # (off: `harness_gap_repo`); and whether a report may name and link the target.
     harness_repo: str = ""
     target_public: bool = False
-
-    def route(self, tier: Tier | None) -> ModelRoute:
-        return self.routes.get(tier or DEFAULT_TIER) or ModelRoute(RuntimeName(self.runtime), None)
 
 
 class FixLegs:
@@ -148,7 +146,7 @@ class FixLegs:
         item = dispatch_item(action)
         if action.kind in ISSUE_ACTS:
             subject = self.gateway.get_issue(action.number)
-            if subject.state != "open" or Label.AI_READY not in subject.labels or Label.NEEDS_HUMAN in subject.labels:
+            if not picked_up(subject, self.settings.harness, self.settings.pickup()) or Label.NEEDS_HUMAN in subject.labels:
                 self.log(f"{action.kind.name} #{action.number}: skipped — issue no longer ready")
                 return
             issue = action.number
@@ -173,7 +171,7 @@ class FixLegs:
             await self._light(action, subject)
             return
         recorded = self.control.leg_runs(self.settings.repository, (issue,))
-        route = self.settings.route(action.tier)
+        route = self.settings.route(action.kind, action.tier)
         runtime, model, effort = route.runtime, route.model, route.effort
         # Every leg of the item, either role's, as derive sees them (#342).
         legs = local_legs(recorded)
@@ -234,8 +232,7 @@ class FixLegs:
         the steward's criteria from the recorded legs."""
         steward = action.kind is AgentKind.STEWARD
         name = action.kind.name
-        route = (self.settings.steward_route or self.settings.triage_route) if steward else self.settings.triage_route
-        route = route or self.settings.route(Tier.LOW)
+        route = self.settings.route(action.kind, None)
         runtime, model, effort = route.runtime, route.model, route.effort
         self.runtime.set_context("fix", name, action.number, action.number, claim_target=action.number)
         try:
@@ -363,15 +360,26 @@ def harness_gap_repo(cfg: HarnessConfig, gateway, log: Callable[[str], None]) ->
 
 def compose_fix_daemon(
     cfg: HarnessConfig, gateway, worktrees, runner, *, log: Callable[[str], None] | None = None,
+    live: LiveConfig | None = None,
 ) -> Role:
     """The fix role: every Action but REVIEW, paid legs up to
-    FIX_DISPATCH_CONCURRENCY."""
+    FIX_DISPATCH_CONCURRENCY. Routes, concurrency, caps and the issue pickup
+    come from `live`'s current snapshot (ADR 0007 amendment)."""
     log = log or stderr_log("fix")
     harness_repo, target_public = harness_gap_repo(cfg, gateway, log)
-    settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, cfg.fixer_runtime.value,
-                           "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
-                           routes={tier: cfg.fix_route(tier) for tier in Tier}, triage_route=cfg.triage_route(),
-                           steward_route=cfg.steward_route(),
+    live = live or LiveConfig(cfg)
+
+    def route(kind: AgentKind, tier: Tier | None) -> ModelRoute:
+        current = live.current
+        if kind is AgentKind.STEWARD:
+            return current.steward_route()
+        if kind is AgentKind.TRIAGE:
+            return current.triage_route()
+        return current.fix_route(tier or DEFAULT_TIER)
+
+    settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, "",
+                           Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot), route,
+                           pickup=lambda: live.current.pickup,
                            triage_budget_usd=cfg.triage_budget_usd,
                            triage_cwd=os.path.join(cfg.state_dir, "triage"),
                            harness_repo=harness_repo, target_public=target_public)
@@ -390,7 +398,7 @@ def compose_fix_daemon(
 
     role = compose_role(cfg, "fix", gateway, runner, make_legs=make_legs, make_act=make_act,
                         choose=fix_choose(settings, log), worktrees=worktrees,
-                        capacity=cfg.fix_dispatch_concurrency, log=log)
+                        capacity=lambda current: current.fix_dispatch_concurrency, live=live, log=log)
     log(f"fix: capabilities: triage=on resolve=on merge={'on' if cfg.auto_merge else 'off'}")
     return role
 

@@ -15,7 +15,8 @@ import json
 import math
 import os
 import re
-from dataclasses import MISSING, asdict, dataclass, field, fields
+from collections.abc import Mapping
+from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from enum import Enum
 
 from ..adapters.control_path import machine_control_authority_root
@@ -40,6 +41,7 @@ from ..domain.pricing import (
 )
 from ..domain.repository import canonical_repository, repository_validation_error
 from ..domain.routing import TIER_LADDER, ModelRoute, Tier, parse_model_route
+from ..domain.world import Pickup
 
 
 def deployment_identity_for_target(repository: str, target_dir: str, role: str) -> str:
@@ -52,13 +54,17 @@ def owner_identity_for_target(repository: str, target_dir: str, role: str) -> st
     return f"{repository}:{role}:{deployment_identity_for_target(repository, target_dir, role)}"
 
 
-def _knob(default, *, env: str = "", coerce: str = "", choices: tuple[str, ...] = ()):
-    """An operator knob: env name defaults to the field name upper-cased."""
+def _knob(default, *, env: str = "", coerce: str = "", choices: tuple[str, ...] = (), live: bool = False):
+    """An operator knob: env name defaults to the field name upper-cased.
+    `live`: a dispatch-only knob a running daemon re-reads each tick (ADR 0007
+    amendment, `LiveConfig`); every other knob takes effect by hot reload."""
     metadata: dict[str, object] = {"coerce": coerce or _default_coercion(default)}
     if env:
         metadata["env"] = env
     if choices:
         metadata["choices"] = choices
+    if live:
+        metadata["live"] = True
     return field(default=default, metadata=metadata)
 
 
@@ -76,6 +82,9 @@ _RUNTIMES = tuple(item.value for item in RuntimeName)
 
 # The review role runs one slot-holding leg at a time (`compose_role` capacity).
 REVIEW_DISPATCH_CAPACITY = 1
+# FIX_DISPATCH_CONCURRENCY changes without a restart, so a daemon's dispatch
+# pool is sized once for this bound (`tick.Daemon`).
+MAX_DISPATCH_CONCURRENCY = 16
 
 
 @dataclass(frozen=True)
@@ -94,27 +103,27 @@ class HarnessConfig:
     # run concurrently up to this bound (one leg per issue). 2 since 2026-08-02:
     # with one slot a single ADDRESS_REVIEW leg held the whole deployment while
     # other PRs' repairs queued.
-    fix_dispatch_concurrency: int = _knob(2)
+    fix_dispatch_concurrency: int = _knob(2, live=True)
     auto_merge: bool = _knob(True)
     merge_method: str = _knob("squash", coerce="choice", choices=("squash", "merge", "rebase"))
     # The fix role's default model on FIXER_RUNTIME (blank: the runtime's own).
-    fix_model: str | None = _knob(None)
+    fix_model: str | None = _knob(None, live=True)
     # The reviewer when the reviewed head's fixer tier is unknown or that tier
     # has no FIX_MODEL_<TIER> spec. With tier specs set, review runs at the
     # fixer's tier (owner, 2026-10-13); independence is the separate leg and
     # REVIEW_BOT identity. Claude reviewers default to opus.
-    review_model: str | None = _knob("gpt-6.1-sol")
+    review_model: str | None = _knob("gpt-6.1-sol", live=True)
     # Routing: the `runtime:model[:effort]` each triage tier's fix legs run on, e.g.
     # `codex:gpt-6-luna:low` or `claude:claude-haiku-5-5`. Blank keeps the fixer
     # runtime with FIX_MODEL for that tier.
-    fix_model_low: str = _knob("")
-    fix_model_med: str = _knob("")
-    fix_model_high: str = _knob("")
-    fix_model_xhigh: str = _knob("")
+    fix_model_low: str = _knob("", live=True)
+    fix_model_med: str = _knob("", live=True)
+    fix_model_high: str = _knob("", live=True)
+    fix_model_xhigh: str = _knob("", live=True)
     # The TRIAGE leg's `runtime:model[:effort]`. Blank runs it on FIX_MODEL_LOW's route.
-    triage_model: str = _knob("")
+    triage_model: str = _knob("", live=True)
     # The STEWARD leg's `runtime:model[:effort]`. Blank runs it on TRIAGE_MODEL's route.
-    steward_model: str = _knob("")
+    steward_model: str = _knob("", live=True)
     # TRIAGE and STEWARD each reserve this, not MAX_BUDGET_USD: a cheap
     # classifier must not hold a fix leg's reservation against the daily caps.
     triage_budget_usd: float = _knob(2.0)
@@ -157,9 +166,13 @@ class HarnessConfig:
     codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = _knob((), coerce="rate_table")
     # Aggregate caps (0 disables): lifetime per issue, per repo per day,
     # host-global per day. SQLite reservations enforce all three atomically.
-    issue_spend_cap_usd: float = _knob(25.0)
-    daily_spend_cap_usd: float = _knob(700.0)
+    issue_spend_cap_usd: float = _knob(25.0, live=True)
+    daily_spend_cap_usd: float = _knob(700.0, live=True)
     global_daily_spend_cap_usd: float = _knob(0.0)
+    # Which open issues the fixer works: `ready` those a human marked
+    # ai-ready; `open` every open issue except needs-human ones and the
+    # harness's own gap reports (`domain.state.picked_up`).
+    issue_pickup: str = _knob(Pickup.READY.value, coerce="choice", choices=tuple(p.value for p in Pickup), live=True)
     # ── internal (no env knob) ──
     agent_md: str = ""
     codex_cost_per_mtok_cached_in: tuple[tuple[str, float], ...] = ()
@@ -174,6 +187,10 @@ class HarnessConfig:
     def config_version(self) -> str:
         """Stable identity of the immutable snapshot used by one admission."""
         return hashlib.sha256(repr(self).encode()).hexdigest()[:16]
+
+    @property
+    def pickup(self) -> Pickup:
+        return Pickup(self.issue_pickup)
 
     @property
     def dispatch_slots(self) -> int:
@@ -202,6 +219,8 @@ class HarnessConfig:
                             ("REVIEW_BUDGET_USD", self.review_budget_usd)):
             if value <= 0:
                 errors.append(f"{name} must be > 0")
+        if self.fix_dispatch_concurrency > MAX_DISPATCH_CONCURRENCY:
+            errors.append(f"FIX_DISPATCH_CONCURRENCY must be <= {MAX_DISPATCH_CONCURRENCY}")
         for name, value in (("AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout),
                             ("AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime),
                             ("CODEX_COST_PER_MTOK_IN", self.codex_cost_per_mtok_in),
@@ -569,3 +588,31 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     values["control_authority_root"] = machine_control_authority_root()
     values["parse_errors"] = tuple(errors)
     return HarnessConfig(**values)
+
+
+# ── live knobs (ADR 0007 amendment) ──────────────────────────────────────────
+# field name -> env name of every live knob.
+LIVE_KNOBS: Mapping[str, str] = {item.name: _env_name(item.name) for item in fields(HarnessConfig)
+                                 if item.metadata.get("live")}
+LIVE_ENV_NAMES = frozenset(LIVE_KNOBS.values())
+
+
+def with_live(boot: HarnessConfig, candidate: HarnessConfig) -> HarnessConfig:
+    """`boot` with `candidate`'s live knobs: the snapshot a tick runs under.
+    The candidate's parse errors come along, so a malformed value in the file
+    invalidates it instead of silently reading as the default."""
+    return replace(boot, parse_errors=candidate.parse_errors,
+                   **{name: getattr(candidate, name) for name in LIVE_KNOBS})
+
+
+def reload_fingerprint(path: str, inherited: Mapping[str, str], role: str) -> str:
+    """The identity of what in an env file needs a restart: every assignment
+    but a live knob's, and the runtimes `role` binds (a live route onto a
+    runtime the process did not bind needs one). The deploy manifest lists
+    knob names, so a newly set live knob is dropped from it too."""
+    assigned = source_env_file(path, inherited, assigned_only=True)
+    kept = {key: value for key, value in assigned.items() if key not in LIVE_ENV_NAMES}
+    if "HARNESS_DEPLOY_KNOBS" in kept:
+        kept["HARNESS_DEPLOY_KNOBS"] = " ".join(sorted(set(kept["HARNESS_DEPLOY_KNOBS"].split()) - LIVE_ENV_NAMES))
+    runtimes = sorted(name.value for name in from_env(assigned).runtimes(role))
+    return hashlib.sha256(json.dumps([sorted(kept.items()), runtimes]).encode()).hexdigest()

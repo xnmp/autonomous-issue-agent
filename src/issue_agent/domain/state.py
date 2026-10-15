@@ -53,8 +53,9 @@ Precedence, the single place it is defined (first match wins, per item):
                Merge, unless a human's standing CHANGES_REQUESTED is on an
                older head (Wait) or GitHub does not report it mergeable and
                unblocked (Wait: branch protection waits on a human).
-               Issue: `ai-ready`, open, no open or merged harness PR,
-               triaged -> RESOLVE.
+               Issue: picked up (`picked_up`: `ai-ready`, or any open
+               issue but the harness's gap reports when ISSUE_PICKUP=open), no
+               open or merged harness PR, triaged -> RESOLVE.
 8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh/open are
                free): an issue act (no PR yet) whose issue GitHub marks
                "blocked by" an open issue, in any repository -> Wait (BLOCKED;
@@ -108,7 +109,8 @@ from .labels import Label
 from .refs import harness_branch_issue
 from .routing import DEFAULT_TIER, Tier, escalate
 from .triage import Steward, Triage
-from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, BlockerRef, Branch, Comment, IssueView, PRView, WorldState
+from .world import (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, BlockerRef, Branch, Comment, IssueView, Pickup, PRView,
+                    WorldState)
 
 ATTEMPT_CAP = 3
 REVIEW_ROUND_CAP = 3
@@ -432,18 +434,39 @@ class _Item:
 
 
 
-# The title of the harness's own gap report (`policy.gap_actions`). No pickup
-# takes an issue up without `ai-ready` today; an automatic mode must exclude
-# FIX_BOT's issues so titled (tests/domain/test_gaps.py pins it per mode).
+# The title of the harness's own gap report (`policy.gap_actions`).
 HARNESS_GAP_PREFIX = "Harness gap:"
+
+
+def harness_gap(issue: IssueView, harness: Harness) -> bool:
+    """A gap report the harness filed on itself: FIX_BOT's issue titled
+    `Harness gap:` (the act layer writes the title, GitHub the author). It
+    never queues itself, so the harness's own reports cannot feed back into
+    paid legs; a human may still mark it `ai-ready`. The base-CI issues share
+    the marker but not the title, and stay pickable. This does not stop a fix
+    leg (which holds FIX_BOT_TOKEN) opening an issue under another title,
+    which open pickup takes up: ADR 0007's amendment accepts that, bounded by
+    the spend caps."""
+    return login_eq(issue.author, harness.fix_bot) and issue.title.startswith(HARNESS_GAP_PREFIX)
+
+
+def picked_up(issue: IssueView, harness: Harness, pickup: Pickup) -> bool:
+    """Whether an issue is the harness's to work: open and marked `ai-ready`,
+    or, when every open issue is picked up, open and not a `harness_gap`.
+    A `needs-human` issue stays an item: step 3 parks it, a reply releases it."""
+    if issue.state != "open" or issue.number <= 0:
+        return False
+    if issue.has(Label.AI_READY):
+        return True
+    return pickup is Pickup.OPEN and not harness_gap(issue, harness)
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
     """Every harness item in `world` mapped to its derived state.
 
-    Items: each open harness PR (head branch `fix/<issue>-`, Q1), and each open
-    `ai-ready` issue with no open or merged harness PR. Anything else is not
-    the harness's.
+    Items: each open harness PR (head branch `fix/<issue>-`, Q1), and each
+    issue `picked_up` under the observation's scope with no open or merged
+    harness PR. Anything else is not the harness's.
     """
     prs = [(p, n) for p in world.prs if p.state == "OPEN" and (n := harness_branch_issue(p.head_ref_name))]
     # An open PR shadows its issue; a merged one means the issue is done, even
@@ -461,7 +484,7 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
               labeled_at=i.needs_human_labeled_at, blocked_by=() if i.number in fixing else i.blocked_by,
               origin=Origin.BASE_FIX if i.number in fixing else Origin.HUMAN)
         for i in world.issues
-        if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
+        if picked_up(i, harness, world.pickup) and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
                # A base-fix PR must fix the base's failures: none of them is the base's to it.
                base=world.base.reports if world.base and world.base.ref == p.base_ref_name and n not in fixing

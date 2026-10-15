@@ -39,6 +39,7 @@ from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, P
 from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
 from .config import REVIEW_DISPATCH_CAPACITY, HarnessConfig
+from .live_config import LiveConfig
 from .planners import tasks
 from .tick import Choose, Slots, Role, compose_role, leg_ends, local_legs, run_item, run_leg, steward_criteria, stderr_log
 
@@ -257,6 +258,7 @@ def _prior_review(pr: PRView, bot: str) -> str:
 
 def compose_review_daemon(
     cfg: HarnessConfig, gateway, runner, *, checkouts=None, log: Callable[[str], None] | None = None,
+    live: LiveConfig | None = None,
 ) -> Role:
     """The review role: REVIEW dispatches only, one at a time.
 
@@ -266,6 +268,7 @@ def compose_review_daemon(
     refuses to start (ValueError, so `main` exits INVALID_CONFIG); `main` has
     already verified the credential acts as REVIEW_BOT (`identity.py`)."""
     log = log or stderr_log("review")
+    live = live or LiveConfig(cfg)
     if checkouts is None:
         if not cfg.target_dir:
             raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
@@ -277,11 +280,12 @@ def compose_review_daemon(
     def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> ReviewLegs:
         return ReviewLegs(gateway, control, ReviewSettings(cfg.repo, owner_id, harness), runtime=runtime,
                           accounting=accounting, checkouts=checkouts, prepare_cwd=prepare_cwd,
-                          task_config=task_config, route=cfg.review_route, log=log)
+                          task_config=task_config, route=lambda tier: live.current.review_route(tier), log=log)
 
     role = compose_role(cfg, "review", gateway, runner, make_legs=make_legs,
                         make_act=lambda dispatch, _control: ReviewAct(dispatch),
-                        choose=review_choose(harness), capacity=REVIEW_DISPATCH_CAPACITY, log=log)
+                        choose=review_choose(harness), capacity=lambda _current: REVIEW_DISPATCH_CAPACITY,
+                        live=live, log=log)
     log(f"review: capabilities: review=on runtime={cfg.reviewer_runtime.value}")
     return role
 

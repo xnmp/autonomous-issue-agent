@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
+from enum import Enum
 
 from .identity import is_bot_login
 from .labels import Label
@@ -193,6 +194,15 @@ class PRView:
         return self.merge_state.upper() == "BEHIND" and not self.is_conflicting()
 
 
+class Pickup(str, Enum):
+    """Which open issues the harness picks up (the ISSUE_PICKUP knob), and so
+    which ones an observation lists. READY: those a human marked `ai-ready`
+    (plus `needs-human` ones, so a release is seen). OPEN: every open issue."""
+
+    READY = "ready"
+    OPEN = "open"
+
+
 @dataclass(frozen=True)
 class WorldState:
     """Everything a single daemon poll observes. A daemon reads only the slice
@@ -213,6 +223,9 @@ class WorldState:
     base: BaseTip | None = None
     # None = unread or not asked for (only the fix role and the dashboard ask).
     base_ci: BaseCI | None = None
+    # The issue scope this observation listed: derive picks up what it covers,
+    # so a READY observation can never be read as listing every open issue.
+    pickup: Pickup = Pickup.READY
 
 
 # Convenience re-export so callers can `from .world import replace`.
@@ -227,6 +240,7 @@ __all__ = [
     "BlockerRef",
     "IssueView",
     "PRView",
+    "Pickup",
     "WorldState",
     "replace",
 ]

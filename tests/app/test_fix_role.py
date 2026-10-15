@@ -19,8 +19,9 @@ import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.github import Accepted, BlockerLinkFacts, GhUnavailable, Refused
-from issue_agent.app.config import from_env
+from issue_agent.app.config import LIVE_KNOBS, from_env
 from issue_agent.app.fix import compose_fix_daemon
+from issue_agent.app.live_config import LiveConfig
 from issue_agent.app.tick import leg_ends
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.contracts import RunId
@@ -30,7 +31,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import MAX_BUDGET_STATUS, AgentResult, ExitReason
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
-from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Review, WorldState
+from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, Pickup, PRView, Review, WorldState
 
 FIX_BOT, REVIEW_BOT = "fix-bot", "review-bot"
 
@@ -77,7 +78,7 @@ class FakeGitHub:
     base_tip: BaseTip | None = field(default_factory=lambda: BaseTip("dev", "b0", ()))
 
     # ── observation ──
-    def build_world(self, base: str, *, filed_by: str = "") -> WorldState:
+    def build_world(self, base: str, *, filed_by: str = "", pickup: Pickup = Pickup.READY) -> WorldState:
         with self.lock:
             now = _now()
             self.observed_by.append(filed_by)
@@ -88,6 +89,7 @@ class FakeGitHub:
                 now=now,
                 base=self.base_tip,
                 base_ci=self._base_ci(filed_by) if filed_by else None,
+                pickup=pickup,
             )
 
     def _base_ci(self, filer: str) -> BaseCI:
@@ -369,7 +371,7 @@ def _classes(composed, *kinds: str) -> list[str | None]:
 
 @pytest.fixture
 def role(tmp_path):
-    def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, *, triaged: bool = True, **env):
+    def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, *, triaged: bool = True, live_file=None, **env):
         cfg = replace(
             from_env(
                 {
@@ -385,7 +387,8 @@ def role(tmp_path):
             control_authority_root=str(tmp_path / "machine-state"),
         )
         worktrees = FakeWorktrees(tmp_path / "worktrees", gh)
-        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log)
+        live = LiveConfig(cfg, str(live_file), read=lambda path: replace(cfg, **live_values(path))) if live_file else None
+        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log, live=live)
         if triaged:
             # Light legs that returned nothing usable: the issue resolves at the
             # default tier with no triage comment (test_triage_routing covers them).
@@ -394,6 +397,13 @@ def role(tmp_path):
         return composed, worktrees
 
     return compose
+
+
+def live_values(path) -> dict:
+    """The live knobs an env file sets, parsed the daemons' way."""
+    env = dict(line.split("=", 1) for line in Path(path).read_text().splitlines() if "=" in line)
+    parsed = from_env({"REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, **env})
+    return {name: getattr(parsed, name) for name in LIVE_KNOBS} | {"parse_errors": parsed.parse_errors}
 
 
 def tick(composed) -> list:
@@ -1713,3 +1723,59 @@ def test_an_unreadable_issue_index_dispatches_no_steward(role, later):
     gh.issue_index = index
     later()
     assert dispatched(tick(composed), AgentKind.STEWARD)
+
+
+# ── ISSUE_PICKUP and live settings (ADR 0007 amendment) ──────────────────────
+
+
+def _unlabelled(number: int = 5, **kw) -> IssueView:
+    return IssueView(number=number, title=kw.pop("title", "Null token crashes"), body="Steps: ...", **kw)
+
+
+def test_open_pickup_resolves_an_unlabelled_issue_and_ready_pickup_leaves_it(role):
+    for pickup, runs in (("ready", 0), ("open", 1)):
+        gh = FakeGitHub(issues={5: _unlabelled()})
+        agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1"))
+        composed, _ = role(gh, agent, ISSUE_PICKUP=pickup)
+        taken = tick(composed)
+        assert len(dispatched(taken, AgentKind.RESOLVE)) == runs
+        assert len(agent.tasks) == runs  # the pre-launch re-check applies the same rule
+
+
+def test_open_pickup_never_dispatches_the_harness_gap_reports(role):
+    gh = FakeGitHub(issues={5: _unlabelled(title="Harness gap: reload watch", author=FIX_BOT)})
+    composed, _ = role(gh, Agent(), ISSUE_PICKUP="open")
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == []
+
+
+def test_a_settings_change_applies_at_the_next_tick_without_a_restart(role, tmp_path):
+    """The owner's flow: pickup and concurrency change in the env file; the
+    running daemon's next tick works under them."""
+    env = tmp_path / "live.env"
+    env.write_text("ISSUE_PICKUP=ready\nFIX_DISPATCH_CONCURRENCY=1\n")
+    gh = FakeGitHub(issues={5: _unlabelled(5), 6: _unlabelled(6, title="Second")})
+    release = threading.Event()
+
+    def blocked(_task):
+        assert release.wait(timeout=10)
+        return AgentResult(False, status="pushed", cost_usd=0.1, session_id="s")
+
+    composed, _ = role(gh, Agent(blocked, blocked), live_file=env)
+    assert tick(composed) == []
+
+    env.write_text("ISSUE_PICKUP=open\nFIX_DISPATCH_CONCURRENCY=2\n")
+    taken = composed.daemon.tick()
+    release.set()
+    composed.daemon.wait_for_dispatches()
+    assert sorted(a.number for a in dispatched(taken, AgentKind.RESOLVE)) == [5, 6]
+
+
+def test_an_invalid_settings_change_keeps_the_daemon_on_its_previous_settings(role, tmp_path):
+    env = tmp_path / "live.env"
+    env.write_text("ISSUE_PICKUP=ready\n")
+    gh = FakeGitHub(issues={5: _unlabelled()})
+    lines: list[str] = []
+    composed, _ = role(gh, Agent(), lines.append, live_file=env)
+
+    env.write_text("ISSUE_PICKUP=open\nFIX_DISPATCH_CONCURRENCY=0\n")
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == []

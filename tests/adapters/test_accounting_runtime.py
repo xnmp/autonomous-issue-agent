@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from issue_agent.adapters.accounting_runtime import AccountingRuntime, _default_claim_target
+from issue_agent.adapters.accounting_runtime import AccountingRuntime, AdmissionCaps, _default_claim_target
 from issue_agent.adapters.codex_runner import CodexRunner, spend_evidence_path, write_spend_evidence
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -69,19 +69,21 @@ def _ended(store, columns="charged_micros, basis"):
         return [tuple(row) for row in db.execute(f"SELECT {columns} FROM legs WHERE state='ended'")]
 
 
+_CAP_FIELDS = ("repository_cap", "global_cap", "issue_cap", "config_version")
+
+
 def _wrapper(tmp_path, runtime, cap=5_000_000, context=("fix", "RESOLVE", 1, 1), **fields):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    caps = AdmissionCaps(**{"repository_cap": Money("USD", cap), "global_cap": None, "issue_cap": None,
+                            "config_version": "cfg", **{k: fields.pop(k) for k in _CAP_FIELDS if k in fields}})
     wrapper = AccountingRuntime(
         **{
             "inner": runtime,
             "store": store,
             "repository": "o/r",
             "role": "fix",
-            "repository_cap": Money("USD", cap),
-            "global_cap": None,
-            "issue_cap": None,
-            "config_version": "cfg",
+            "caps": lambda: caps,
             "runtime_name": "codex",
             "budget_policy": _policy(),
             "rate_table": _rates(),
@@ -706,3 +708,30 @@ def test_an_agent_end_records_no_end_class(tmp_path) -> None:
     wrapper, store = _light_wrapper(tmp_path, "RESOLVE", AgentResult(False, status="pushed", session_id="s"))
     _work(wrapper)
     assert "end" not in _receipt(store)
+
+
+def test_each_leg_is_admitted_under_the_caps_current_when_it_starts_and_records_that_snapshot(tmp_path) -> None:
+    """Live caps (ADR 0007 amendment): the provider is read per leg, so a cap
+    raised between legs admits the next one, and the receipt names the
+    snapshot each leg ran under."""
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1.25, session_id="s", usage=_usage()))
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    current = [AdmissionCaps(Money("USD", 10_000_000), None, None, "snap-1")]
+    wrapper = AccountingRuntime(runtime, store, "o/r", "fix", lambda: current[0], "codex", _policy(), _rates())
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    def leg():
+        result = _work(wrapper, model="gpt-test")
+        store.unlease("o/r", "fix", 1, "o/r:fix")  # the role hands its claim back after each leg
+        return result
+
+    assert leg().status == "ok"
+    current[0] = AdmissionCaps(Money("USD", 1_000_000), None, None, "snap-2")  # below one leg's $2 reservation
+    assert leg().exit_reason is ExitReason.BUDGET_EXHAUSTED
+    current[0] = AdmissionCaps(Money("USD", 10_000_000), None, None, "snap-3")
+    assert leg().status == "ok"
+    assert runtime.calls == 2
+
+    configs = [run.receipt.get("config") for run in store.leg_runs("o/r", (1,)) if run.receipt]
+    assert configs == ["snap-1", "snap-3"]

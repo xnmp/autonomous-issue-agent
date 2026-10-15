@@ -151,3 +151,8 @@ tick writes once), POST answered but not confirmed (the next tick reads it
 back and does not write), POST unanswered (landed: read back and not written
 again; not landed: written on the next tick), and confirm (a replay of a
 settled key that GitHub still shows writes nothing).
+
+The automatic pickup mode exists since 2026-10-15: `ISSUE_PICKUP=open`, a live
+per-deployment knob (ADR 0007 amendment, which records the trust it moves). It
+excludes the gap reports above through `domain.state.harness_gap`; a human's
+`ai-ready` on one is still honoured.

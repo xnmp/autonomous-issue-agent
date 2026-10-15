@@ -22,7 +22,7 @@ from issue_agent.adapters.github import (
     parse_blockers,
     parse_merged_harness_prs,
 )
-from issue_agent.domain.world import BlockerRef, Branch, Push
+from issue_agent.domain.world import BlockerRef, Branch, Pickup, Push
 
 
 def labels(*names: str) -> dict:
@@ -901,3 +901,14 @@ def test_a_merged_harness_prs_merge_time_is_read_and_a_missing_or_malformed_one_
 
     times = [p.merged_at for p in parse_merged_harness_prs([at("2026-10-14T10:00:00Z"), xref(10), at(7)], "o/r")]
     assert times == ["2026-10-14T10:00:00Z", "", ""]
+
+
+def test_open_pickup_lists_every_open_issue_and_ready_pickup_only_labelled_ones():
+    for pickup, labels in ((Pickup.READY, True), (Pickup.OPEN, False)):
+        served = ServedGitHub(issues=[issue_node(n) for n in range(1, 4)])
+        world = GitHubGateway("o/r", runner=served).build_world("dev", pickup=pickup)
+        (query,) = served.asking("issues")
+        assert ('labels:["ai-ready","needs-human"]' in query) is labels
+        assert "states:OPEN" in query
+        assert world.pickup is pickup
+        assert [i.number for i in world.issues] == [1, 2, 3]

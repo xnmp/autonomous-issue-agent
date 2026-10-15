@@ -58,7 +58,7 @@ def _paid(run_agent, name="fix", kind=AgentKind.RESOLVE, **daemon) -> Daemon:
         "decide": lambda _world: [RunAgent(kind, 7)],
         "executor": Executor(FakeGateway(), run_agent=run_agent),
         "poll_seconds": 1,
-        "dispatch_capacity": 1,
+        "dispatch_capacity": lambda: 1,
         **daemon,
     })
 
@@ -109,7 +109,7 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
             RunAgent(AgentKind.REBASE, 534),
         ],
         ex,
-        dispatch_capacity=2,
+        dispatch_capacity=lambda: 2,
     )
     taken = d.tick()
     d.wait_for_dispatches()
@@ -139,7 +139,7 @@ def test_background_dispatch_is_bounded_and_admits_independent_targets():
         lambda: WorldState(),
         lambda _world: [RunAgent(AgentKind.RESOLVE, next(next_issue))],
         Executor(FakeGateway(), run_agent=run_agent),
-        dispatch_capacity=2,
+        dispatch_capacity=lambda: 2,
     )
 
     daemon.tick()
@@ -186,7 +186,7 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
         ),
         Executor(gateway, run_agent=run_agent),
         poll_seconds=1,
-        dispatch_capacity=1,
+        dispatch_capacity=lambda: 1,
     )
 
     with pytest.raises(SystemExit) as stopped:
@@ -516,7 +516,7 @@ def test_suspend_recovery_waits_for_active_dispatch_owner():
         decide,
         Executor(FakeGateway(), run_agent=run_agent),
         poll_seconds=60,
-        dispatch_capacity=1,
+        dispatch_capacity=lambda: 1,
         log=log,
     )
 
@@ -561,7 +561,7 @@ def test_a_second_dispatch_for_a_running_target_is_not_submitted():
         lambda _w: [RunAgent(AgentKind.RESOLVE, 7)] * 2,
         Executor(FakeGateway(), run_agent=run_agent),
         poll_seconds=1,
-        dispatch_capacity=2,
+        dispatch_capacity=lambda: 2,
     )
     try:
         assert d.tick() == [RunAgent(AgentKind.RESOLVE, 7)]
@@ -894,7 +894,7 @@ def _drain_daemon(decisions, run_agent, heartbeat="", capacity=1):
         return list(decisions[len(ticks) - 1]) if len(ticks) <= len(decisions) else []
 
     return Daemon("fix", lambda: WorldState(), decide, Executor(FakeGateway(), run_agent=run_agent),
-                  poll_seconds=1, dispatch_capacity=capacity, heartbeat_path=heartbeat)
+                  poll_seconds=1, dispatch_capacity=lambda: capacity, heartbeat_path=heartbeat)
 
 
 def _wait_until(condition, timeout=5.0):
@@ -995,3 +995,28 @@ def test_light_legs_started_during_the_drain_drain_before_the_exit():
 
     assert stopped.value.code == RELOAD_EXIT_CODE
     assert finished == [7, 8]
+
+
+def test_dispatch_capacity_is_read_at_each_use_so_a_live_change_applies_next_tick():
+    """FIX_DISPATCH_CONCURRENCY is live (ADR 0007 amendment): raising it lets
+    the next tick start more legs; lowering it admits none past the new bound."""
+    release = threading.Event()
+    capacity = [1]
+    issues = iter(range(1, 10))
+
+    daemon = Daemon(
+        "fix", lambda: WorldState(), lambda _world: [RunAgent(AgentKind.RESOLVE, next(issues))],
+        Executor(FakeGateway(), run_agent=lambda _action: release.wait(timeout=5)),
+        dispatch_capacity=lambda: capacity[0],
+    )
+    try:
+        assert len(daemon.tick()) == 1
+        assert daemon.available_dispatch_slots == 0 and daemon.tick() == []
+        capacity[0] = 3
+        assert daemon.available_dispatch_slots == 2
+        assert len(daemon.tick()) == 1 and len(daemon.tick()) == 1
+        capacity[0] = 1
+        assert daemon.available_dispatch_slots == 0 and daemon.tick() == []
+    finally:
+        release.set()
+        daemon.wait_for_dispatches()

@@ -31,8 +31,9 @@ from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
 from ..domain.recovery import RecoveryTrigger
 from ..domain.repository import canonical_repository
-from .config import HarnessConfig, from_env, rate_table, render_agent_md, supervision_dir
+from .config import HarnessConfig, from_env, rate_table, reload_fingerprint, render_agent_md, supervision_dir
 from .fix import compose_fix_daemon
+from .live_config import LiveConfig
 from .review import compose_review_daemon
 from .identity import resolve_role_identity, role_credential
 from .tick import Daemon, Role, leg_sandbox
@@ -168,10 +169,16 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
                                             lambda candidate: GitHubGateway(cfg.repo, candidate).viewer_login(), log)
     cfg = dataclasses.replace(cfg, fix_bot=login) if role == "fix" else dataclasses.replace(cfg, review_bot=login)
     gw = GitHubGateway(cfg.repo, identity, progress=scheduler_progress)
+    # Live knobs re-read each tick from the same env file (ADR 0007
+    # amendment); HOT_RELOAD=0 pins the boot snapshot like every other knob.
+    # Built from the identity-resolved cfg: a live snapshot carries only the
+    # live fields over this one.
+    path = env.get("AGENT_ENV", "") if env.get("HOT_RELOAD", "1") != "0" else ""
+    live = LiveConfig(cfg, path, role=role, log=log)
     if role == "fix":
         worktrees = Worktrees(cfg.target_dir or os.getcwd(), cfg.worktree_root, cfg.base_branch)
-        return _store_woken(compose_fix_daemon(cfg, gw, worktrees, runner), cfg, role, log)
-    return _store_woken(compose_review_daemon(cfg, gw, runner), cfg, role, log)
+        return _store_woken(compose_fix_daemon(cfg, gw, worktrees, runner, live=live), cfg, role, log)
+    return _store_woken(compose_review_daemon(cfg, gw, runner, live=live), cfg, role, log)
 
 
 def _role(argv: list[str] | None) -> str:
@@ -304,9 +311,10 @@ def _serve(role: str) -> None:
         raise SystemExit(ExitCode.INVALID_CONFIG) from exc
     # Hot reload (HOT_RELOAD=0 disables): a change to the harness's HEAD
     # commit (never a mid-edit save — commit-gated so partial changes cannot
-    # load) or to the composed env file restarts this daemon through point-at's
-    # relaunch loop. The concurrent fixer stops admitting work, keeps observing,
-    # and restarts after its paid dispatches drain.
+    # load) or to the composed env file's non-live part restarts this daemon
+    # through point-at's relaunch loop. The concurrent fixer stops admitting
+    # work, keeps observing, and restarts after its paid dispatches drain.
+    # A live knob's change applies at the next tick instead (`LiveConfig`).
     reload_check = None
     if os.environ.get("HOT_RELOAD", "1") != "0":
         from ..adapters.reload import ReloadWatch
@@ -315,6 +323,7 @@ def _serve(role: str) -> None:
             _HARNESS_ROOT,
             files=tuple(p for p in (os.environ.get("AGENT_ENV"),) if p),
             validate=lambda: _validate_reload_candidate(dict(os.environ), role),
+            fingerprint=lambda path: reload_fingerprint(path, dict(os.environ), role),
         )
         reload_check = watch.changed
     notifier.ready(f"{role} daemon initialized")
