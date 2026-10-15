@@ -279,3 +279,15 @@ def test_a_workflow_listing_with_an_unhashable_path_is_unread_and_the_tick_goes_
                     runs={"total_count": 1, "workflow_runs": [run_row()]})
     base = observe(github).base
     assert base.workflows is None and base.runs is not None
+
+
+def test_a_close_by_the_fixer_with_no_closing_commit_is_the_harnesss_own():
+    def closed(event):
+        return {**found(1, "t", "CLOSED", closed="2026-10-15T11:55:46Z"), "timelineItems": {"nodes": [event]}}
+    nodes = [closed({"actor": {"login": "Fix-Bot"}, "closer": None}),  # the harness's close
+             closed({"actor": {"login": "fix-bot"}, "closer": {"oid": "abc"}}),  # its push closed it
+             closed({"actor": {"login": "someone"}, "closer": None}), closed({"actor": None, "closer": None}),
+             closed({"actor": {"login": "fix-bot"}}),  # the closer unread
+             closed({"actor": {"login": 7}, "closer": None}), found(2, "t")]
+    assert [(i.closed_by, i.by_fixer) for i in base_issues(search(*nodes), "fix-bot")] == [
+        ("", True), ("abc", False), ("", False), ("", False), ("", False), ("", False), ("", False)]

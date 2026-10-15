@@ -4,6 +4,7 @@ and a required workflow's issue readied and fixed first. Through
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -96,6 +97,23 @@ def test_green_closes_only_once_no_newer_run_of_the_workflow_is_still_running():
     # An older run still running (or re-run) does not hold it.
     (closed,) = _act(_run(3, "", "09:00:00", "10:01:00"), green, issues=issue)
     assert _closes([closed]) == [40]
+
+
+def test_a_run_created_between_the_ticks_read_and_its_green_close_still_files():
+    # The tick read G green and settled; in the same tick it merged a PR at 10:00:02, whose run X was
+    # created at 10:00:04, and its close landed at 10:00:06. X fails: the base must get an issue.
+    green, x = _run(1, "success", "09:30:00", "09:59:00"), _run(2, "failure", "10:00:04", "10:20:00")
+    harness = BaseIssue(40, f"{PREFIX} since sha0", "2026-10-14T10:00:06Z", by_fixer=True)
+    (filed,) = _act(green, x, issues=[harness])
+    assert filed.title == f"{PREFIX} since sha2"
+    # A human's or a merge's close in the same place anchors on the close: X tested older code.
+    assert _act(green, x, issues=[replace(harness, by_fixer=False)]) == ()
+    # The closing green itself, re-run and failing, is the base red again: it files.
+    (filed,) = _act(_run(3, "success", "08:00:00", "08:30:00"), _run(1, "failure", "09:30:00", "10:40:00"),
+                    issues=[harness])
+    assert filed.title == f"{PREFIX} since sha1"
+    with pytest.raises(ValueError):
+        BaseIssue(40, PREFIX, "2026-10-14T10:00:06Z", "abc", by_fixer=True)  # a commit closed it, not the harness
 
 
 def test_after_any_close_only_a_failure_created_at_or_after_the_last_close_files():
@@ -306,6 +324,11 @@ def test_a_required_workflows_open_issue_is_readied_unless_already_ready_or_park
     for held in (Label.AI_READY, Label.NEEDS_HUMAN):
         assert _act(_br(2, "failure"), issues=OPEN, required=frozenset({"macOS Smoke"}),
                     labels={40: frozenset({held})}) == ()
+
+
+def test_a_required_workflows_issue_is_not_readied_while_its_green_waits_to_settle():
+    pending = (_br(2, "failure"), _br(3, "success", hour=1), _br(4, "", hour=2))
+    assert READY not in _act(*pending, issues=OPEN, required=frozenset({"macOS Smoke"}))
 
 
 def test_a_non_required_or_unmapped_workflows_issue_is_not_readied():

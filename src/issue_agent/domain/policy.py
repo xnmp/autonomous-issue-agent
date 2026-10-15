@@ -19,7 +19,7 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
-from .checks import BaseHealth, BaseRun
+from .checks import BaseHealth, BaseIssue, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
@@ -178,8 +178,8 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
                        for n, r in sorted(ended.items()))
             continue
         # The commit whose merge or push closed the last issue tested the fix, whenever GitHub dates the close.
-        after, closer = max(((at, i.closed_by) for i in issues if (at := parse_timestamp(i.closed_at))),
-                            default=(None, ""))
+        after, closer = max(((_anchor(i, at, latest.workflow, health.runs), i.closed_by) for i in issues
+                             if (at := parse_timestamp(i.closed_at))), default=(None, ""))
         first = min(ended.values(), key=_created) if ended else next((
             r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
             and (after is None or _created(r)[0] >= after or closer and r.head_sha == closer)), None)
@@ -203,6 +203,18 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
                for n in sorted(base_fix(health) - admitted))
     return tuple(out)
+
+
+def _anchor(issue: BaseIssue, closed_at: datetime, workflow: str, runs: Iterable[BaseRun]) -> datetime:
+    """What a red run must be created at or after to file once `issue`
+    closed. The harness's green close (by the fixer, no closing commit): its
+    green run's creation, since a run created between the tick's read and the
+    close landing must still file. The harness's other closes need no care:
+    a merged fix's issue closes only once the next is open, and an orphan's
+    workflow no longer runs. Any other close: the close itself (#442)."""
+    green = max((r for r in runs if r.workflow == workflow and r.conclusion in GREEN_CONCLUSIONS
+                 and _created(r)[0] <= closed_at), key=_created, default=None) if issue.by_fixer else None
+    return _created(green)[0] if green is not None else closed_at
 
 
 def _created(run: BaseRun) -> tuple[datetime, int]:

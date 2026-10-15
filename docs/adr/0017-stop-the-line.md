@@ -111,9 +111,16 @@ identify a failure the same way:
   created at or after the last close, or its head is the commit that closed
   the issue (a merged PR's merge commit, or a pushed commit, read inside the
   issue search: GitHub may date the close after that commit's run was
-  created). Rule 1 means no newer run existed at a green close, so the close
-  time is the right anchor for every kind; this supersedes the
-  completion-time rule above. Incident: tauri #1150, a legacy issue closed by
+  created). The harness's own green close (its ClosedEvent's actor is the
+  fixer, with no closer) anchors instead on its green run's creation: Rule 1
+  saw no newer run at the tick's read, but a run created before the close
+  landed (a merge in the same tick, a human push) must still file, and a
+  failing re-run of that green files too. The harness's other closes are
+  unaffected: a merged fix's issue closes only once the next is open, and an
+  orphan's workflow no longer runs. An unreadable actor anchors on the
+  close. This supersedes the completion-time rule above. A required
+  workflow's issue is readied and served first only while its latest
+  verdict is red, so a green waiting to settle pays no leg. Incident: tauri #1150, a legacy issue closed by
   #1178's merge at 11:55:46Z; the next tick refiled the streak as #1179 from
   a run of `e6daf55`. A human's close of a red streak waits for a run created
   after it, not a re-run of an older one.

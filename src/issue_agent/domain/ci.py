@@ -179,8 +179,11 @@ def workflow_issues(health: BaseHealth, workflow: str) -> tuple[BaseIssue, ...]:
 def base_fix(health: BaseHealth | None) -> frozenset[int]:
     """The open base-CI issues of workflows the base branch requires (#402):
     the harness readies them and serves them first, without STEWARD, TRIAGE
-    or a blocker, and their PRs are charged the base's failures. None while
-    the required workflows are unread: the issues then wait for a human."""
-    if health is None or health.required is None:
+    or a blocker, and their PRs are charged the base's failures, while the
+    workflow's latest verdict is red (a green waiting to settle pays no leg,
+    #442). None while the required workflows are unread: the issues then
+    wait for a human."""
+    if health is None or health.runs is None or health.required is None:
         return frozenset()
-    return frozenset(i.number for w in health.required for i in workflow_issues(health, w) if not i.closed_at)
+    red = {latest.workflow for latest, _, _ in base_verdicts(health.runs) if latest.conclusion in RED_CONCLUSIONS}
+    return frozenset(i.number for w in health.required & red for i in workflow_issues(health, w) if not i.closed_at)

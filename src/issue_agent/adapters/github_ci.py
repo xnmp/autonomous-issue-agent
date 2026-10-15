@@ -149,18 +149,23 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                    or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
                    for n in nodes)):
         raise ValueError("issue search is absent, malformed or short")
-    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"], _closer(n))
+    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
+                           *_closer(n, filer) if n["state"] == "CLOSED" else ())
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 
-def _closer(node: dict) -> str:
-    """The commit that closed an issue (#442), "" when absent or unreadable."""
+def _closer(node: dict, filer: str) -> tuple[str, bool]:
+    """The commit that closed an issue, and whether the fixer closed it with
+    none (the harness's own close) (#442); ("", False) when unreadable."""
     events = (node.get("timelineItems") or {}).get("nodes") if isinstance(node.get("timelineItems"), dict) else None
-    closer = events[-1].get("closer") if isinstance(events, list) and events and isinstance(events[-1], dict) else None
-    if not isinstance(closer, dict):
-        return ""
-    oid = (closer.get("mergeCommit") or {}).get("oid") if isinstance(closer.get("mergeCommit"), dict) else closer.get("oid")
-    return oid if isinstance(oid, str) and oid else ""
+    event = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else {}
+    closer, actor = event.get("closer"), event.get("actor")
+    oid = ((closer.get("mergeCommit") or {}).get("oid") if isinstance(closer.get("mergeCommit"), dict)
+           else closer.get("oid")) if isinstance(closer, dict) else None
+    if isinstance(oid, str) and oid:
+        return oid, False
+    login = actor.get("login") if isinstance(actor, dict) else None
+    return "", "closer" in event and closer is None and isinstance(login, str) and login_eq(login, filer)
 
 
 def active_workflows(payload, listing) -> frozenset[str] | None:
