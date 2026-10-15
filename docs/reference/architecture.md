@@ -109,7 +109,10 @@ no migration history and no digest pins):
   `started_at`, `ended_at` and `end_reason`, the money (reserved maximum,
   charged micros, basis, origin, usage, rate card, `provider_receipt_id`
   UNIQUE, `settled_at`) and the leg's result (`leg_class`, session, result
-  JSON). CHECK constraints make contradictions unrepresentable: an `ended`
+  JSON). `leg_class` is the raw end class the leg returned with: a cut-off
+  (a per-leg cap or a provider-ended turn) is stored `machine`. Whether a leg
+  is an attempt is derived on read (`tick.leg_end`, `domain/attempt.py`, ADR
+  0003), so SQL that counts `leg_class` is not an attempt count. CHECK constraints make contradictions unrepresentable: an `ended`
   leg has a charge and a `released` or unsettled leg has none, a charge's
   fields are all set or all null, a `reserved` leg has not started, and an
   ended or released leg has an end time. An unsettled leg with `ended_at`

@@ -97,8 +97,9 @@ def leg_end(run: LegRun, earlier: Sequence[LegEnd] = (), log: Callable[[str], No
         return None
     receipt = run.receipt or {}
     runtime = runtime if isinstance(runtime := receipt.get("runtime"), str) and runtime in _RUNTIMES else ""
-    # Receipts before #441 marked a cap `capped` (on a free resume's machine end, and on an
-    # agent end); `end` names every cut-off since. Read until no open item holds such a receipt.
+    # Legacy: receipts before #441 marked a cap `capped` (on a free resume's machine end, and on
+    # an agent end); `end` names every cut-off since. Exit: delete the `capped` read once no open
+    # item holds a receipt written before #441.
     cut_off = isinstance(end := receipt.get("end"), str) and end in CUT_OFF_ENDS or receipt.get("capped") is True
     leg = next((c for c in (LegClass.AGENT, LegClass.ASKED) if receipt.get("leg") == c.value), LegClass.MACHINE)
     if leg is LegClass.MACHINE and cut_off and cut_off_counts(kind, runtime, earlier):
