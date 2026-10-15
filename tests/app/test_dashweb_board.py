@@ -769,17 +769,18 @@ def test_heavy_work_reads_as_paused_for_the_reload_only_while_a_live_heartbeat_r
 
 
 def test_the_overview_lists_red_base_workflows_longest_red_first_with_their_open_issue(deployment):
-    from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun
+    from issue_agent.domain.checks import BaseHealth, BaseIssue, BaseRun
 
     def run(name, number, conclusion, at):
         return BaseRun(name, number, f"https://github.com/o/r/actions/runs/{number}", f"s{number}", conclusion, at, at)
 
     backend, *_ = deployment
-    gateway = Gateway(WorldState(now=ts(0), base_ci=BaseCI(
-        (run("macOS Smoke", 70, "failure", "2026-10-14T03:00:00Z"), run("macOS Smoke", 71, "failure", "2026-10-14T05:00:00Z"),
-         run("Windows smoke", 80, "failure", "2026-10-13T22:00:00Z"), run("CI", 90, "success", "2026-10-12T00:00:00Z"),
-         run("Lint", 60, "success", "2026-10-14T05:00:00Z")),
-        (BaseIssue(41, "CI: Windows smoke failing on dev"), BaseIssue(42, "CI: macOS Smoke failing on dev", "2026-10-01")))))
+    gateway = Gateway(WorldState(now=ts(0), base=BaseHealth(
+        "dev",
+        runs=(run("macOS Smoke", 70, "failure", "2026-10-14T03:00:00Z"), run("macOS Smoke", 71, "failure", "2026-10-14T05:00:00Z"),
+              run("Windows smoke", 80, "failure", "2026-10-13T22:00:00Z"), run("CI", 90, "success", "2026-10-12T00:00:00Z"),
+              run("Lint", 60, "success", "2026-10-14T05:00:00Z")),
+        issues=(BaseIssue(41, "CI: Windows smoke failing on dev"), BaseIssue(42, "CI: macOS Smoke failing on dev", "2026-10-01")))))
     backend.gateway_factory = lambda repo: gateway
     backend._observations = type(backend._observations)(executor=InlineExecutor())  # type: ignore[arg-type]
     backend.overview("demo")

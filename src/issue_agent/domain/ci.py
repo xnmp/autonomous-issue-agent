@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 
-from .checks import BaseCI, BaseIssue, BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
+from .checks import BaseHealth, BaseIssue, BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -140,13 +140,17 @@ GREEN_CONCLUSIONS = frozenset({"success", "neutral"})
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
+def _order(run: BaseRun) -> tuple[datetime, int]:
+    return (parse_timestamp(run.created_at) or _EPOCH, run.run_id)
+
+
 def base_verdicts(runs: Iterable[BaseRun]) -> tuple[tuple[BaseRun, BaseRun, bool], ...]:
     """Per workflow name: its latest verdict run (by creation, then run id; a
     re-run keeps its run), the first run of the streak of that verdict ending
     at it as far back as `runs` reach, and whether an opposite verdict bounds
     that streak (else it may have begun before the earliest listed run)."""
     by_workflow: dict[str, list[BaseRun]] = {}
-    for run in sorted(runs, key=lambda r: (parse_timestamp(r.created_at) or _EPOCH, r.run_id), reverse=True):
+    for run in sorted(runs, key=_order, reverse=True):
         if run.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS:
             by_workflow.setdefault(run.workflow, []).append(run)
     out = []
@@ -169,18 +173,40 @@ def base_title(workflow: str, base: str, head: str = "") -> str:
     return f"CI: {name} failing on {base}" + (f" since {head[:7]}" if head else "")
 
 
-def workflow_issues(base_ci: BaseCI, workflow: str, base: str) -> tuple[BaseIssue, ...]:
+def workflow_issues(health: BaseHealth, workflow: str) -> tuple[BaseIssue, ...]:
     """`workflow`'s base-CI issues, oldest first."""
-    prefix = base_title(workflow, base)
-    return tuple(sorted((i for i in base_ci.issues if i.title == prefix or i.title.startswith(prefix + " since ")),
+    prefix = base_title(workflow, health.ref)
+    return tuple(sorted((i for i in health.issues if i.title == prefix or i.title.startswith(prefix + " since ")),
                         key=lambda i: i.number))
 
 
-def base_fix(base_ci: BaseCI | None, base: str) -> frozenset[int]:
+def base_unsettled(runs: Iterable[BaseRun]) -> frozenset[str]:
+    """The workflows whose latest verdict is green while a newer run of
+    theirs is still running (#442): the green may not stand, so their issues
+    are neither closed nor dispatched until it settles."""
+    runs = tuple(runs)
+    return frozenset(latest.workflow for latest, _, _ in base_verdicts(runs) if latest.conclusion in GREEN_CONCLUSIONS
+                     and any(r.workflow == latest.workflow and not r.conclusion and _order(r) > _order(latest)
+                             for r in runs))
+
+
+def base_held(health: BaseHealth | None) -> frozenset[int]:
+    """The open base-CI issues of workflows whose latest verdict is green,
+    closing or waiting to settle: derive takes none of them up (#442)."""
+    if health is None or health.runs is None:
+        return frozenset()
+    return frozenset(i.number for latest, _, _ in base_verdicts(health.runs) if latest.conclusion in GREEN_CONCLUSIONS
+                     for i in workflow_issues(health, latest.workflow) if not i.closed_at)
+
+
+def base_fix(health: BaseHealth | None) -> frozenset[int]:
     """The open base-CI issues of workflows the base branch requires (#402):
     the harness readies them and serves them first, without STEWARD, TRIAGE
-    or a blocker, and their PRs are charged the base's failures. None while
-    the required workflows are unread: the issues then wait for a human."""
-    if base_ci is None or base_ci.required is None:
+    or a blocker, and their PRs are charged the base's failures, while the
+    workflow's latest verdict is red (#442; one whose workflow passes, even
+    unsettled, is held from every dispatch: `base_held`). None while the required
+    workflows are unread: the issues then wait for a human."""
+    if health is None or health.runs is None or health.required is None:
         return frozenset()
-    return frozenset(i.number for w in base_ci.required for i in workflow_issues(base_ci, w, base) if not i.closed_at)
+    red = {latest.workflow for latest, _, _ in base_verdicts(health.runs) if latest.conclusion in RED_CONCLUSIONS}
+    return frozenset(i.number for w in health.required & red for i in workflow_issues(health, w) if not i.closed_at)

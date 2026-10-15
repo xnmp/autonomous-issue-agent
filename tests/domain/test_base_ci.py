@@ -4,11 +4,14 @@ and a required workflow's issue readied and fixed first. Through
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from issue_agent.domain.actions import AgentKind, FileIssue, Relabel, SetIssueState, Target
 from issue_agent.domain.backoff import LegEnd
-from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun, BaseTip, Check, Observed, RequiredCheck
+from issue_agent.domain.checks import BaseHealth, BaseIssue, BaseRun, Check, Observed, RequiredCheck
 from issue_agent.domain.evidence import new_failures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import base_ci_actions, dispatch_order
@@ -25,9 +28,9 @@ def _br(run: int, conclusion: str, name: str = "macOS Smoke", hour: int = 0) -> 
     return BaseRun(name, run, f"https://x/runs/{run}", f"sha{run}", conclusion, at, at)
 
 
-def _act(*runs, issues=(), required=None, labels=None, merged=None):
-    return base_ci_actions(BaseCI(tuple(runs), tuple(issues), required), "dev", "<!-- m -->", labels or {},
-                           merged or {})
+def _act(*runs, issues=(), required=None, labels=None, merged=None, workflows=None):
+    return base_ci_actions(BaseHealth("dev", runs=tuple(runs), issues=tuple(issues), required=required,
+                                      workflows=workflows), "<!-- m -->", labels or {}, merged or {})
 
 
 def _filed(actions) -> list[FileIssue]:
@@ -38,7 +41,8 @@ def _filed(actions) -> list[FileIssue]:
 
 
 def test_an_unread_base_acts_on_nothing():
-    assert base_ci_actions(None, "dev", "<!-- m -->") == ()
+    assert base_ci_actions(None, "<!-- m -->") == ()
+    assert base_ci_actions(BaseHealth("dev"), "<!-- m -->") == ()  # the tip read, the runs not
 
 
 def test_a_red_streak_files_one_issue_named_and_keyed_by_its_first_failing_run():
@@ -58,7 +62,7 @@ def test_an_open_issue_of_the_workflow_files_nothing_and_green_closes_it():
         assert _act(_br(2, "failure"), issues=[BaseIssue(40, title)]) == ()
         (closed,) = _act(_br(9, "success"), issues=[BaseIssue(40, title)])
         assert closed == SetIssueState(40, False, "<!-- m -->\n**macOS Smoke** passes on `dev` again: "
-                                                  "https://x/runs/9 (head `sha9`).")
+                                                  "https://x/runs/9 (head `sha9`, created `2026-10-14T00:00:09Z`).")
     assert _act(_br(9, "success"), issues=[BaseIssue(40, PREFIX, CLOSED_AT)]) == ()
 
 
@@ -81,23 +85,106 @@ def _run(run: int, conclusion: str, created: str, completed: str) -> BaseRun:
                    f"2026-10-14T{created}Z", f"2026-10-14T{completed}Z")
 
 
-def test_a_green_close_never_holds_back_a_red_run_that_overlapped_it():
-    # Green G (10:00) finishes 10:20 and closes the old streak's issue at 10:21; red R, created 10:05
-    # while G ran, finishes 10:40: the base is red and must have an issue.
-    green, red = _run(1, "success", "10:00:00", "10:20:00"), _run(2, "failure", "10:05:00", "10:40:00")
-    for old in (f"{PREFIX} since sha0", PREFIX):
-        (filed,) = _act(green, red, issues=[BaseIssue(40, old, "2026-10-14T10:21:00Z")])
+def test_green_closes_only_once_no_newer_run_of_the_workflow_is_still_running():
+    # Green G (10:00) finishes 10:20 while red R, created 10:05, still runs: G may not be the base's verdict.
+    green, issue = _run(1, "success", "10:00:00", "10:20:00"), [BaseIssue(40, f"{PREFIX} since sha0")]
+    assert _act(green, _run(2, "", "10:05:00", "10:21:00"), issues=issue) == ()
+    assert _act(green, _run(2, "failure", "10:05:00", "10:40:00"), issues=issue) == ()  # R failed: it stays open
+    (closed,) = _act(green, _run(2, "success", "10:05:00", "10:40:00"), issues=issue)
+    assert _closes([closed]) == [40]
+    # G (09:30) completed 09:59 while R3, created 09:40, runs on at 10:01: no close.
+    assert _act(_run(1, "success", "09:30:00", "09:59:00"), _run(3, "", "09:40:00", "10:01:00"), issues=issue) == ()
+    # An older run still running (or re-run) does not hold it.
+    (closed,) = _act(_run(3, "", "09:00:00", "10:01:00"), green, issues=issue)
+    assert _closes([closed]) == [40]
+
+
+def test_a_run_created_between_the_ticks_read_and_its_green_close_still_files():
+    # The tick read G green and settled; in the same tick it merged a PR at 10:00:02, whose run X was
+    # created at 10:00:04, and its close landed at 10:00:06. X fails: the base must get an issue.
+    green, x = _run(1, "success", "09:30:00", "09:59:00"), _run(2, "failure", "10:00:04", "10:20:00")
+    (close,) = _act(green, issues=[BaseIssue(40, f"{PREFIX} since sha0")])
+    harness = BaseIssue(40, f"{PREFIX} since sha0", "2026-10-14T10:00:06Z", note=close.comment)
+    (filed,) = _act(green, x, issues=[harness])
+    assert filed.title == f"{PREFIX} since sha2"
+    # The closing green itself, re-run and failing, is the base red again: it files.
+    (filed,) = _act(_run(1, "failure", "09:30:00", "10:40:00"), issues=[harness])
+    assert filed.title == f"{PREFIX} since sha1"
+    # Any other close anchors on the close: X tested older code. No comment, another's words (a leg's
+    # forgery is the residual), a comment naming no green run, or a closing commit.
+    for other in ("", close.comment.replace("<!-- m -->", "<!-- other -->"), close.comment.replace(", created", ""),
+                  close.comment.replace("2026-10-14T09:30:00Z", "never"), "<!-- m -->\nIts fix merged, but ..."):
+        assert _act(green, x, issues=[replace(harness, note=other)]) == ()
+    assert _act(green, x, issues=[replace(harness, closed_by="abc")]) == ()
+
+
+def test_an_issue_whose_workflow_passes_settled_or_not_is_held_from_every_dispatch():
+    unsettled = BaseHealth("dev", (), (_br(2, "failure"), _br(3, "success", hour=1), _br(4, "", hour=2)),
+                           tuple(OPEN), frozenset({"macOS Smoke"}))
+    issue = _issue(40)  # already `ai-ready`
+    assert issue_key(40) not in derive(WorldState(issues=(issue,), now=NOW.isoformat(), base=unsettled), Local(NOW, {}), H)
+    settled = replace(unsettled, runs=unsettled.runs[:2])
+    assert derive(WorldState(issues=(issue,), now=NOW.isoformat(), base=settled), Local(NOW, {}), H) == {}  # closing now
+    red = replace(unsettled, runs=(*unsettled.runs[:1], _br(4, "", hour=2)))
+    assert derive(WorldState(issues=(issue,), now=NOW.isoformat(), base=red), Local(NOW, {}), H)[issue_key(40)] == \
+        Dispatch(AgentKind.RESOLVE)
+
+
+def test_after_any_close_only_a_failure_created_at_or_after_the_last_close_files():
+    # Closed on green at 10:00, reopened, closed by a human at 11:00 (a legacy title or a streak's): the last close rules.
+    for title in (PREFIX, f"{PREFIX} since sha0"):
+        issues = [BaseIssue(40, title, "2026-10-14T11:00:00Z")]
+        assert _act(_run(1, "failure", "10:30:00", "11:20:00"), issues=issues) == ()
+        (filed,) = _act(_run(1, "failure", "10:30:00", "11:20:00"), _run(2, "failure", "11:00:00", "11:30:00"),
+                        issues=issues)
         assert filed.title == f"{PREFIX} since sha2"
 
 
-def test_after_a_close_mid_streak_a_failure_completing_at_or_after_it_files():
+def test_after_a_close_mid_streak_only_a_failure_created_at_or_after_it_files():
     issues = [BaseIssue(40, f"{PREFIX} since sha1", "2026-10-14T10:21:00Z")]  # closed by its fix's merge
     first = _run(1, "failure", "09:00:00", "09:30:00")
     assert _act(first, _run(2, "failure", "10:00:00", "10:20:59"), issues=issues) == ()  # finished before the close
     (filed,) = _act(first, _run(3, "failure", "10:21:00", "10:21:00"), issues=issues)  # same second as the close
     assert filed.title == f"{PREFIX} since sha3"
-    (filed,) = _act(first, _run(4, "failure", "10:00:00", "10:50:00"), issues=issues)  # running across the close
-    assert filed.title == f"{PREFIX} since sha4"
+    # Running across the close, it tested code from before the fix (#442, tauri #1150 -> #1179).
+    assert _act(first, _run(4, "failure", "10:00:00", "10:50:00"), issues=issues) == ()
+
+
+# Tauri, 2026-10-15 (UTC): a legacy issue was fixed by a PR merged at 11:55:45 into the default branch,
+# whose `Closes #` closed it at 11:55:46; 20 s later the harness filed the streak again from an old run.
+MERGE_CLOSED = "2026-10-15T11:55:46Z"
+
+
+def _tauri(run: int, conclusion: str, created: str, completed: str) -> BaseRun:
+    return BaseRun("macOS Smoke", run, f"https://x/runs/{run}", f"sha{run}", conclusion,
+                   f"2026-10-15T{created}Z", f"2026-10-15T{completed}Z")
+
+
+OLD_RED = (_tauri(1, "failure", "01:41:50", "02:39:57"), _tauri(2, "failure", "02:45:40", "03:26:13"))
+IN_FLIGHT = _tauri(3, "failure", "11:50:00", "12:20:00")  # created before the merge, red after the close
+MERGE_RUN = "11:55:47"  # the merge commit's own run
+
+
+def test_a_merge_closing_the_streaks_issue_files_nothing_until_the_merges_own_run_fails():
+    for title in (PREFIX, f"{PREFIX} since sha1"):  # the incident's legacy title, and a streak title
+        issues = [BaseIssue(40, title, MERGE_CLOSED)]
+        assert _act(*OLD_RED, issues=issues) == ()
+        assert _act(*OLD_RED, IN_FLIGHT, issues=issues) == ()
+        (filed,) = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", MERGE_RUN, "12:30:00"), issues=issues)
+        assert filed.title == f"{PREFIX} since sha4"
+        assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", MERGE_RUN, "12:30:00"), issues=issues) == ()
+
+
+def test_the_closing_commits_own_run_files_even_if_github_dated_it_before_the_close():
+    # The merge commit's run created 11:55:45, a second before GitHub recorded `Closes #` at 11:55:46.
+    merge_run = "11:55:45"
+    for closer, files in (("sha4", True), ("", False), ("shaX", False)):  # absent or another commit: the close rules
+        issues = [BaseIssue(40, PREFIX, MERGE_CLOSED, closer)]
+        actions = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", merge_run, "12:30:00"), issues=issues)
+        assert [a.title for a in _filed(actions)] == ([f"{PREFIX} since sha4"] if files else [])
+        assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", merge_run, "12:30:00"), issues=issues) == ()
+    # A run of the pre-merge code never files, closer or not.
+    assert _act(*OLD_RED, IN_FLIGHT, issues=[BaseIssue(40, PREFIX, MERGE_CLOSED, "sha4")]) == ()
 
 
 MERGED_AT = "2026-10-14T10:00:00Z"
@@ -159,7 +246,7 @@ def test_needs_human_keeps_an_issue_open_after_its_fix_merged():
 
 def test_a_title_stays_within_githubs_limit_whatever_the_base_branch():
     base = "release/" + "b" * 192
-    (filed,) = base_ci_actions(BaseCI((_br(2, "failure", name="w" * 300),), ()), base, "<!-- m -->")
+    (filed,) = base_ci_actions(BaseHealth(base, runs=(_br(2, "failure", name="w" * 300),)), "<!-- m -->")
     assert len(filed.title) <= 256 and f" failing on {base} since " in filed.title  # what the issue search finds
 
 
@@ -175,6 +262,71 @@ def test_a_hostile_or_huge_workflow_name_is_bounded_in_the_title_and_inert_in_th
     assert "@owner" not in filed.body and "<img" not in filed.body and "![p]" not in filed.body
 
 
+# ── a run being re-run (#442) ────────────────────────────────────────────────
+
+
+def test_a_run_being_re_run_holds_the_green_close_of_an_older_run_until_it_ends():
+    # Red run 2 has its issue; a human re-runs it. The older green must not close the issue: once
+    # closed, the re-run's failure (a run created before the close) would file nothing.
+    rerun = _br(2, "", hour=1)
+    issue = [BaseIssue(40, f"{PREFIX} since sha2")]
+    assert _act(_br(1, "success"), rerun, issues=issue) == ()
+    assert _act(_br(1, "success"), _br(2, "failure", hour=1), issues=issue) == ()  # it failed again
+    (closed,) = _act(_br(1, "success"), _br(2, "success", hour=1), issues=issue)  # it was a flake
+    assert _closes([closed]) == [40]
+    assert [a.title for a in _filed(_act(_br(1, "failure"), rerun))] == [f"{PREFIX} since sha1"]  # red regardless
+
+
+def test_an_older_run_being_re_run_leaves_the_latest_verdict_and_its_streak_alone():
+    (filed,) = _act(_br(1, "success"), _br(2, "failure", hour=1), _br(3, "", hour=2), _br(4, "failure", hour=3))
+    assert filed.title == f"{PREFIX} since sha2"
+    (closed,) = _act(_br(2, "", hour=1), _br(4, "success", hour=3), issues=[BaseIssue(40, f"{PREFIX} since sha2")])
+    assert _closes([closed]) == [40]
+
+
+def test_base_health_reads_issues_and_workflows_only_with_the_runs():
+    for part in ({"issues": (BaseIssue(40, PREFIX),)}, {"required": frozenset()}, {"workflows": frozenset()}):
+        with pytest.raises(ValueError):
+            BaseHealth("dev", **part)
+    for malformed in ({"ref": ""}, {"ref": "dev", "reports": []}, {"ref": "dev", "runs": []}):
+        with pytest.raises(ValueError):
+            BaseHealth(**malformed)
+
+
+# ── a renamed or removed workflow's issue (#449) ─────────────────────────────
+
+OLD = BaseIssue(40, "CI: Old Smoke failing on dev since sha1")
+CLOSED_OLD = "No workflow of this repository runs under this issue's name on `dev` any more"
+
+
+def test_an_open_issue_of_a_workflow_neither_listed_nor_in_the_repository_is_closed():
+    for old in (OLD, BaseIssue(40, "CI: Old Smoke failing on dev")):  # a legacy title too
+        (closed,) = _act(_br(2, "success"), issues=[old], workflows=frozenset({"macOS Smoke"}))
+        assert _closes([closed]) == [40] and CLOSED_OLD in closed.comment and "Old Smoke" not in closed.comment
+
+
+def test_a_renamed_workflows_red_files_under_the_new_name_and_closes_the_old_issue():
+    actions = _act(_br(2, "failure"), issues=[OLD], workflows=frozenset({"macOS Smoke"}))
+    assert [a.title for a in _filed(actions)] == [f"{PREFIX} since sha2"] and _closes(actions) == [40]
+
+
+def test_an_issue_is_kept_while_its_workflow_exists_runs_or_cannot_be_read():
+    smoke = BaseIssue(40, f"{PREFIX} since sha1")
+    assert _act(_br(2, "success", name="Lint"), issues=[smoke], workflows=frozenset({"macOS Smoke"})) == ()
+    # listed in the base's runs but not by that name in the repository's workflows
+    assert _closes(_act(_br(2, "failure"), issues=[smoke], workflows=frozenset())) == []
+    assert _act(_br(2, "success", name="Lint"), issues=[OLD]) == ()  # the workflows are unread
+    assert _act(_br(2, "success", name="Lint"), issues=[OLD], workflows=frozenset(),
+                labels={40: frozenset({Label.NEEDS_HUMAN})}) == ()  # a human holds it
+
+
+def test_only_this_bases_open_base_ci_issues_are_closed_as_orphaned():
+    others = [BaseIssue(41, "CI: Old Smoke failing on main since sha1"), BaseIssue(42, "Old Smoke failing on dev"),
+              BaseIssue(43, "CI: Old Smoke failing on dev-2"), BaseIssue(44, OLD.title, CLOSED_AT),
+              BaseIssue(45, "CI: Old Smoke failing on dev since sha1 again")]
+    assert _act(_br(2, "success"), issues=others, workflows=frozenset({"macOS Smoke"})) == ()
+
+
 # ── a required workflow's issue is readied ───────────────────────────────────
 
 READY = Relabel(Target.ISSUE, 40, remove=None, add=Label.AI_READY)
@@ -188,6 +340,11 @@ def test_a_required_workflows_open_issue_is_readied_unless_already_ready_or_park
                     labels={40: frozenset({held})}) == ()
 
 
+def test_a_required_workflows_issue_is_not_readied_while_its_green_waits_to_settle():
+    pending = (_br(2, "failure"), _br(3, "success", hour=1), _br(4, "", hour=2))
+    assert READY not in _act(*pending, issues=OPEN, required=frozenset({"macOS Smoke"}))
+
+
 def test_a_non_required_or_unmapped_workflows_issue_is_not_readied():
     for required in (frozenset({"Lint"}), frozenset(), None):
         assert _act(_br(2, "failure"), issues=OPEN, required=required) == ()
@@ -198,14 +355,13 @@ def test_a_non_required_or_unmapped_workflows_issue_is_not_readied():
 H = Harness("fix-bot", "review-bot")
 POLICY = frozenset({RequiredCheck("smoke")})
 RED_SMOKE = Check("smoke", "FAILURE", "fail", required=True)
-TIP = BaseTip("dev", "b9", (RED_SMOKE,))
 LIGHT = (LegEnd(AgentKind.STEWARD, NOW - timedelta(hours=2), False),
          LegEnd(AgentKind.TRIAGE, NOW - timedelta(hours=1), False))
 
 
 def _world(*, required=frozenset({"macOS Smoke"}), issues=(), prs=()) -> WorldState:
-    return WorldState(issues=tuple(issues), prs=tuple(prs), base=TIP, now=NOW.isoformat(),
-                      base_ci=BaseCI((_br(2, "failure"),), tuple(OPEN), required))
+    return WorldState(issues=tuple(issues), prs=tuple(prs), now=NOW.isoformat(),
+                      base=BaseHealth("dev", (RED_SMOKE,), (_br(2, "failure"),), tuple(OPEN), required))
 
 
 def _issue(number: int, **kw) -> IssueView:

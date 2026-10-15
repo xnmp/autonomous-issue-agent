@@ -16,7 +16,7 @@ from ...adapters.control_store import Lease
 from ...domain import dashboard as dash
 from ...domain.actions import ISSUE_ACTS, AgentKind, Target
 from ...domain.backoff import LegEnd
-from ...domain.checks import BaseCI
+from ...domain.checks import BaseHealth
 from ...domain.ci import RED_CONCLUSIONS, base_verdicts, parse_timestamp, workflow_issues
 from ...domain.labels import Label
 from ...domain.refs import harness_branch_issue
@@ -358,15 +358,15 @@ def attention(item_list: Iterable[Item], gh_issues: Mapping[int, Mapping]) -> li
     } for item, status in rows]
 
 
-def base_failures(base_ci: BaseCI | None, base: str, repo: str) -> list[dict] | None:
+def base_failures(health: BaseHealth | None, repo: str) -> list[dict] | None:
     """The fix role's red base workflows, longest red first; None: unread."""
-    if base_ci is None:
+    if health is None or health.runs is None:
         return None
     return [{"workflow": latest.workflow, "since_ts": since.created_at, "run_url": latest.url,
              "issue_url": issue_url(repo, issue.number) if issue and not issue.closed_at else None}
-            for latest, since, _ in sorted(base_verdicts(base_ci.runs), key=lambda v: v[1].created_at)
+            for latest, since, _ in sorted(base_verdicts(health.runs), key=lambda v: v[1].created_at)
             if latest.conclusion in RED_CONCLUSIONS
-            for issue in [next((i for i in workflow_issues(base_ci, latest.workflow, base) if not i.closed_at), None)]]
+            for issue in [next((i for i in workflow_issues(health, latest.workflow) if not i.closed_at), None)]]
 
 
 def health_trend(issues_payload: object, local_tz: tzinfo) -> list[dict]:

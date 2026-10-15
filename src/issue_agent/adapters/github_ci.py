@@ -3,7 +3,7 @@
 from urllib.parse import quote
 from dataclasses import replace
 
-from ..domain.ci import parse_timestamp
+from ..domain.ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, parse_timestamp
 
 from ..domain.checks import BaseIssue, BaseRun, Check, CIObservation, Observed, RequiredCheck, Unavailable
 from ..domain.identity import login_eq
@@ -104,24 +104,38 @@ def _report(node):
 
 def base_reports(nodes) -> tuple[Check, ...]:
     """The base tip's reports. A branch commit has no PR to be required for:
-    the PR's own policy decides which of its failures matter (#313)."""
+    the PR's own policy decides which of its failures matter (#313). An
+    Actions job counts only from a push run running or ended red or green,
+    as base-CI issues do (#442): another event's run tested a PR, and the
+    failed jobs of a cancelled run are no verdict."""
     if not isinstance(nodes, list):
         raise ValueError("base reports are malformed")
-    return tuple(_report({**node, "isRequired": False}) for node in nodes)
+    return tuple(_report({**node, "isRequired": False}) for node in nodes if _the_bases(node))
+
+
+def _the_bases(node) -> bool:
+    suite = node.get("checkSuite") if isinstance(node, dict) else None
+    if not isinstance(suite, dict) or not isinstance(run := suite.get("workflowRun"), dict):
+        return True  # a commit status or another app's check run (`_report` validates it)
+    ended = suite.get("conclusion")
+    return run.get("event") == "push" and (ended is None or str(ended).lower() in RED_CONCLUSIONS | GREEN_CONCLUSIONS)
 
 
 def base_runs(payload, base: str) -> tuple[BaseRun, ...]:
-    """One page of the base branch's completed push runs. A malformed row
-    makes the page unread: dropping it could make an older run the latest."""
+    """One page of the base branch's push runs, completed or running (no
+    conclusion: a newer run still running holds a green close, #442). A
+    malformed row makes the page unread: dropping it could make an older run
+    the latest."""
     rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
         raise ValueError("base run listing is absent or malformed")
-    rows = [r for r in rows if (r.get("head_branch"), r.get("event"), r.get("status")) == (base, "push", "completed")]
+    rows = [r for r in rows if (r.get("head_branch"), r.get("event")) == (base, "push")]
     if any(parse_timestamp(str(r.get("created_at"))) is None or parse_timestamp(str(r.get("updated_at"))) is None
            or not isinstance(r.get("conclusion") or "", str) for r in rows):
         raise ValueError("base run conclusion or times are malformed")
     return tuple(BaseRun(r.get("name"), r.get("id"), r.get("html_url"), r.get("head_sha"),
-                         (r.get("conclusion") or "unknown").lower(), r["created_at"], r["updated_at"]) for r in rows)
+                         (r.get("conclusion") or "unknown").lower() if r.get("status") == "completed" else "",
+                         r["created_at"], r["updated_at"]) for r in rows)
 
 
 def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
@@ -135,8 +149,43 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                    or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
                    for n in nodes)):
         raise ValueError("issue search is absent, malformed or short")
-    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"])
+    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
+                           *_closer(n, filer) if n["state"] == "CLOSED" else ())
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
+
+
+def _closer(node: dict, filer: str) -> tuple[str, str]:
+    """The commit that closed an issue, else the comment by `filer` posted
+    right before the close (#442); "" for either when absent or unreadable."""
+    events = (node.get("timelineItems") or {}).get("nodes") if isinstance(node.get("timelineItems"), dict) else None
+    *before, event = events if isinstance(events, list) and events and all(isinstance(e, dict) for e in events) else [{}]
+    if event.get("__typename") != "ClosedEvent":
+        return "", ""
+    closer = event.get("closer")
+    oid = ((closer.get("mergeCommit") or {}).get("oid") if isinstance(closer.get("mergeCommit"), dict)
+           else closer.get("oid")) if isinstance(closer, dict) else None
+    if isinstance(oid, str) and oid:
+        return oid, ""
+    comment = before[-1] if before and before[-1].get("__typename") == "IssueComment" else {}
+    author = comment.get("author")
+    login, body = author.get("login") if isinstance(author, dict) else None, comment.get("body")
+    return "", body if isinstance(login, str) and login_eq(login, filer) and isinstance(body, str) else ""
+
+
+def active_workflows(payload, listing) -> frozenset[str] | None:
+    """The names of the repository's active workflows, from one page of its
+    listing; None (no issue is closed as orphaned, #449) when a row is
+    malformed, the page is short of the count, or a workflow is named apart
+    from its runs in the base's run `listing` (its name may be another
+    branch's: a rename on its way)."""
+    rows = payload.get("workflows") if isinstance(payload, dict) else None
+    if (not isinstance(rows, list) or type(payload.get("total_count")) is not int or len(rows) != payload["total_count"]
+            or any(not isinstance(r, dict) or not isinstance(r.get("name"), str) for r in rows)):
+        return None
+    named = {r.get("path"): r["name"] for r in rows}
+    if any(named.get(r.get("path"), r.get("name")) != r.get("name") for r in listing["workflow_runs"] if r.get("event") == "push"):
+        return None
+    return frozenset(r["name"] for r in rows if r.get("state") == "active")
 
 
 def required_workflows(policy: frozenset[RequiredCheck], nodes: list) -> frozenset[str]:

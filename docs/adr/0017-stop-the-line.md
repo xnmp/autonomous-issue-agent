@@ -3,6 +3,7 @@
 Status: Accepted
 Date: 2026-10-15
 Governs: src/issue_agent/domain/policy.py src/issue_agent/domain/ci.py src/issue_agent/domain/state.py
+  src/issue_agent/adapters/github_ci.py
 
 ## Context
 
@@ -78,3 +79,67 @@ key. If the filing lands and the close is lost, the next tick closes the old
 issue and files nothing more. Closing first would strand the base: once
 closed, the old issue drops out of the merged-PR read, and the post-merge
 run completed before the close, so nothing would file.
+
+## Amendment (2026-10-15, #442, #449): one base observation
+
+Base health is one `BaseHealth` value per tick. Its parts are still read
+apart, because they answer different questions: the tip's check rollup
+(job-level, what #313's `charge` matches a PR's failures against) and the
+push-run listing (run-level history, what streaks are cut from). They now
+identify a failure the same way:
+
+- An Actions job on the tip is base evidence only from a **push** run that is
+  running or ended red or green. On a fast-forwarded tip the rollup also
+  lists the PR's `pull_request` runs, and a cancelled run's aggregate jobs
+  report FAILURE where the listing has no verdict (tauri-explorer `156de47`,
+  2026-10-15). A settled BaseRed on an Actions job is so backed by a red
+  push run, hence an issue; while that run (or its re-run) is in flight the
+  issue may not be filed yet. Accepted trade-off: a job that really failed
+  before its run was cancelled is the PR's, and a repair may be paid for it.
+  Commit statuses and other apps' checks are charged as before and have no
+  issue.
+- **Rule 1: green closes only when settled.** The harness closes a streak
+  issue on green only when that green run is the workflow's newest-created
+  run on the base: no run created after it is queued, running or being
+  re-run (the listing keeps those, without a verdict). Otherwise it waits
+  for the newer run. Before, a re-run dropped out of the completed listing
+  and an older green closed the issue; and a green finishing before an
+  overlapping, newer red run closed it too.
+- **Rule 2: every close anchors the same way.** After any close of a streak
+  issue (the harness's green close, `Closes #`, a human, the merged-fix
+  close; a legacy title too), a red run files the next issue only if it was
+  created at or after the last close, or its head is the commit that closed
+  the issue (a merged PR's merge commit, or a pushed commit, read inside the
+  issue search: GitHub may date the close after that commit's run was
+  created). The harness's own green close anchors instead on its green
+  run's creation: Rule 1 saw no newer run at the tick's read, but a run
+  created before the close landed (a merge in the same tick, a human push)
+  must still file, and a failing re-run of that green files too. Such a
+  close is known by what the harness writes: the fixer's comment posted with
+  the close (`gh issue close --comment`, read inside the issue search as the
+  timeline item just before the close), carrying the marker and the green
+  run's URL, head and creation time. No comment, another author, a reopen in
+  between, a malformed run or a closing commit anchors on the close. The
+  harness's other closes are unaffected: a merged fix's issue closes only
+  once the next is open, and an orphan's workflow no longer runs. This
+  supersedes the completion-time rule above. A required workflow's issue is
+  readied and served first only while its latest verdict is red, and an
+  issue whose workflow's latest verdict is green (closing, or waiting for
+  Rule 1 to settle) is taken up by no path, so it pays no leg. Incident:
+  tauri #1150, a legacy issue closed by
+  #1178's merge at 11:55:46Z; the next tick refiled the streak as #1179 from
+  a run of `e6daf55`. A human's close of a red streak waits for a run created
+  after it, not a re-run of an older one.
+- An open base-CI issue whose workflow is neither in the listed runs nor
+  among the repository's active workflows is **closed** (renamed, removed or
+  disabled), unless it carries `needs-human`. The 100 listed runs span hours,
+  so a path-filtered workflow is often absent from them. A workflow listing
+  that names a workflow apart from its runs on the base (a rename not yet on
+  the branch the listing reads) is unread, and unread workflows close
+  nothing.
+
+Provenance: the workflow listing (`actions/workflows`) is the repository's
+workflow files, under write access. The green-close comment is
+harness-written, but a fix leg holds the same token and could forge one; the
+worst case is an early refile of the streak, whose paid leg the caps bound. The close is read back like the green
+close and re-derived from the next observation if lost.
