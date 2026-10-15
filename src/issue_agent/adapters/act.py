@@ -236,9 +236,9 @@ class GitHubAct:
         answer = write()
         self.control.confirm_key(key)
         if isinstance(answer, Refused):
-            self.log(f"{what}: GitHub refused it (HTTP {answer.status}), not retried: {answer.message}")
+            self.log(f"{what}: GitHub refused it (HTTP {answer.status}), settled: {answer.message}")
         elif state == "done":
-            self.log(f"{what} was deleted; written again")
+            self.log(f"{what} was settled but absent (deleted, or refused before); written again")
         return answer
 
     def post(self, action: PostComment) -> None:

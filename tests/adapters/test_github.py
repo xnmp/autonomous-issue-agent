@@ -532,7 +532,6 @@ def test_a_rerun_posts_the_failed_jobs_rerun_and_returns_githubs_answer():
     # GraphQL answers its refusals with a 200 that carries errors.
     (_http(200, {"data": {"addBlockedBy": None}, "errors": [{"type": "NOT_FOUND", "message": "Could not resolve"}]}),
      Refused(200, "Could not resolve")),
-    (_http(200, {"errors": ["a bare string error"]}), Refused(200, "HTTP 200")),
     (_http(422, {"message": "x" * 100_000}), Refused(422, "x" * 299 + "…")),  # a huge reason is bounded
 ])
 def test_a_write_answer_is_read_from_the_status_line_and_the_receipt_id(out, answer):
@@ -544,6 +543,9 @@ def test_a_write_answer_is_read_from_the_status_line_and_the_receipt_id(out, ans
     ("gh: error connecting to api.github.com", "network", None),
     (_http(502, {"message": "Bad Gateway"}), "server", None),  # it may have landed
     (_http(500), "server", None),
+    # An untyped GraphQL error is GitHub's own failure, after which the mutation may have committed.
+    (_http(200, {"errors": [{"message": "Something went wrong while executing your query."}]}), "server", None),
+    (_http(200, {"errors": ["a bare string error"]}), "server", None),
     (_http(401, {"message": "Bad credentials"}), "auth", None),
     (_http(429, {"message": "Too Many Requests"}, **{"Retry-After": "30"}), "rate-limit", 30.0),
     (_http(403, {"message": "You have exceeded a secondary rate limit."}), "rate-limit", None),

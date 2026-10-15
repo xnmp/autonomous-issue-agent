@@ -102,7 +102,8 @@ _HTTP_STATUS = re.compile(r"HTTP/\S+ (\d{3})\b")
 def parse_write_answer(out: str, receipt: str = "", argv: list[str] | None = None) -> Accepted | Refused:
     """`gh api --include` output as GitHub's answer, read from its status
     line and body, never gh's error text. No answer raises GhUnavailable: no
-    status line or a 5xx (the write may have landed); a 401 or a rate limit
+    status line, a 5xx or an untyped GraphQL error (the write may have
+    landed); a 401 or a rate limit
     (429, a 403 with `retry-after`, or an error saying "rate limit", as GitHub
     documents), after which it did not land but the next tick may."""
     head, _, body = out.replace("\r\n", "\n").partition("\n\n")
@@ -123,7 +124,9 @@ def parse_write_answer(out: str, receipt: str = "", argv: list[str] | None = Non
     if (status >= 400 or errors) and (status == 429 or "rate limit" in message.lower()
                                       or status == 403 and retry_after is not None):
         raise GhUnavailable("rate-limit", message, argv, retry_after_s=retry_after)
-    if not 200 <= status < 500:
+    # GitHub types a GraphQL refusal (NOT_FOUND, FORBIDDEN, ...); an untyped
+    # error is its own failure ("Something went wrong"), which may have landed.
+    if not 200 <= status < 500 or status < 300 and not all(isinstance(e, dict) and e.get("type") for e in errors):
         raise GhUnavailable("server", message, argv)
     if status >= 300 or errors:
         return Refused(status, message)

@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.github import Accepted, BlockerLinkFacts, GhUnavailable
+from issue_agent.adapters.github import Accepted, BlockerLinkFacts, GhUnavailable, Refused
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
@@ -182,10 +182,10 @@ class FakeGitHub:
         self._lossy("comment")
         return Accepted(len(store[number].comments))
 
-    def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
+    def open_pull_request(self, branch: str, base: str, title: str, body: str) -> Accepted | Refused:
         with self.lock:
             if self.pull_request_for_branch(branch) is not None:
-                raise RuntimeError("a pull request already exists for this branch")
+                return Refused(422, "A pull request already exists for this branch")
             number = 100 + len(self.prs)
             head = self.branches[branch]
             self.prs[number] = PRView(
@@ -201,6 +201,7 @@ class FakeGitHub:
                 merge_state="CLEAN",
             )
         self._lossy("open_pull_request")
+        return Accepted(number)
 
     def enable_auto_merge(self, pr: int, method: str, expected_head: str) -> bool:
         if self.prs[pr].head_ref_oid != expected_head:

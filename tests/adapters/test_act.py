@@ -138,7 +138,7 @@ def test_a_refused_comment_is_settled_once_with_one_line_and_not_retried_by_act(
     act.log = logs.append
     act.execute(STOP)  # no raise: GitHub answered, and repeating it changes nothing
     assert gh.posted == [STOP.body]
-    assert logs == [f"issue #5: comment {STOP.key}: GitHub refused it (HTTP 403), not retried: "
+    assert logs == [f"issue #5: comment {STOP.key}: GitHub refused it (HTTP 403), settled: "
                     "Unable to create comment because issue is locked."]
 
 
@@ -555,7 +555,7 @@ def test_a_filing_github_refuses_is_settled_with_one_line(tmp_path):
     act.log = logs.append
     act.execute(FILE)  # no raise
     assert gh.writes == [("create", 0, FILE.title)] and gh.issues == {}
-    assert logs == [f"issue {FILE.title!r}: GitHub refused it (HTTP 410), not retried: Issues are disabled for this repo"]
+    assert logs == [f"issue {FILE.title!r}: GitHub refused it (HTTP 410), settled: Issues are disabled for this repo"]
 
 
 def test_a_filed_issue_a_human_deleted_or_retitled_is_filed_again_once_and_logged(tmp_path):
@@ -573,7 +573,7 @@ def test_a_filed_issue_a_human_deleted_or_retitled_is_filed_again_once_and_logge
         act.execute(FILE)  # derive no longer finds the issue under its title and asks again
         act.execute(FILE)  # its search lags the new filing
         assert [i.author for i in gh.issues.values() if i.title == FILE.title] == ["alice", "fix-bot"]
-        assert [m for m in logs if "deleted" in m] == [f"issue {FILE.title!r} was deleted; written again"]
+        assert [m for m in logs if "deleted" in m] == [f"issue {FILE.title!r} was settled but absent (deleted, or refused before); written again"]
 
 
 def test_a_filing_whose_reply_was_lost_is_found_in_the_issue_listing_not_filed_again(tmp_path):
@@ -924,7 +924,7 @@ def test_a_report_github_refuses_is_settled_with_one_line_and_never_retried(tmp_
     for _ in range(3):
         act.execute(_gap(5))
     assert harness.attempts == 1 and harness.issues == {}
-    assert logs == [f"harness gap {_gap(5).title!r} in {HARNESS}: GitHub refused it (HTTP 410), not retried: "
+    assert logs == [f"harness gap {_gap(5).title!r} in {HARNESS}: GitHub refused it (HTTP 410), settled: "
                     "Issues are disabled for this repo"]
 
 
@@ -943,7 +943,7 @@ def test_a_recurrence_comment_github_refuses_is_settled_with_one_line_and_never_
     for _ in range(3):
         act.execute(_gap(6))
     assert harness.posted == ["m\nseen again on o/r#6"] and harness.reads == reads + 1
-    assert len([line for line in logs if "not retried" in line and "locked" in line]) == 1
+    assert len([line for line in logs if "settled" in line and "locked" in line]) == 1
 
 
 def test_a_report_github_does_not_answer_is_retried_next_tick(tmp_path):
@@ -1003,3 +1003,10 @@ def test_a_confirmed_gap_report_is_never_derived_again(tmp_path):
     act.execute(asked)
     assert gap_actions(legs, (), target, HARNESS, "m", reported_gaps(act.control)) == ()
     assert len(harness.issues) == 1
+
+
+def test_a_comment_without_an_idempotency_key_cannot_be_asked_for():
+    """Every keyless comment of a repository would share one namespaced key and
+    dedupe the others away, so a keyless comment is unrepresentable."""
+    with pytest.raises(ValueError, match="key is required"):
+        PostComment(Target.ISSUE, 5, "body", key="")
