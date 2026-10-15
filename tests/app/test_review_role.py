@@ -171,9 +171,9 @@ def capped_for_a_human(gh, roles) -> bool:
 
 
 def test_the_review_claim_is_handed_back_only_after_the_leg_is_cleaned_up(roles, tmp_path):
-    # The claim's release is what wakes both roles (StoreWake): it must come
+    # The claim's release is what wakes the fix role (StoreWake): it must come
     # after the verdict landed and the checkout is gone, so the woken tick
-    # sees the verdict and a free slot.
+    # sees the verdict.
     gh = green()
     seen_at_remove = []
 

@@ -120,11 +120,10 @@ def _review_prompt(cfg: HarnessConfig) -> str:
     return cfg.review_prompt or _plugin_text("REVIEW_PROMPT.md")
 
 
-def _store_woken(composed: Role, cfg: HarnessConfig, log: Callable[[str], None],
-                 progress: Callable[[], None] | None) -> Daemon:
-    """The role's daemon, its wait between ticks ended when either role frees
-    an item of the repository (read from the shared control store)."""
-    composed.daemon.wait_for_change = StoreWake(composed.control.path, cfg.repo, log=log, progress=progress).wait
+def _store_woken(composed: Role, cfg: HarnessConfig, role: str, log: Callable[[str], None]) -> Daemon:
+    """The role's daemon, its wait between ticks also ended when the other
+    role frees an item of the repository (read from the shared control store)."""
+    composed.daemon.watch_store = StoreWake(composed.control.path, cfg.repo, role, log=log).watch
     return composed.daemon
 
 
@@ -168,10 +167,10 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
                            progress=scheduler_progress)
         worktrees = Worktrees(cfg.target_dir or os.getcwd(), cfg.worktree_root, cfg.base_branch)
-        return _store_woken(compose_fix_daemon(cfg, gw, worktrees, runner), cfg, log, scheduler_progress)
+        return _store_woken(compose_fix_daemon(cfg, gw, worktrees, runner), cfg, role, log)
     if role == "review":
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=log), progress=scheduler_progress)
-        return _store_woken(compose_review_daemon(cfg, gw, runner), cfg, log, scheduler_progress)
+        return _store_woken(compose_review_daemon(cfg, gw, runner), cfg, role, log)
     raise SystemExit(f"unknown role: {role!r} (use fix|review)")
 
 

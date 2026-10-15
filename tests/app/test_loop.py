@@ -1,8 +1,10 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
 import asyncio
+import contextlib
 import json
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -15,6 +17,7 @@ from issue_agent.adapters.control_store import SQLiteControlStore, StoreWake
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.reload import RELOAD_EXIT_CODE
 from issue_agent.app.tick import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, CancellableAsyncDispatch, Daemon
+from issue_agent.domain.contracts import RunId
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.evidence import CiFailure, CiFailures
 from issue_agent.domain.labels import Label
@@ -49,13 +52,15 @@ def _daemon(decide, observe=None, logs=None):
 
 def _paid(run_agent, name="fix", kind=AgentKind.RESOLVE, **daemon) -> Daemon:
     """A daemon whose every tick decides one paid leg on item 7."""
-    return Daemon(
-        name,
-        lambda: WorldState(),
-        lambda _world: [RunAgent(kind, 7)],
-        Executor(FakeGateway(), run_agent=run_agent),
-        **{"poll_seconds": 1, "dispatch_capacity": 1, **daemon},
-    )
+    return Daemon(**{
+        "name": name,
+        "observe": lambda: WorldState(),
+        "decide": lambda _world: [RunAgent(kind, 7)],
+        "executor": Executor(FakeGateway(), run_agent=run_agent),
+        "poll_seconds": 1,
+        "dispatch_capacity": 1,
+        **daemon,
+    })
 
 
 def _interrupt(_seconds):
@@ -441,7 +446,7 @@ def test_normal_shutdown_persists_stopped_heartbeat(tmp_path):
 
 
 def test_scheduler_progress_covers_tick_and_quiet_wait():
-    progress = []
+    progress, clock = [], ManualClock()
 
     def observe():
         assert progress == ["completed"]
@@ -449,10 +454,10 @@ def test_scheduler_progress_covers_tick_and_quiet_wait():
 
     d, _ = _daemon(lambda _world: [], observe=observe)
     d.run_forever(
-        sleep=lambda _seconds: None, now=lambda: 0, max_ticks=1, scheduler_progress=lambda: progress.append("completed")
+        sleep=clock.advance, now=lambda: 0, max_ticks=1, scheduler_progress=lambda: progress.append("completed")
     )
 
-    assert progress == ["completed"] * 5
+    assert progress == ["completed"] * 63  # three around the tick, then every second of the 60 s wait
 
 
 def test_failed_shutdown_deadline_overrides_clean_signal_exit():
@@ -566,15 +571,20 @@ def test_a_second_dispatch_for_a_running_target_is_not_submitted():
     assert started == [7]
 
 
+def _probe(*answers: bool):
+    """A `watch_store` whose nth wait probes `answers[n]` (then nothing freed)."""
+    waits = iter(answers)
+
+    def watch():
+        return contextlib.nullcontext(lambda answer=next(waits, False): answer)
+
+    return watch
+
+
 def test_reservation_sweep_cadence_is_elapsed_time_not_tick_count():
-    # Store wakes tick every 5 s against a 10 s poll; the sweep stays once per
+    # Wakes tick every 5 s against a 10 s poll; the sweep stays once per
     # 3 poll intervals (30 s) of elapsed time, not once per 3 ticks.
     sweeps, clock = [], ManualClock()
-
-    def wake(_timeout):
-        clock.advance(5)
-        return "store changed"
-
     daemon = Daemon(
         "fix",
         lambda: WorldState(),
@@ -583,75 +593,73 @@ def test_reservation_sweep_cadence_is_elapsed_time_not_tick_count():
         poll_seconds=10,
         reconcile=sweeps.append,
         reservation_sweep_polls=3,
-        wait_for_change=wake,
+        watch_store=_probe(*[True] * 13),
     )
 
-    daemon.run_forever(sleep=lambda _s: None, now=lambda: int(clock()), active_now=clock, max_ticks=13)
+    daemon.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=13)
 
     assert clock() == 65
     assert sweeps == [RecoveryTrigger.PERIODIC] * 2
 
 
-def test_without_a_change_the_full_interval_is_waited():
-    d, _ = _daemon(lambda w: [])
-    waited = []
-    d.poll_seconds, d.wait_for_change = 5, lambda timeout: waited.append(timeout)
-    d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=2)
-    assert waited == [5, 5]
-    # Regression guard on the unwired path: no slicing, no extra sleep calls.
-    unwired, _ = _daemon(lambda w: [])
-    slept = []
-    unwired.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert slept == [60, 60]
+def _observed_at(clock, observed):
+    return lambda: observed.append(clock()) or WorldState()
 
 
-def test_a_wake_starts_the_next_tick_and_logs_its_reason_once():
-    logs, ticks, waits = [], [], []
+def test_without_a_trigger_the_poll_still_fires_and_nothing_busy_loops(tmp_path):
+    # Commits that free nothing here (another repository's legs every second,
+    # a new claim) end no wait early.
+    store = SQLiteControlStore(str(tmp_path / "state" / "control.db"))
+    store.initialize()
+    clock, observed, logs = ManualClock(), [], []
 
-    def wake(timeout):
-        waits.append(timeout)
-        return "store changed" if len(waits) == 1 else None
+    def sleep(seconds):
+        clock.advance(seconds)
+        store.record_unpaid_leg(RunId(f"other-{clock()}"), repository="other/repo", role="review", kind="REVIEW",
+                                owner_id="other/repo:review", issue=1, number=1, head="", runtime="claude")
+        if clock() == 30:
+            assert store.lease("o/r", "review", 7, "o/r:review")
 
-    d, _ = _daemon(lambda w: ticks.append(w) or [], logs=logs)
-    d.wait_for_change = wake
-    d.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: 0, max_ticks=3)
-    assert len(ticks) == 3
-    assert waits == [60, 60, 60]
-    assert [m for m in logs if "woke" in m] == ["fix: woke: store changed"]
+    daemon = Daemon("fix", _observed_at(clock, observed), lambda _world: [], Executor(FakeGateway()),
+                    poll_seconds=60, log=logs.append,
+                    watch_store=StoreWake(store.path, "o/r", "fix", log=logs.append).watch)
+    daemon.run_forever(sleep=sleep, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+
+    assert observed == [0, 60, 120]
+    assert not any("woke" in m for m in logs)
+
+
+def test_an_unwired_daemon_waits_the_full_poll():
+    clock, observed = ManualClock(), []
+    d, _ = _daemon(lambda _w: [], observe=_observed_at(clock, observed))
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+    assert observed == [0, 60, 120]
+
+
+def test_a_wake_starts_the_next_tick_at_the_gap_and_logs_its_reason_once():
+    clock, observed, logs = ManualClock(), [], []
+    d, _ = _daemon(lambda _w: [], observe=_observed_at(clock, observed), logs=logs)
+    d.watch_store = _probe(True)
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+    assert observed == [0, 5, 65]
+    assert [m for m in logs if "woke" in m] == ["fix: woke: the other role freed an item"]
 
 
 @pytest.mark.parametrize(("retry_after", "back_off"), [(120, 120), (None, 60)])
-def test_after_github_refuses_a_tick_no_wake_shortens_the_back_off(retry_after, back_off):
-    calls, slept = [], []
+def test_after_github_refuses_a_tick_no_trigger_shortens_the_back_off(retry_after, back_off):
+    clock, observed = ManualClock(), []
 
     def observe():
-        calls.append("observe")
-        if len(calls) == 1:
+        observed.append(clock())
+        if len(observed) == 1:
             raise GhUnavailable("rate-limit", "HTTP 429", retry_after_s=retry_after)
         return WorldState()
 
     d, _ = _daemon(lambda w: [], observe=observe)
-    d.wait_for_change = lambda _timeout: "store changed"
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert slept == [back_off]  # the back-off in full; the second interval was woken
-
-
-def test_one_change_wait_spans_the_whole_interval_under_a_watchdog():
-    # Slicing it would re-baseline the store at every slice and absorb a
-    # change that landed near a boundary; the wait feeds the watchdog itself.
-    progress, waited, logs = [], [], []
-
-    def wait(timeout):
-        waited.append(timeout)
-        return "store changed"
-
-    d, _ = _daemon(lambda w: [], logs=logs)
-    d.poll_seconds, d.wait_for_change = 90, wait
-    d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=1,
-                  scheduler_progress=lambda: progress.append(1))
-    assert waited == [90]
-    assert len(progress) == 4  # three around the tick, one as the wait returns
-    assert "fix: woke: store changed" in logs
+    d.watch_store = _probe(True, True)
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=2)
+    assert observed == [0, back_off]  # the back-off in full; the next interval is woken
+    assert clock() == back_off + 5
 
 
 _FREE_ITEM_ELSEWHERE = """
@@ -672,21 +680,81 @@ def test_an_item_freed_in_another_process_starts_the_next_tick_before_the_poll(t
         if clock() == 10:
             subprocess.run([sys.executable, "-c", _FREE_ITEM_ELSEWHERE, store.path], check=True, timeout=60)
 
-    daemon = Daemon(
-        "fix",
-        lambda: observed.append(clock()) or WorldState(),
-        lambda _world: [],
-        Executor(FakeGateway()),
-        poll_seconds=60,
-        log=logs.append,
-        wait_for_change=StoreWake(store.path, "o/r", log=logs.append, sleep=sleep, monotonic=clock).wait,
-    )
+    daemon = Daemon("fix", _observed_at(clock, observed), lambda _world: [], Executor(FakeGateway()),
+                    poll_seconds=60, log=logs.append,
+                    watch_store=StoreWake(store.path, "o/r", "fix", log=logs.append).watch)
 
-    daemon.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: int(clock()),
-                       active_now=clock, max_ticks=2)
+    daemon.run_forever(sleep=sleep, now=lambda: int(clock()), active_now=clock, max_ticks=2)
 
-    assert observed == [0, 11]  # one quiet check after the release, not the 60 s poll
-    assert "fix: woke: store changed" in logs
+    assert observed == [0, 10]  # the check that saw the release, not the 60 s poll
+    assert "fix: woke: the other role freed an item" in logs
+
+
+def test_a_freed_slot_wakes_the_next_tick_only_once_the_leg_has_left_the_pool(tmp_path):
+    # The race the settle timer hid: a role releases its claim inside the
+    # dispatch, before the dispatch leaves the pool. A tick woken by the
+    # store's release would count the slot taken, dispatch nothing, and wait
+    # the full poll. The role wakes on its pool instead, and that tick fills
+    # the freed slot.
+    store = SQLiteControlStore(str(tmp_path / "state" / "control.db"))
+    store.initialize()
+    clock, observed, started = ManualClock(), [], []
+    leased, released, leave, unleased = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+
+    def run_agent(action):
+        started.append(action.number)
+        if len(started) > 1:
+            return
+        assert store.lease("o/r", "fix", 7, "o/r:fix")
+        leased.set()
+        assert released.wait(timeout=5)
+        assert store.unlease("o/r", "fix", 7, "o/r:fix")
+        unleased.set()
+        assert leave.wait(timeout=5)  # still in the pool, its claim gone
+
+    def sleep(seconds):
+        assert leased.wait(timeout=5)  # the wait sees the claim held before it goes
+        clock.advance(seconds)
+        if clock() == 10:
+            released.set()
+            assert unleased.wait(timeout=5)
+        if clock() == 20:
+            leave.set()
+            d.wait_for_dispatches()
+
+    d = _paid(run_agent, poll_seconds=60, observe=_observed_at(clock, observed),
+              watch_store=StoreWake(store.path, "o/r", "fix", log=lambda _m: None).watch)
+    try:
+        d.run_forever(sleep=sleep, now=lambda: int(clock()), active_now=clock, max_ticks=2)
+    finally:
+        released.set()
+        leave.set()
+        d.wait_for_dispatches()
+
+    assert observed == [0, 20]
+    assert started == [7, 7]  # the woken tick dispatched into the freed slot
+
+
+def test_a_leg_that_leaves_the_pool_while_the_tick_runs_wakes_the_next_wait():
+    # The count is read before the tick, so a leg ending at any point in it
+    # (here inside decide) is never absorbed by the wait that follows.
+    clock, observed, release = ManualClock(), [], threading.Event()
+
+    def decide(_world):
+        if len(observed) == 2:
+            release.set()
+            d.wait_for_dispatches()
+            return []
+        return [RunAgent(AgentKind.RESOLVE, 7)]
+
+    d = _paid(lambda _a: release.wait(timeout=5), poll_seconds=60, observe=_observed_at(clock, observed))
+    d.decide = decide
+    try:
+        d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+    finally:
+        release.set()
+        d.wait_for_dispatches()
+    assert observed == [0, 60, 65]
 
 
 _CRITERIA = PostComment(Target.ISSUE, 1096, "Acceptance criteria: …", key="triage:1096")
@@ -699,11 +767,10 @@ def test_a_tick_that_changed_github_observes_the_result_after_the_gap_not_the_po
 
     def decide(_world):
         decided_at.append(clock())
-        return [_CRITERIA] if len(decided_at) == 1 else [RunAgent(AgentKind.RESOLVE, 1096)]
+        return [_CRITERIA] if len(decided_at) == 1 else []
 
     d, gw = _daemon(decide, logs=logs)
     d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=2)
-    d.wait_for_dispatches()
 
     assert decided_at == [0, 5]
     assert "fix: woke: re-tick after a GitHub change" in logs
@@ -712,53 +779,45 @@ def test_a_tick_that_changed_github_observes_the_result_after_the_gap_not_the_po
 def test_a_mutation_every_tick_repeats_costs_one_extra_observe_per_interval_never_a_loop():
     # An idempotent re-post (or a merge GitHub has not taken yet) is decided
     # on every tick: the re-tick that repeats it does not re-tick again.
-    slept = []
-    d, _ = _daemon(lambda _w: [_CRITERIA])
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=5)
-    assert slept == [5, 60, 5, 60, 5]
+    clock, observed = ManualClock(), []
+    d, _ = _daemon(lambda _w: [_CRITERIA], observe=_observed_at(clock, observed))
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=5)
+    assert observed == [0, 5, 65, 70, 130]
+
+
+def test_a_dispatch_that_ends_at_once_every_tick_costs_one_extra_observe_per_interval_never_a_loop():
+    # A skip before the claim, or a refused read inside the worker, records no
+    # leg, so nothing backs it off: its end must not wake every gap.
+    clock, observed, logs = ManualClock(), [], []
+    d = _paid(lambda _a: None, poll_seconds=60, observe=_observed_at(clock, observed), log=logs.append)
+
+    def sleep(seconds):
+        d.wait_for_dispatches()  # each leg has left the pool before the next check
+        clock.advance(seconds)
+
+    d.run_forever(sleep=sleep, now=lambda: int(clock()), active_now=clock, max_ticks=5)
+    assert observed == [0, 5, 65, 70, 130]
+    assert "fix: woke: a leg of this role ended" in logs
+
+
+def test_a_wake_by_the_other_role_does_not_spend_the_next_own_wake():
+    clock, observed = ManualClock(), []
+    d, _ = _daemon(lambda _w: [_CRITERIA], observe=_observed_at(clock, observed))
+    d.watch_store = _probe(False, True)
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=4)
+    assert observed == [0, 5, 10, 15]  # re-tick, store wake, re-tick
 
 
 def test_a_tick_that_only_dispatched_waits_for_the_leg_not_a_retick():
-    # A dispatch changes nothing on GitHub; its end wakes the loop (store wake).
-    slept = []
-    d = _paid(lambda _a: None, poll_seconds=60)
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    d.wait_for_dispatches()
-    assert slept == [60, 60]
-
-
-def test_the_retick_gap_goes_through_the_change_wait_and_github_back_off_wins():
-    waited, slept = [], []
-    d, _ = _daemon(lambda _w: [_CRITERIA])
-    d.wait_for_change = lambda timeout: waited.append(timeout)
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert waited == [5, 60] and slept == []
-
-    calls = []
-
-    def observe():
-        calls.append(1)
-        if len(calls) == 2:
-            raise GhUnavailable("rate-limit", "HTTP 429", retry_after_s=None)
-        return WorldState()
-
-    refused, _ = _daemon(lambda _w: [_CRITERIA], observe=observe)
-    slept = []
-    refused.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=3)
-    assert slept == [5, 60, 5]  # the refused re-tick waits the full poll before trying again
-
-
-def test_a_store_wake_ending_the_retick_gap_does_not_start_another_retick():
-    waited = []
-
-    def wait(timeout):
-        waited.append(timeout)
-        return "store changed"
-
-    d, _ = _daemon(lambda _w: [_CRITERIA])
-    d.wait_for_change = wait
-    d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=4)
-    assert waited == [5, 60, 5, 60]
+    # A dispatch changes nothing on GitHub; its end wakes the loop.
+    clock, observed, release = ManualClock(), [], threading.Event()
+    d = _paid(lambda _a: release.wait(timeout=5), poll_seconds=60, observe=_observed_at(clock, observed))
+    try:
+        d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=2)
+    finally:
+        release.set()
+        d.wait_for_dispatches()
+    assert observed == [0, 60]
 
 
 class _Refusing:
@@ -769,34 +828,61 @@ class _Refusing:
         raise self.error
 
 
-@pytest.mark.parametrize(("error", "slept"), [
-    (GhUnavailable("rate-limit", "HTTP 403: secondary rate limit", retry_after_s=90), [90, 90]),
-    (GhUnavailable("rate-limit", "HTTP 403: secondary rate limit"), [60, 60]),
-    (RuntimeError("comment not confirmed"), [60, 60]),
+@pytest.mark.parametrize(("error", "waits"), [
+    (GhUnavailable("rate-limit", "HTTP 403: secondary rate limit", retry_after_s=90), [0, 90, 180]),
+    (GhUnavailable("rate-limit", "HTTP 403: secondary rate limit"), [0, 60, 120]),
+    (RuntimeError("comment not confirmed"), [0, 60, 120]),
 ])
-def test_a_github_write_that_failed_backs_off_instead_of_reticking(error, slept):
-    waits = []
-    d = Daemon("fix", lambda: WorldState(), lambda _w: [_CRITERIA], _Refusing(error), poll_seconds=60)
-    d.run_forever(sleep=waits.append, now=lambda: 0, max_ticks=2)
-    assert waits == slept
+def test_a_github_write_that_failed_backs_off_instead_of_reticking(error, waits):
+    clock, observed = ManualClock(), []
+    d = Daemon("fix", _observed_at(clock, observed), lambda _w: [_CRITERIA], _Refusing(error), poll_seconds=60,
+               watch_store=_probe(True, True))
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+    if isinstance(error, GhUnavailable):  # a refusal is never woken early, by any trigger
+        assert observed == waits
+    else:  # a failed write is no re-tick; the store's trigger still wakes
+        assert observed == [0, 5, 10]
     assert d.tick() == []  # a failed write is not a change taken
 
 
 def test_the_retick_gap_never_exceeds_a_shorter_poll():
-    slept = []
-    d, _ = _daemon(lambda _w: [_CRITERIA])
+    clock, observed = ManualClock(), []
+    d, _ = _daemon(lambda _w: [_CRITERIA], observe=_observed_at(clock, observed))
     d.poll_seconds = 2
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert slept == [2, 2]
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+    assert observed == [0, 2, 4]
 
 
 def test_a_mutation_beside_a_dispatch_still_reticks():
-    slept = []
-    d = _paid(lambda _a: None, poll_seconds=60)
+    clock, observed, release = ManualClock(), [], threading.Event()
+    d = _paid(lambda _a: release.wait(timeout=5), poll_seconds=60, observe=_observed_at(clock, observed))
     d.decide = lambda _w: [_CRITERIA, RunAgent(AgentKind.RESOLVE, 7)]
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=1)
-    d.wait_for_dispatches()
-    assert slept == [5]
+    try:
+        d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=2)
+    finally:
+        release.set()
+        d.wait_for_dispatches()
+    assert observed == [0, 5]
+
+
+def test_a_shutdown_signal_interrupts_the_wait_promptly():
+    # The daemon's SIGTERM handler raises SystemExit in the main thread; the
+    # wait's real sleep must let it through instead of finishing the interval.
+    d, _ = _daemon(lambda _w: [])
+
+    def stop(_signum, _frame):
+        raise SystemExit(0)
+
+    previous = signal.signal(signal.SIGALRM, stop)
+    signal.setitimer(signal.ITIMER_REAL, 0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemExit):
+            d.run_forever(sleep=time.sleep, now=lambda: int(time.time()))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert time.monotonic() - started < 5
 
 
 def _drain_daemon(decisions, run_agent, heartbeat="", capacity=1):
