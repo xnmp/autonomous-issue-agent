@@ -209,6 +209,24 @@ def test_a_temp_path_that_is_or_holds_home_or_the_harness_refuses_the_leg(host):
 
 
 @needs_bwrap
+def test_a_temp_directory_on_a_noexec_filesystem_refuses_the_leg(host, monkeypatch):
+    # bwrap keeps the source's mount flags: a noexec /tmp breaks every leg
+    # that runs what it builds there.
+    real = os.statvfs
+
+    class NoExec:
+        def __init__(self, path):
+            self.f_flag = real(path).f_flag | os.ST_NOEXEC
+
+    monkeypatch.setattr(os, "statvfs", NoExec)
+    tmp = Path(leg_tmp(host))
+
+    with pytest.raises(SandboxRefused, match="noexec"):
+        sandbox(host).launch(["/bin/true"], tmp=str(tmp), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+    assert not tmp.exists()
+
+
+@needs_bwrap
 def test_a_launch_refused_after_planning_leaves_no_temp_directory(host):
     tmp = Path(leg_tmp(host))
 

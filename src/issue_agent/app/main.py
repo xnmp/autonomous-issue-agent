@@ -77,6 +77,21 @@ def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId
     return tuple(recovered)
 
 
+def _raise_open_file_limit() -> None:
+    """The soft open-file limit up to the hard one: removing a leg's temp
+    directory holds a descriptor per level of its tree, and units start at
+    systemd's 1024 (#470). Legs inherit it. Best-effort: a host that refuses
+    keeps its limit, and a tree too deep is logged at removal."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ImportError, ValueError, OSError):  # macOS refuses an unlimited hard limit
+        pass
+
+
 def _validate_reload_candidate(env: dict[str, str], role: str | None = None) -> None:
     loaded = _load_agent_env(env)
     if role:
@@ -255,6 +270,8 @@ def _serve(role: str) -> None:
     except (ValueError, UnsafeLockFile) as e:
         sys.stderr.write(f"{role}: invalid deployment lock — {e}\n")
         raise SystemExit(ExitCode.INVALID_CONFIG) from e
+
+    _raise_open_file_limit()
 
     # Record the proxy posture at boot so a "can't reach api.github.com" failure is
     # diagnosable from the role log alone (the daemon inherits the launching shell's

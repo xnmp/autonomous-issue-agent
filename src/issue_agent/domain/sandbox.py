@@ -43,6 +43,10 @@ class Mount:
     # leg's disk-backed /tmp.
     source: str = ""
 
+    def __post_init__(self) -> None:
+        if self.source and (self.access is not Access.READ_WRITE or self.optional):
+            raise UnsafeMount(f"{self.path} shows another directory, so it must be a required read-write bind")
+
     @property
     def host(self) -> str:
         return self.source or self.path

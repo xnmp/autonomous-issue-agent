@@ -175,6 +175,10 @@ def _make_leg_tmp(root: str, plan: MountPlan) -> None:
     other local user reads a leg's scratch."""
     try:
         os.makedirs(os.path.dirname(root), mode=0o700, exist_ok=True)
+        # bwrap keeps the state filesystem's mount flags on the leg's /tmp.
+        if os.statvfs(os.path.dirname(root)).f_flag & getattr(os, "ST_NOEXEC", 0):
+            raise SandboxRefused(f"the leg's temp directory {root} is on a noexec filesystem; a leg runs what it "
+                                 "builds in /tmp, so the harness state directory must allow exec")
         os.mkdir(root, 0o700)
     except OSError as exc:
         raise SandboxRefused(f"the leg's temp directory {root} cannot be created fresh ({exc.strerror})") from exc

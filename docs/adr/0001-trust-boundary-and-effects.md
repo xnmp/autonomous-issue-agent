@@ -70,21 +70,24 @@ step leaves only scratch the next clone replaces; a restarted daemon reuses
 clones on disk at the same path, so Claude's cwd-keyed session store resumes
 (`tests/adapters/test_worktree_identity.py`).
 A leg's `/tmp` and `/var/tmp` (#470, 2026-10-16) are fresh 0700 directories on
-disk, `leg-tmp/<run>/{tmp,var-tmp}` in the deployment's process registry
-(ADR 0005), not tmpfs: a tmpfs is charged to the unit's memory, and one leg's
-Chrome traces OOM-killed the fix unit. The launch refuses a path that already
-exists or would expose a protected one. Crash points: a refused launch removes
-what it made; a launch that fails before its process group exists ends the run
-through `kill_tree`, as does every leg end and every reap, once no process of
-the run can run (directories a leg made read-only included); boot recovery,
-under the deployment lock, removes whatever a crash left
+disk, `leg-tmp/<launching daemon>/<run>/{tmp,var-tmp}` in the deployment's
+process registry (ADR 0005), not tmpfs: a tmpfs is charged to the unit's
+memory, and one leg's Chrome traces OOM-killed the fix unit. The launch refuses
+a path that already exists, would expose a protected one, or sits on a noexec
+filesystem. Crash points: a refused launch removes what it made; a launch that
+fails before its process group exists ends the run through `kill_tree`, as does
+every leg end and every reap, once no process of the run can run (directories a
+leg made read-only included); a full disk that refuses the cancellation receipt
+still kills a registered group and frees its directory. Every recovery, boot
+first, removes the directories of a dead launching daemon whose run holds no
+registration, before it reaps, so a crash's leftover frees the disk the reaping
+writes to; that covers a retired registry too. Only a tree deeper than the open
+file limit (raised to the hard limit at daemon start) survives, with a log line
 (`tests/adapters/test_leg_sandbox.py`, `tests/adapters/test_process_supervisor.py`,
 the runner tests). The trade: a runaway leg's scratch is now bounded by the
 state filesystem's free space, not the unit's memory, and that filesystem holds
 the control store. The checkout and `CARGO_TARGET_DIR` already write the same
-disk unbounded, so the exposure is not new in kind. A sibling registry's
-leftover from a run that died before registering waits for that deployment's
-next boot.
+disk unbounded, so the exposure is not new in kind.
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
 the act layer. Secrets reach the daemons as systemd encrypted

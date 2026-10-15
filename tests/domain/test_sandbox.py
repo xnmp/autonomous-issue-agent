@@ -8,6 +8,7 @@ from issue_agent.domain.sandbox import (
     Access,
     GitLink,
     LegFacts,
+    Mount,
     UnsafeMount,
     claude_session_store,
     leg_mount_plan,
@@ -160,6 +161,13 @@ def test_no_other_fact_claims_the_legs_tmp(override):
 
     assert shown(plan, "/tmp") == f"{LEG_TMP}/tmp" and shown(plan, "/var/tmp") == f"{LEG_TMP}/var-tmp"
     assert access(plan, "/tmp") is Access.READ_WRITE and access(plan, "/var/tmp") is Access.READ_WRITE
+
+
+@pytest.mark.parametrize("kind", [dict(access=Access.READ_ONLY), dict(access=Access.PRIVATE),
+                                  dict(access=Access.DEVICE), dict(access=Access.READ_WRITE, optional=True)])
+def test_only_a_required_read_write_bind_may_show_another_directory(kind):
+    with pytest.raises(UnsafeMount):
+        Mount("/tmp", source="/home/op/.local/state/leg-tmp/r/tmp", **kind)
 
 
 def test_a_path_entry_under_tmp_still_shows_the_hosts_directory():

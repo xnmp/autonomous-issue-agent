@@ -126,20 +126,36 @@ def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
         _wait_dead(process)
 
 
-def _leg_tmp(supervisor, run_id: str) -> Path:
-    """A leg's temp directory as its sandbox leaves it: written, with a link
-    out, directories it made read-only or closed, and /tmp itself read-only."""
-    path = Path(supervisor.leg_tmp(RunId(run_id)))
+# Above the kernel's largest pid_max: a launcher that can never be alive.
+DEAD_LAUNCHER = "4194305-1"
+
+
+def _leg_tmp(supervisor, run_id: str, launcher: str = "") -> Path:
+    """A leg's temp directory as its sandbox leaves it, made by this process
+    or by `launcher`: written, with a link out, directories it made read-only
+    or closed, and /tmp itself read-only."""
+    path = (supervisor.tmp_directory / launcher / run_id) if launcher else Path(supervisor.leg_tmp(RunId(run_id)))
     (path / "tmp/archive/deep").mkdir(parents=True)
     (path / "tmp/trace.json").write_text("{}")
     (path / "tmp/archive/deep/file").write_text("x")
     (path / "tmp/closed").mkdir()
     (path / "tmp/closed/file").write_text("x")
-    (path / "tmp/link").symlink_to(path.parent.parent.parent / "keep")
+    (path / "tmp/link").symlink_to(supervisor.state_dir.parent / "keep")
     for directory, mode in (("tmp/archive/deep", 0o500), ("tmp/archive", 0o500), ("tmp/closed", 0o000),
                             ("tmp", 0o500)):
         (path / directory).chmod(mode)
     return path
+
+
+def _disk_full(monkeypatch) -> None:
+    import errno
+
+    import issue_agent.adapters.process_supervisor as module
+
+    def full(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(module, "atomic_write", full)
 
 
 def test_a_legs_temp_directory_goes_with_its_process_group(tmp_path) -> None:
@@ -168,17 +184,107 @@ def test_a_legs_temp_directory_goes_when_its_process_never_registered(tmp_path) 
     assert not tmp.exists()
 
 
+def test_a_full_disk_still_kills_the_group_and_frees_its_temp_directory(tmp_path, monkeypatch) -> None:
+    # The cancellation receipt cannot be written; the group must not survive
+    # to keep filling the disk with its /tmp (review of #474).
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "leg", 1)
+    tmp = _leg_tmp(supervisor, "leg-0")
+    _disk_full(monkeypatch)
+
+    with pytest.raises(OSError):
+        supervisor.kill_tree(RunId("leg-0"))
+
+    _wait_dead(process)
+    assert not tmp.exists()
+
+
+def test_boot_recovery_on_a_full_disk_frees_leftovers_and_kills_orphans(tmp_path, monkeypatch) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "orphan", 1)
+    left = [_leg_tmp(supervisor, "orphan-0"), _leg_tmp(supervisor, "crashed", launcher=DEAD_LAUNCHER)]
+    _disk_full(monkeypatch)
+
+    with pytest.raises(OSError):
+        supervisor.recover_orphans()
+
+    _wait_dead(process)
+    assert not any(path.exists() for path in left)
+
+
 def test_boot_recovery_removes_temp_directories_a_crash_left(tmp_path) -> None:
     supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
     (tmp_path / "keep").mkdir()
     (process,) = _sleepers(supervisor, "orphan", 1)
-    left = [_leg_tmp(supervisor, "orphan-0"), _leg_tmp(supervisor, "crashed-before-registering")]
+    left = [_leg_tmp(supervisor, "orphan-0"),
+            _leg_tmp(supervisor, "crashed-before-registering", launcher=DEAD_LAUNCHER),
+            _leg_tmp(supervisor, "unidentified-host", launcher="unidentified")]
 
     supervisor.recover_orphans()
 
     _wait_dead(process)
     assert not any(path.exists() for path in left)
+    assert not (supervisor.tmp_directory / DEAD_LAUNCHER).exists()
     assert ProcessSupervisor(str(tmp_path / "absent")).recover_orphans() == ()  # nothing to sweep
+
+
+def test_any_recovery_removes_a_dead_daemons_unregistered_temp_directory_but_no_live_one(tmp_path) -> None:
+    # A retired registry (an old checkout, the sibling role) never boots again.
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "live", 1)  # a legacy receipt its live parent keeps
+    live_launch = _leg_tmp(supervisor, "launching")  # this daemon is alive: a launch in progress
+    leftover = _leg_tmp(supervisor, "crashed", launcher=DEAD_LAUNCHER)
+    still_registered = _leg_tmp(supervisor, "live-0", launcher=DEAD_LAUNCHER)
+    try:
+        assert supervisor.recover_abandoned_orphans() == ()
+
+        assert not leftover.exists()
+        assert (live_launch / "tmp/trace.json").exists() and (still_registered / "tmp/trace.json").exists()
+    finally:
+        supervisor.kill_tree(RunId("live-0"))
+        supervisor.kill_tree(RunId("launching"))
+        _wait_dead(process)
+    assert not still_registered.exists() and not live_launch.exists()
+
+
+@pytest.mark.parametrize("raise_limit", [True, False])
+def test_a_temp_tree_deeper_than_the_open_file_limit(tmp_path, raise_limit) -> None:
+    # Removal holds a descriptor per level; units start at a soft limit of
+    # 1024. The daemon raises it at start, and a tree still too deep is logged.
+    script = f"""
+import os, resource
+from pathlib import Path
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.app.main import _raise_open_file_limit
+from issue_agent.domain.contracts import RunId
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+if {raise_limit!r}:
+    _raise_open_file_limit()
+supervisor = ProcessSupervisor({str(tmp_path / "state")!r})
+root = Path(supervisor.leg_tmp(RunId("deep"))) / "tmp"
+root.mkdir(parents=True)
+fd = os.open(root, os.O_RDONLY)
+for _ in range(300):
+    os.mkdir("a", dir_fd=fd)
+    deeper = os.open("a", os.O_RDONLY, dir_fd=fd)
+    os.close(fd)
+    fd = deeper
+os.close(fd)
+supervisor.kill_tree(RunId("deep"))
+print("present" if root.exists() else "removed")
+"""
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+
+    assert done.returncode == 0, done.stderr
+    if raise_limit:
+        assert done.stdout.strip() == "removed"
+    else:
+        assert done.stdout.strip() == "present"
+        assert "could not remove leg temp directory" in done.stderr
 
 
 def test_wake_recovery_keeps_a_live_legs_temp_directory(tmp_path) -> None:
