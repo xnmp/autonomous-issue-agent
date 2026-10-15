@@ -177,6 +177,12 @@ class PRView:
     pushes: tuple[Push, ...] = ()
     needs_human_labeled_at: str = ""  # as on IssueView
     merged_at: str = ""  # a merged PR's merge time ("" unread or not merged)
+    # When GitHub last recorded an edit of the PR body (GraphQL `lastEditedAt`;
+    # "" never edited or not read). A bot change request older than it judged
+    # another description, so a review is owed again (#472). Provenance: anyone
+    # who can edit the PR (the fix bot, collaborators, apps) and GitHub stamps
+    # it. It can only owe a review, never make or keep a verdict.
+    body_edited_at: str = ""
 
     @property
     def checks(self) -> tuple[Check, ...]:

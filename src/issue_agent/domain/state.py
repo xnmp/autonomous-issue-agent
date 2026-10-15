@@ -48,7 +48,8 @@ Precedence, the single place it is defined (first match wins, per item):
                failing run still runs, else Rerun (free) if no run on the head
                is past its first attempt, else NeedsHuman (ATTEMPTS);
                pending -> Wait; green and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
-               head -> ADDRESS_REVIEW; no bot verdict on head -> REVIEW; bot
+               head -> ADDRESS_REVIEW; no bot verdict on head, or a bot
+               CHANGES_REQUESTED older than the PR body's last edit -> REVIEW; bot
                CHANGES_REQUESTED on head -> ADDRESS_REVIEW; bot APPROVED head ->
                Merge, unless a human's standing CHANGES_REQUESTED is on an
                older head (Wait) or GitHub does not report it mergeable and
@@ -616,7 +617,7 @@ def _proceed(
     if step.act in ISSUE_ACTS and item.blocked_by:
         return Blocked(item.blocked_by)
     if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
-            and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
+            and bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
             and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
         return PlainStop(StopReason.REVIEW_ROUNDS, anchor)
     attempts = _attempts(legs, step, floor)
@@ -745,7 +746,7 @@ def _pr_step(
     if head in human_heads:
         return Dispatch(AgentKind.ADDRESS_REVIEW, head,
                         evidence=_change_request(pr, lambda login: standing.get(login.strip().casefold()) == head))
-    verdict = _bot_verdict_on_head(pr, harness)
+    verdict = bot_verdict_on_head(pr, harness)
     if verdict is None:
         return Dispatch(AgentKind.REVIEW, head)
     if verdict == REVIEW_CHANGES_REQUESTED:
@@ -770,14 +771,27 @@ def _change_request(pr: PRView, by: Callable[[str], bool]) -> ChangeRequest:
     return ChangeRequest(review.author, pr.head_ref_oid, review.id, review.body)
 
 
-def _bot_verdict_on_head(pr: PRView, harness: Harness) -> str | None:
+def bot_verdict_on_head(pr: PRView, harness: Harness) -> str | None:
+    """The review bot's standing verdict on the head, the one rule both roles
+    read: its latest APPROVED/CHANGES_REQUESTED there, unless that is a
+    CHANGES_REQUESTED older than the PR body's last edit. A fixer answering in
+    the description alone (a commit would stale the CI evidence it cites) is
+    owed a review of the same head (tauri #1182, #472). An approval stands: a
+    human ticking boxes while branch protection waits on them must not buy
+    reviews toward the REVIEW attempt cap. An unreadable edit or verdict time
+    keeps the verdict: the head-only rule, which the caps still bound."""
     verdicts = [
         (parse_timestamp(r.submitted_at) is not None, r.submitted_at, i, r.state.upper())
         for i, r in enumerate(pr.reviews)
         if login_eq(r.author, harness.review_bot) and r.commit_id == pr.head_ref_oid
         and r.state.upper() in (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
     ]
-    return max(verdicts)[3] if verdicts else None
+    if not verdicts:
+        return None
+    _, submitted, _, state = max(verdicts)
+    edited, at = parse_timestamp(pr.body_edited_at), parse_timestamp(submitted)
+    stale = state == REVIEW_CHANGES_REQUESTED and edited is not None and at is not None and at < edited
+    return None if stale else state
 
 
 def _human_change_requests(pr: PRView, harness: Harness) -> Mapping[str, str]:
@@ -881,7 +895,7 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
 __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
     "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "Rerun", "OpenPR", "TriageNote", "TRIAGE_TAG",
-    "BLOCKER_TAG", "LinkBlocker",
+    "BLOCKER_TAG", "LinkBlocker", "bot_verdict_on_head",
     "Release", "Wait", "Blocked", "NeedsHuman", "PlainStop", "AttemptsStop", "QuestionStop", "DuplicateStop",
     "Busy", "Backoff", "DerivedState", "derive", "human_comments", "latest_steward", "touches_github",
 ]

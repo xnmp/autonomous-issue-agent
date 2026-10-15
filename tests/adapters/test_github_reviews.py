@@ -10,8 +10,9 @@ HEAD = "a" * 40
 BOT = "review-bot[bot]"
 
 
-def row(review_id=1, state="CHANGES_REQUESTED", *, login=BOT, commit=HEAD):
-    return {"id": review_id, "state": state, "user": {"login": login}, "commit_id": commit}
+def row(review_id=1, state="CHANGES_REQUESTED", *, login=BOT, commit=HEAD, submitted="2026-10-15T15:32:20Z"):
+    return {"id": review_id, "state": state, "user": {"login": login}, "commit_id": commit,
+            "submitted_at": submitted}
 
 
 def gateway(answer, calls=None):
@@ -67,3 +68,20 @@ def test_an_incomplete_or_refused_read_raises_instead_of_answering(answer):
 def test_an_outage_propagates():
     with pytest.raises(GhUnavailable):
         gateway(GhUnavailable("server", "HTTP 503")).reviewed_on(7, HEAD, BOT)
+
+
+EDIT = "2026-10-15T16:04:27Z"  # tauri #1182: the body edit after the 15:32:20Z review
+
+
+def test_472_a_verdict_older_than_the_body_edit_the_review_judged_has_not_landed():
+    assert gateway(json.dumps([[row()]])).reviewed_on(7, HEAD, BOT, since=EDIT) is False
+
+
+@pytest.mark.parametrize("submitted", [EDIT, "2026-10-15T16:20:00Z", "", None, "garbage"])
+def test_472_a_verdict_no_older_than_the_edit_or_untimed_has_landed(submitted):
+    assert gateway(json.dumps([[row(submitted=submitted)]])).reviewed_on(7, HEAD, BOT, since=EDIT) is True
+
+
+@pytest.mark.parametrize("since", ["", "garbage", "9" * 100_000])
+def test_472_an_absent_or_malformed_edit_time_is_the_head_only_read_back(since):
+    assert gateway(json.dumps([[row()]])).reviewed_on(7, HEAD, BOT, since=since) is True

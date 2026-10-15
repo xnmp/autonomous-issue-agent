@@ -287,6 +287,82 @@ def test_push_after_approval_needs_a_fresh_review():
     assert pr_state(pr(head_ref_oid="h2", ci=ci(head="h2"), reviews=(review("APPROVED", 1),))) == Dispatch(REVIEW, "h2")
 
 
+# ── A description edit after the bot's verdict (#472) ────────────────────────
+
+
+def test_a_body_edit_after_the_bots_change_request_owes_a_review_of_the_same_head():
+    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1),), body_edited_at=iso(2))) == Dispatch(REVIEW, HEAD)
+
+
+def test_a_body_edit_after_the_bots_approval_buys_no_review():
+    # A human ticking boxes while branch protection waits on them would buy
+    # reviews of an approved head up to the REVIEW attempt cap.
+    assert pr_state(pr(reviews=(review("APPROVED", 1),), body_edited_at=iso(2))) == Merge(HEAD)
+    blocked = pr(reviews=(review("APPROVED", 1),), body_edited_at=iso(2), merge_state="BLOCKED")
+    assert pr_state(blocked) == Wait(WaitReason.MERGEABILITY_UNKNOWN)
+
+
+def test_description_only_answers_are_bounded_by_the_review_round_cap():
+    # Each re-review that still requests changes is a round; the third stops.
+    rounds = (review("CHANGES_REQUESTED", 1, head="a"), review("CHANGES_REQUESTED", 2), review("CHANGES_REQUESTED", 4))
+    assert pr_state(pr(reviews=rounds[:2], body_edited_at=iso(3))) == Dispatch(REVIEW, HEAD)
+    assert pr_state(pr(reviews=rounds, body_edited_at=iso(3))) == PlainStop(StopReason.REVIEW_ROUNDS, "-")
+
+
+@pytest.mark.parametrize("edited", [iso(0), iso(1)])  # before, and the same instant as, the verdict
+def test_a_body_edit_not_after_the_bots_verdict_owes_nothing(edited):
+    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1),), body_edited_at=edited)) == addressing()
+    assert pr_state(pr(reviews=(review("APPROVED", 1),), body_edited_at=edited)) == Merge(HEAD)
+
+
+def test_a_verdict_newer_than_the_body_edit_stands_whatever_older_verdicts_it_follows():
+    reviews = (review("CHANGES_REQUESTED", 1), review("CHANGES_REQUESTED", 3))
+    assert pr_state(pr(reviews=reviews, body_edited_at=iso(2))) == addressing()
+
+
+def test_a_body_edit_never_revives_a_verdict_on_an_older_head():
+    view = pr(head_ref_oid="h2", ci=ci(head="h2"), reviews=(review("APPROVED", 1),), body_edited_at=iso(0))
+    assert pr_state(view) == Dispatch(REVIEW, "h2")
+
+
+@pytest.mark.parametrize("edited", ["", "   ", "yesterday", "2026-13-45T99:00:00Z", "9" * 100_000])
+def test_an_absent_or_malformed_body_edit_time_keeps_the_head_only_rule(edited):
+    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1),), body_edited_at=edited)) == addressing()
+    assert pr_state(pr(reviews=(review("APPROVED", 1),), body_edited_at=edited)) == Merge(HEAD)
+
+
+def test_an_untimed_bot_verdict_stands_against_a_body_edit():
+    untimed = Review("CHANGES_REQUESTED", "review-bot", submitted_at="garbage", commit_id=HEAD)
+    assert pr_state(pr(reviews=(untimed,), body_edited_at=iso(2))) == addressing()
+
+
+def test_tauri_1182_a_description_only_answer_is_re_reviewed_not_addressed_again():
+    # tauri PR #1182: the bot asked only for CI evidence in the description; the
+    # fixer edited the body (a commit would stale the runs) and the head stayed.
+    head = "9123431262421f27f4f93db35b6f07e65872c60e"
+
+    def ts(raw: str) -> datetime:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+    reviews = (Review("CHANGES_REQUESTED", "review-bot", "2026-10-15T14:25:17Z", commit_id="3eaa8826"),
+               Review("CHANGES_REQUESTED", "review-bot", "2026-10-15T15:32:20Z", commit_id=head))
+    view = pr(head_ref_oid=head, ci=ci(head=head), reviews=reviews)
+    answers = tuple(LegEnd(ADDR, ts(end), False, head=head, started_at=ts(start), end_head=head)
+                    for start, end in (("2026-10-15T15:49:14Z", "2026-10-15T15:50:31Z"),
+                                       ("2026-10-15T16:00:26Z", "2026-10-15T16:03:27Z"),
+                                       ("2026-10-15T16:03:57Z", "2026-10-15T16:04:44Z")))
+    history = local({**TRIAGED, **pr_legs(*answers)}, now=ts("2026-10-15T16:41:32Z"))
+
+    # Unedited, three answers that changed nothing are no progress: the cap stops it.
+    assert pr_state(view, history) == AttemptsStop(ADDR, "2026-10-15T16:04:44+00:00")
+    # The third answer edited the body (16:04:27Z, after the 15:32:20Z review):
+    # the review role owes a review of the same head, the fix role nothing.
+    edited = replace(view, body_edited_at="2026-10-15T16:04:27Z")
+    states = derive(WorldState(prs=(edited,)), history, H)
+    assert states == {pr_key(7): Dispatch(REVIEW, head)}
+    assert actions(states, H) == (RunAgent(REVIEW, 7, head=head),)
+
+
 @pytest.mark.parametrize(
     ("view", "reason"),
     [

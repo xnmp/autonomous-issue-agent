@@ -168,6 +168,43 @@ def test_a_pr_node_records_its_head_push_and_files():
     assert view.changed_files == frozenset({".github/workflows/ci.yml", "src/a.py"})
 
 
+@pytest.mark.parametrize(("edited", "read"), [("2026-10-15T16:04:27Z", "2026-10-15T16:04:27Z"), (None, ""), (7, ""),
+                                             ({"at": 1}, "")])
+def test_a_pr_node_carries_when_its_body_was_last_edited_and_null_or_malformed_reads_blank(edited, read):
+    assert parse_fix_pr(pr_node(lastEditedAt=edited), [], [], []).body_edited_at == read
+    assert parse_fix_pr(pr_node(), [], [], []).body_edited_at == ""
+
+
+def test_472_the_body_edit_time_rides_the_existing_pr_request():
+    assert "lastEditedAt" in gh._FIX_CONNECTIONS["pullRequests"]
+
+
+@pytest.mark.parametrize(("node", "read"), [
+    ({"body": "Linux, Windows, macOS green on 9123431.", "lastEditedAt": "2026-10-15T16:04:27Z"},
+     ("Linux, Windows, macOS green on 9123431.", "2026-10-15T16:04:27Z")),
+    ({"body": "", "lastEditedAt": None}, ("", "")),
+    ({"body": "x" * 200_000, "lastEditedAt": 12}, ("x" * 200_000, "")),
+])
+def test_472_the_review_legs_body_and_its_edit_time_come_from_one_read(node, read):
+    calls = []
+
+    def run(argv, _token):
+        calls.append(argv)
+        return json.dumps({"data": {"repository": {"pullRequest": node}}})
+
+    assert GitHubGateway("o/r", runner=run).pr_body(1182) == read
+    assert len(calls) == 1 and "pullRequest(number:1182)" in next(a for a in calls[0] if a.startswith("query="))
+
+
+@pytest.mark.parametrize("node", [None, {"lastEditedAt": "2026-10-15T16:04:27Z"}, {"body": None}, "nope"])
+def test_472_an_unreadable_body_raises_rather_than_briefing_an_empty_one(node):
+    def run(_argv, _token):
+        return json.dumps({"data": {"repository": {"pullRequest": node}}})
+
+    with pytest.raises(FixObservationIncomplete):
+        GitHubGateway("o/r", runner=run).pr_body(7)
+
+
 def test_an_unattributed_head_commit_is_a_push_by_no_login():
     node = pr_node(
         commits={
