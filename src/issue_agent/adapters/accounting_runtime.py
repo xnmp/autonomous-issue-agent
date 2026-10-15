@@ -157,9 +157,9 @@ class AccountingRuntime(AgentRuntime):
         as a machine end and nothing else counts it.
 
         `attempt` is for an end that retrying cannot change (GitHub refused
-        the review a leg produced; the head has nothing to review): it is
-        written as an agent leg's receipt, so the item's attempt cap stops it
-        at `needs-human` instead of a free retry looping forever.
+        the review a leg produced): it is written as an agent leg's receipt,
+        so the item's attempt cap stops it at `needs-human` instead of a free
+        retry looping forever.
         """
         issue, kind, number, *_, head, _resumed, _tier = self._context.get()
         if self.role not in LEG_ROLES or issue is None or not kind:

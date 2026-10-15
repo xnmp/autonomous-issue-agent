@@ -122,6 +122,15 @@ scope limits. Block only for:
   information that materially changes the product outcome.
 - **No legal move**: your rules deny every way forward.
 
+An issue the base already resolves is not a reason to block (tauri #786 sat
+on a human for a close). Prove it: check each criterion against the base and
+find the change that fixed it. If no test pins the behaviour, add a regression
+test that fails on the pre-fix code; otherwise make one empty commit
+(`git commit --allow-empty`). No `evidence/` screenshots are owed. Push and
+return `status=pushed`, with a summary that names the fixing change, gives the
+evidence for each criterion and ends with `Closes #<issue>`. The independent reviewer checks the claim, and the merge
+closes the issue.
+
 Before blocking for a platform you cannot run locally, check whether CI runs it
 and collect its evidence, adding diagnostic instrumentation as needed (e.g.
 fail-fast timeouts, verbose logs, `always()` artifact uploads). After two

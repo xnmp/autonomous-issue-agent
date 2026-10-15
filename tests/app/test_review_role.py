@@ -84,11 +84,10 @@ class ReviewGitHub(FakeGitHub):
 
 
 class FakeCheckouts:
-    """Pinned checkouts whose base...head diff is `changed` (False: empty)."""
+    """Pinned review checkouts under `root`."""
 
-    def __init__(self, root: Path, changed: bool = True):
+    def __init__(self, root: Path):
         self.root = root
-        self.changed = changed
         self.pinned: list[tuple[int, str, str, str]] = []
 
     def ensure(self, pr: int, head: str, base_ref: str, base: str) -> str:
@@ -96,9 +95,6 @@ class FakeCheckouts:
         path = self.root / f"review-pr-{pr}"
         path.mkdir(parents=True, exist_ok=True)
         return str(path)
-
-    def has_changes(self, base: str, head: str) -> bool:
-        return self.changed
 
     def remove(self, pr: int) -> None:
         pass
@@ -295,18 +291,6 @@ def test_the_bots_previous_review_reaches_the_next_rounds_reviewer(roles):
     assert "<untrusted_prior_review_json>" in second and "Handle a None token in parse()." in second
 
 
-def test_a_head_with_nothing_to_review_stops_for_a_human_without_a_paid_leg(roles, tmp_path):
-    gh = green()
-    agent = Agent()
-    review = roles.review(gh, agent, checkouts=FakeCheckouts(tmp_path / "empty", changed=False))
-    for _ in range(3):
-        tick(review)
-
-    assert tick(review) == []
-    assert agent.tasks == [] and gh.submitted == []
-    assert capped_for_a_human(gh, roles)
-
-
 def test_a_push_during_the_review_leaves_the_verdict_on_the_old_head_and_never_merges_on_it(roles):
     gh = green()
 
@@ -486,25 +470,6 @@ def test_a_human_answer_on_the_issue_reaches_the_reviewer_and_harness_comments_d
 
     thread = agent.tasks[0].prompt.split("<untrusted_issue_comments_json>")[1].split("</untrusted_issue")[0]
     assert "drop the 410 case" in thread and "harness note" not in thread
-
-
-def test_a_git_failure_on_the_emptiness_check_is_a_machine_end_not_an_attempt(roles, tmp_path):
-    from issue_agent.adapters.worktree import WorktreeUnavailable
-    from issue_agent.app.tick import leg_class
-    from issue_agent.domain.outcome import LegClass
-
-    class Broken(FakeCheckouts):
-        def has_changes(self, base: str, head: str) -> bool:
-            raise WorktreeUnavailable("git diff timed out")
-
-    gh = green()
-    agent = Agent()
-    review = roles.review(gh, agent, checkouts=Broken(tmp_path / "broken"))
-    tick(review)
-
-    assert agent.tasks == [] and gh.submitted == []
-    (run,) = review.control.leg_runs("o/r", (5,))
-    assert leg_class(run) is LegClass.MACHINE  # backs off; no REVIEW attempt is spent
 
 
 def test_an_agents_unmarked_issue_comment_during_a_pr_stage_leg_is_not_briefed_as_a_humans(roles):

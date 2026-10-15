@@ -258,24 +258,6 @@ def test_a_base_ref_that_cannot_be_fetched_still_fetches_the_head_and_names_the_
     assert ["fetch", "origin", "refs/pull/165/head", "--quiet"] in calls
 
 
-@pytest.mark.parametrize(
-    "answer,changed",
-    [(GitResult(0, ""), False), (GitResult(0, "src/x.py\n"), True)],
-    ids=["empty", "changed"],
-)
-def test_has_changes_reads_the_three_dot_diff(answer, changed):
-    rc, fg = _review_checkouts({f"diff --name-only {BASE}...{SHA}": answer})
-    assert rc.has_changes(BASE, SHA) is changed
-
-
-def test_a_failed_diff_is_not_an_empty_one():
-    # A timeout or a missing object must defer the round, never read as
-    # "nothing to review" (which costs an attempt).
-    rc, _fg = _review_checkouts({"diff --name-only": GitResult(1, "")})
-    with pytest.raises(WorktreeUnavailable):
-        rc.has_changes(BASE, SHA)
-
-
 def test_review_checkout_needs_the_base():
     rc, fg = _review_checkouts({**TOPLEVEL_OK, **HEAD_OK})
     for ref, base in (("", BASE), ("dev", "")):

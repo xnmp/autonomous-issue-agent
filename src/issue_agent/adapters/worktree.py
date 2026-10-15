@@ -340,16 +340,6 @@ class ReviewCheckouts:
             self._ensured[pr] = head_sha
             return abs_path
 
-    def has_changes(self, base_sha: str, head_sha: str) -> bool:
-        """Whether base...head (GitHub's PR diff) changes anything. A git
-        failure is not an empty diff: it raises, so the round defers."""
-        # --name-only, not --quiet: --quiet's "differs" exit is the same 1 a
-        # timeout or a missing object returns.
-        result = self._git(["diff", "--name-only", f"{base_sha}...{head_sha}"], self.repo_dir)
-        if result.code != 0:
-            raise WorktreeUnavailable(f"git diff {base_sha[:12]}...{head_sha[:12]} failed — defer")
-        return bool(result.out.strip())
-
     def _has_commit(self, sha: str) -> bool:
         return self._git(["cat-file", "-e", f"{sha}^{{commit}}"], self.repo_dir).code == 0
 
