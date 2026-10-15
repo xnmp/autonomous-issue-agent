@@ -2416,6 +2416,237 @@
         "title": "RoleHealth",
         "type": "object"
       },
+      "SettingRow": {
+        "additionalProperties": true,
+        "description": "One live knob (ADR 0007 amendment): its effective value in the composed\nsnapshot, and the file that sets it.",
+        "properties": {
+          "choices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Choices"
+          },
+          "default": {
+            "title": "Default",
+            "type": "string"
+          },
+          "effective": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective"
+          },
+          "group": {
+            "enum": [
+              "routes",
+              "dispatch",
+              "caps"
+            ],
+            "title": "Group",
+            "type": "string"
+          },
+          "help": {
+            "title": "Help",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "route",
+              "model",
+              "int",
+              "usd",
+              "choice"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime"
+          },
+          "source": {
+            "enum": [
+              "repo",
+              "shared",
+              "default"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "group",
+          "kind",
+          "label",
+          "help",
+          "value",
+          "source",
+          "default"
+        ],
+        "title": "SettingRow",
+        "type": "object"
+      },
+      "SettingWrite": {
+        "additionalProperties": false,
+        "description": "Set `key` in the repo overlay or shared.env; a null value removes it\nfrom that file (the next layer's value or the default applies).",
+        "properties": {
+          "key": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "scope": {
+            "default": "repo",
+            "enum": [
+              "repo",
+              "shared"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "SettingWrite",
+        "type": "object"
+      },
+      "SettingWriteResult": {
+        "additionalProperties": true,
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "warnings": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "detail"
+        ],
+        "title": "SettingWriteResult",
+        "type": "object"
+      },
+      "SettingsPayload": {
+        "additionalProperties": true,
+        "properties": {
+          "efforts": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Efforts",
+            "type": "object"
+          },
+          "files": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "object"
+          },
+          "models": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Models",
+            "type": "object"
+          },
+          "runtimes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Runtimes",
+            "type": "array"
+          },
+          "settings": {
+            "items": {
+              "$ref": "#/components/schemas/SettingRow"
+            },
+            "title": "Settings",
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "warnings",
+          "settings",
+          "runtimes",
+          "efforts",
+          "models",
+          "files"
+        ],
+        "title": "SettingsPayload",
+        "type": "object"
+      },
       "SlotUsage": {
         "additionalProperties": true,
         "description": "Dispatch slots against the agent lane. Light legs (steward, triage)\nrun outside `capacity`.",
@@ -3199,6 +3430,92 @@
           }
         },
         "summary": "Api Overview"
+      }
+    },
+    "/api/repos/{name}/settings": {
+      "get": {
+        "operationId": "api_settings_api_repos__name__settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsPayload"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Settings"
+      },
+      "post": {
+        "operationId": "api_set_setting_api_repos__name__settings_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingWriteResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Set Setting"
       }
     },
     "/api/usage": {

@@ -438,6 +438,43 @@ const OverviewPayload = z
     warnings: z.array(z.string()),
   })
   .passthrough();
+const SettingRow = z
+  .object({
+    choices: z.union([z.array(z.string()), z.null()]).optional(),
+    default: z.string(),
+    effective: z.union([z.string(), z.null()]).optional(),
+    group: z.enum(["routes", "dispatch", "caps"]),
+    help: z.string(),
+    key: z.string(),
+    kind: z.enum(["route", "model", "int", "usd", "choice"]),
+    label: z.string(),
+    runtime: z.union([z.string(), z.null()]).optional(),
+    source: z.enum(["repo", "shared", "default"]),
+    value: z.string(),
+  })
+  .passthrough();
+const SettingsPayload = z
+  .object({
+    efforts: z.record(z.array(z.string())),
+    files: z.record(z.string()),
+    models: z.record(z.array(z.string())),
+    runtimes: z.array(z.string()),
+    settings: z.array(SettingRow),
+    warnings: z.array(z.string()),
+  })
+  .passthrough();
+const SettingWrite = z.object({
+  key: z.string().min(1).max(64),
+  scope: z.enum(["repo", "shared"]).optional().default("repo"),
+  value: z.union([z.string(), z.null()]).optional(),
+});
+const SettingWriteResult = z
+  .object({
+    detail: z.string(),
+    ok: z.boolean(),
+    warnings: z.array(z.string()).optional().default([]),
+  })
+  .passthrough();
 const ClaudeUsage = z
   .object({
     error: z.union([z.string(), z.null()]),
@@ -535,6 +572,10 @@ export const schemas = {
   AttentionItem,
   SpendBucket,
   OverviewPayload,
+  SettingRow,
+  SettingsPayload,
+  SettingWrite,
+  SettingWriteResult,
   ClaudeUsage,
   CodexUsage,
   HarnessRepoSpend,
@@ -748,6 +789,68 @@ const endpoints = makeApi([
         spend_per_hour: z.array(SpendBucket).optional().default([]),
         store_error: z.union([z.string(), z.null()]).optional(),
         warnings: z.array(z.string()),
+      })
+      .passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "get",
+    path: "/api/repos/:name/settings",
+    alias: "api_settings_api_repos__name__settings_get",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+    ],
+    response: z
+      .object({
+        efforts: z.record(z.array(z.string())),
+        files: z.record(z.string()),
+        models: z.record(z.array(z.string())),
+        runtimes: z.array(z.string()),
+        settings: z.array(SettingRow),
+        warnings: z.array(z.string()),
+      })
+      .passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "post",
+    path: "/api/repos/:name/settings",
+    alias: "api_set_setting_api_repos__name__settings_post",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        type: "Body",
+        schema: SettingWrite,
+      },
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+    ],
+    response: z
+      .object({
+        detail: z.string(),
+        ok: z.boolean(),
+        warnings: z.array(z.string()).optional().default([]),
       })
       .passthrough(),
     errors: [

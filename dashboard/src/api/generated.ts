@@ -106,6 +106,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/repos/{name}/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Settings */
+        get: operations["api_settings_api_repos__name__settings_get"];
+        put?: never;
+        /** Api Set Setting */
+        post: operations["api_set_setting_api_repos__name__settings_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/usage": {
         parameters: {
             query?: never;
@@ -862,6 +880,100 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * SettingRow
+         * @description One live knob (ADR 0007 amendment): its effective value in the composed
+         *     snapshot, and the file that sets it.
+         */
+        SettingRow: {
+            /** Choices */
+            choices?: string[] | null;
+            /** Default */
+            default: string;
+            /** Effective */
+            effective?: string | null;
+            /**
+             * Group
+             * @enum {string}
+             */
+            group: "routes" | "dispatch" | "caps";
+            /** Help */
+            help: string;
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "route" | "model" | "int" | "usd" | "choice";
+            /** Label */
+            label: string;
+            /** Runtime */
+            runtime?: string | null;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "repo" | "shared" | "default";
+            /** Value */
+            value: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * SettingWrite
+         * @description Set `key` in the repo overlay or shared.env; a null value removes it
+         *     from that file (the next layer's value or the default applies).
+         */
+        SettingWrite: {
+            /** Key */
+            key: string;
+            /**
+             * Scope
+             * @default repo
+             * @enum {string}
+             */
+            scope: "repo" | "shared";
+            /** Value */
+            value?: string | null;
+        };
+        /** SettingWriteResult */
+        SettingWriteResult: {
+            /** Detail */
+            detail: string;
+            /** Ok */
+            ok: boolean;
+            /**
+             * Warnings
+             * @default []
+             */
+            warnings: string[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** SettingsPayload */
+        SettingsPayload: {
+            /** Efforts */
+            efforts: {
+                [key: string]: string[];
+            };
+            /** Files */
+            files: {
+                [key: string]: string;
+            };
+            /** Models */
+            models: {
+                [key: string]: string[];
+            };
+            /** Runtimes */
+            runtimes: string[];
+            /** Settings */
+            settings: components["schemas"]["SettingRow"][];
+            /** Warnings */
+            warnings: string[];
+        } & {
+            [key: string]: unknown;
+        };
+        /**
          * SlotUsage
          * @description Dispatch slots against the agent lane. Light legs (steward, triage)
          *     run outside `capacity`.
@@ -1223,6 +1335,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["OverviewPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_settings_api_repos__name__settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_set_setting_api_repos__name__settings_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettingWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingWriteResult"];
                 };
             };
             /** @description Validation Error */

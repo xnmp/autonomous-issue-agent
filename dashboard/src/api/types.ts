@@ -54,6 +54,10 @@ export type TriageSummary = Schema["TriageSummary"];
 export type CarriedLegs = Schema["CarriedLegs"];
 export type IssueDetailPayload = Schema["IssueDetailPayload"];
 export type ActionResult = Schema["ActionResult"];
+export type SettingRow = Schema["SettingRow"];
+export type SettingsPayload = Schema["SettingsPayload"];
+export type SettingWrite = Schema["SettingWrite"];
+export type SettingWriteResult = Schema["SettingWriteResult"];
 
 export type RoleName = "fix" | "review";
 export type VerificationStatus =

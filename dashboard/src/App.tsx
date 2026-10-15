@@ -24,6 +24,7 @@ import type {
 } from "./api/types";
 import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
+import { SettingsTab } from "./components/SettingsTab";
 import { EmptyState } from "./components/ui/Feedback";
 import { Chip, Dot } from "./components/ui/Chip";
 import { HEALTH_LABEL, HEALTH_TONE, roleHealth, type Tone } from "./lib/semantics";
@@ -282,6 +283,13 @@ export default function App() {
         onSelect: () => navigate({ view: "issues", repo, sub }),
       });
     }
+    tabs.push({
+      key: "settings",
+      title: "Settings",
+      label: "Settings",
+      active: route.view === "settings",
+      onSelect: () => navigate({ view: "settings", repo }),
+    });
 
     for (const n of openIssues[repo] ?? []) {
       const card = displayedIssues.data?.in_flight.find((c) => c.issue === n) ?? null;
@@ -414,6 +422,7 @@ function Body({
   showOverviewIssueHealthTrend: boolean;
 }) {
   if (route.view === "verification") return <VerificationTab />;
+  if (route.view === "settings") return <SettingsTab repo={route.repo} />;
   if (route.view === "issue") {
     return (
       <IssueTab
