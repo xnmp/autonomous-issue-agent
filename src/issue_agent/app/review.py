@@ -27,14 +27,13 @@ from ..adapters.act import submit_review
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.agent_task import RuntimeName
-from ..domain.effort import Effort
 from ..domain.identity import login_eq
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
-from ..domain.routing import Tier
+from ..domain.routing import ModelRoute, Tier
 from ..domain.state import DerivedState, Harness, ItemKey, Local, human_comments, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
@@ -120,7 +119,7 @@ class ReviewLegs:
         checkouts,
         prepare_cwd: Callable[[str, RuntimeName | None], None] | None,
         task_config: tasks.ReviewTaskConfig,
-        route: Callable[[Tier | None], tuple[RuntimeName | None, str | None, Effort | None]] | None = None,
+        route: Callable[[Tier | None], ModelRoute],
         log: Callable[[str], None],
     ) -> None:
         self.gateway = gateway
@@ -131,8 +130,7 @@ class ReviewLegs:
         self.checkouts = checkouts
         self.prepare_cwd = prepare_cwd
         self.task_config = task_config
-        # None: the role's default runtime with the configured REVIEW_MODEL.
-        self.route = route or (lambda _tier: (None, task_config.model, None))
+        self.route = route
         self.log = log
 
     async def run(self, action: RunAgent) -> None:
@@ -224,9 +222,10 @@ class ReviewLegs:
         return _bounded(subject.author or "author", subject.body or ""), format_pr_discussion(human)
 
     def _task(self, action: RunAgent, issue: int, pr: PRView, runs: Iterable[LegRun]):
-        runtime, model, effort = self.route(action.tier)
+        route = self.route(action.tier)
+        runtime, model, effort = route.runtime, route.model, route.effort
         self.log(f"REVIEW PR #{action.number}: tier {getattr(action.tier, 'value', '(none)')} -> "
-                 f"{runtime.value if runtime else '(default runtime)'}:{model or '(default model)'}{':' + effort.value if effort else ''}")
+                 f"{runtime.value}:{model or '(default model)'}{':' + effort.value if effort else ''}")
         base = pr.base_ref_oid
         cwd = self.checkouts.ensure(action.number, action.head, pr.base_ref_name, base)
         if self.prepare_cwd is not None:
@@ -242,7 +241,7 @@ class ReviewLegs:
             prior_review=as_untrusted(prior) if prior else None,
         )
         task = tasks.build_review_task(action.number, issue, action.head, base, context, self.task_config)
-        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort or task.effort)
+        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort)
 
 
 def _bounded(author: str, text: str) -> str:

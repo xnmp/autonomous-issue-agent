@@ -1238,15 +1238,15 @@ def test_unset_tier_specs_keep_the_single_configured_fixer(role):
     assert agent.tasks[0].model == "claude-sonnet-5-5"
 
 
-def test_a_routed_legs_task_carries_the_routes_effort_and_an_omitted_one_uses_the_global_knob(role):
+def test_a_routed_legs_task_carries_the_routes_effort_and_an_omitted_one_leaves_the_runtime_default(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
     agent = Agent(*red_pushes(gh, 2))
-    composed, _ = role(gh, agent, FIX_EFFORT="low", FIX_MODEL_MED="claude:claude-sonnet-5-5:high",
+    composed, _ = role(gh, agent, FIX_MODEL_MED="claude:claude-sonnet-5-5:high",
                        FIX_MODEL_HIGH="claude:claude-opus-5-5")
     tick(composed)
     tick(composed)  # MED (route effort), then escalated to HIGH (no route effort)
-    assert [t.effort for t in agent.tasks] == [Effort.HIGH, Effort.LOW]
+    assert [t.effort for t in agent.tasks] == [Effort.HIGH, None]
 
 
 def test_each_light_act_carries_its_own_routes_effort(role):

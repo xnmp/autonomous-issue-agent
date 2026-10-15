@@ -22,7 +22,6 @@ from ..adapters.control_store import LegRun
 from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
 from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
-from ..domain.effort import Effort
 from ..domain.evidence import ChangeRequest, CiFailures
 from ..domain.identity import login_eq
 from ..domain.labels import Label
@@ -30,7 +29,7 @@ from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order
 from ..domain.refs import harness_branch_issue, slugify
-from ..domain.routing import DEFAULT_TIER, Tier
+from ..domain.routing import DEFAULT_TIER, ModelRoute, Tier
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, pr_key
 from ..domain.triage import states_criteria
 from ..domain.trust import as_untrusted
@@ -84,9 +83,6 @@ def human_reply(
     return next((c for at, c in human_comments(comments, harness, legs) if at > after), None)
 
 
-Route = tuple[RuntimeName, "str | None", "Effort | None"]
-
-
 @dataclass(frozen=True)
 class FixSettings:
     repository: str
@@ -95,18 +91,18 @@ class FixSettings:
     runtime: str
     owner_id: str
     harness: Harness
-    # (runtime, model, effort) per tier (FIX_MODEL_<TIER>), for TRIAGE (TRIAGE_MODEL)
-    # and for STEWARD (STEWARD_MODEL).
-    routes: Mapping[Tier, Route] = field(default_factory=dict)
-    triage_route: Route | None = None
-    steward_route: Route | None = None
+    # The route per tier (FIX_MODEL_<TIER>), for TRIAGE (TRIAGE_MODEL) and for
+    # STEWARD (STEWARD_MODEL).
+    routes: Mapping[Tier, ModelRoute] = field(default_factory=dict)
+    triage_route: ModelRoute | None = None
+    steward_route: ModelRoute | None = None
     # The reservation of each light leg, STEWARD and TRIAGE alike.
     triage_budget_usd: float = 2.0
     # An empty scratch directory: the light acts read only their prompt.
     triage_cwd: str = ""
 
-    def route(self, tier: Tier | None) -> Route:
-        return self.routes.get(tier or DEFAULT_TIER) or (RuntimeName(self.runtime), None, None)
+    def route(self, tier: Tier | None) -> ModelRoute:
+        return self.routes.get(tier or DEFAULT_TIER) or ModelRoute(RuntimeName(self.runtime), None)
 
 
 class FixLegs:
@@ -171,7 +167,8 @@ class FixLegs:
             await self._light(action, subject)
             return
         recorded = self.control.leg_runs(self.settings.repository, (issue,))
-        runtime, model, effort = self.settings.route(action.tier)
+        route = self.settings.route(action.tier)
+        runtime, model, effort = route.runtime, route.model, route.effort
         # The review role's legs and the light acts' are not this role's sessions to continue.
         runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS - _LIGHT_ACTS),
                       key=lambda r: r.completed_at)
@@ -203,8 +200,7 @@ class FixLegs:
             # Every leg of the item, either role's, as derive sees them (#342).
             reply = human_reply(subject.comments, asked.completed_at, self.settings.harness,
                                 local_legs(recorded).get(item, ())) if asked else None
-            # No route effort keeps the global FIX_EFFORT.
-            cfg = replace(self.task_config, runtime=runtime, model=model, effort=effort or self.task_config.effort)
+            cfg = replace(self.task_config, runtime=runtime, model=model, effort=effort)
             task = self._task(action, subject, cwd, runs, cut_off, asked, cfg, runtime, recorded)
             if asked is not None:
                 target = "issue" if action.kind is AgentKind.RESOLVE else "pr"
@@ -242,7 +238,8 @@ class FixLegs:
         steward = action.kind is AgentKind.STEWARD
         name = action.kind.name
         route = (self.settings.steward_route or self.settings.triage_route) if steward else self.settings.triage_route
-        runtime, model, effort = route or self.settings.route(Tier.LOW)
+        route = route or self.settings.route(Tier.LOW)
+        runtime, model, effort = route.runtime, route.model, route.effort
         # resumed: the light acts never resume, so a leg cap is their one
         # attempt (STEWARD: no criteria; TRIAGE: DEFAULT_TIER), not a machine
         # end retried forever.
@@ -371,7 +368,7 @@ def compose_fix_daemon(
                            triage_budget_usd=cfg.triage_budget_usd,
                            triage_cwd=os.path.join(cfg.state_dir, "triage"))
     task_config = tasks.FixTaskConfig(cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,
-                                      cfg.fix_model, cfg.fix_effort, runtime=cfg.fixer_runtime)
+                                      cfg.fix_model, runtime=cfg.fixer_runtime)
 
     def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> FixLegs:
         return FixLegs(gateway, control, replace(settings, owner_id=owner_id), runtime=runtime,

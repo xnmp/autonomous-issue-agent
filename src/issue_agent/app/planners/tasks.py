@@ -28,9 +28,8 @@ class FixTaskConfig:
     base_branch: str = "dev"
     agent_md: str = ""               # plugin/AGENT.md text → appended system prompt
     max_budget_usd: float = 3.0
-    # One configured model and effort per role (refactor decision Q12).
+    # The role's default model; each leg's route supplies its own.
     model: str | None = None
-    effort: Effort | None = None
     runtime: RuntimeName | None = None
 
 
@@ -67,7 +66,6 @@ def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None =
         append_system_prompt=cfg.agent_md,
         model=cfg.model,
         runtime=cfg.runtime,
-        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
         resume=session_id,

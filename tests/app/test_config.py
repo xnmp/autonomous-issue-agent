@@ -81,9 +81,6 @@ _NON_FINITE = ("nan", "NaN", "inf", "-inf", "Infinity", "1e400")
         (None, None, "base_branch", "dev", False),
         ("FIX_MODEL", "opus", "fix_model", "opus", False),
         ("FIX_MODEL", "", "fix_model", None, False),
-        # #16 escalation ladder: a valid token parses to the domain enum.
-        ("FIX_EFFORT", "high", "fix_effort", Effort.HIGH, False),
-        ("FIX_EFFORT", " Low ", "fix_effort", Effort.LOW, False),
         ("CODEX_COST_PER_MTOK_OUT", "15.00", "codex_cost_per_mtok_out", 15.0, False),
         ("REVIEW_BUDGET_USD", "2.5", "review_budget_usd", 2.5, False),
         ("MERGE_METHOD", "merge", "merge_method", "merge", False),
@@ -210,7 +207,6 @@ def test_grouped_config_preserves_flat_env_mapping():
             "MAX_BUDGET_USD": "4.25",
             "REVIEW_MODEL": "opus",
             "CODEX_BIN": "codex-dev",
-            "CODEX_MODEL": "gpt-next",
         }
     )
 
@@ -218,7 +214,7 @@ def test_grouped_config_preserves_flat_env_mapping():
     assert (c.state_dir, c.review_state_dir) == ("/state/fix", "/state/review")
     assert (c.worktree_root, c.harness_root) == ("/worktrees", "/harness")
     assert (c.fix_bot, c.fix_budget_usd, c.review_model) == ("fixer", 4.25, "opus")
-    assert (c.codex_bin, c.codex_model) == ("codex-dev", "gpt-next")
+    assert c.codex_bin == "codex-dev"
 
 
 @pytest.mark.parametrize(
@@ -231,7 +227,6 @@ def test_grouped_config_preserves_flat_env_mapping():
             {"FIXER_RUNTIME", "AGENT_IDLE_TIMEOUT_SECONDS", "AGENT_MAX_RUNTIME_SECONDS"},
         ),
         ({"FIX_DISPATCH_CONCURRENCY": "0"}, {"FIX_DISPATCH_CONCURRENCY"}),
-        ({"FIX_EFFORT": "hihg"}, {"FIX_EFFORT"}),
     ],
 )
 def test_each_invalid_knob_is_flagged_exactly_once(env, knobs):
@@ -448,34 +443,71 @@ def _routed(**env):
 
 def test_the_live_claude_routing_knobs_parse_into_per_tier_routes():
     from issue_agent.domain.agent_task import RuntimeName
-    from issue_agent.domain.routing import Tier
+    from issue_agent.domain.routing import ModelRoute, Tier
 
     cfg = _routed(FIXER_RUNTIME="claude", FIX_MODEL="claude-sonnet-5-5", FIX_MODEL_LOW="claude:claude-haiku-5-5",
                   FIX_MODEL_MED="claude:claude-sonnet-5-5", FIX_MODEL_HIGH="claude:claude-opus-5-5",
                   FIX_MODEL_XHIGH="claude:claude-fable-5-1", TRIAGE_MODEL="claude:claude-haiku-5-5",
                   REVIEWER_RUNTIME="claude", REVIEW_MODEL="claude-opus-5-5")
     assert cfg.validation_errors() == ()
-    assert cfg.fix_route(Tier.XHIGH) == (RuntimeName.CLAUDE, "claude-fable-5-1", None)
-    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5", None)
-    assert cfg.review_route(Tier.HIGH) == (RuntimeName.CLAUDE, "claude-opus-5-5", None)
-    assert cfg.review_route(None) == (RuntimeName.CLAUDE, "claude-opus-5-5", None)
+    assert cfg.fix_route(Tier.XHIGH) == ModelRoute(RuntimeName.CLAUDE, "claude-fable-5-1")
+    assert cfg.triage_route() == ModelRoute(RuntimeName.CLAUDE, "claude-haiku-5-5")
+    assert cfg.review_route(Tier.HIGH) == ModelRoute(RuntimeName.CLAUDE, "claude-opus-5-5")
+    assert cfg.review_route(None) == ModelRoute(RuntimeName.CLAUDE, "claude-opus-5-5")
     assert cfg.runtimes("fix") == cfg.runtimes("review") == frozenset({RuntimeName.CLAUDE})
     assert cfg.triage_budget_usd == 2.0
 
 
-def test_unset_routes_fall_back_to_todays_single_models():
+def test_unset_routes_fall_back_to_the_role_default_route():
     from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import ModelRoute, Tier
+
+    cfg = _routed(FIXER_RUNTIME="codex", FIX_MODEL="gpt-6-luna", FIX_MODEL_LOW="claude:claude-haiku-5-5")
+    assert cfg.validation_errors() == ()
+    assert cfg.fix_route(Tier.MED) == ModelRoute(RuntimeName.CODEX, "gpt-6-luna")  # FIX_MODEL on FIXER_RUNTIME
+    assert cfg.triage_route() == ModelRoute(RuntimeName.CLAUDE, "claude-haiku-5-5")  # TRIAGE_MODEL unset: LOW's route
+    assert cfg.review_route(Tier.MED) == ModelRoute(RuntimeName.CODEX, "gpt-6.1-sol")  # no MED spec: REVIEW_MODEL
+    assert cfg.runtimes("fix") == frozenset({RuntimeName.CODEX, RuntimeName.CLAUDE})
+
+
+@pytest.mark.parametrize("env", [{}, {"FIX_MODEL": ""}, {"FIX_MODEL": "   "}])
+def test_an_absent_or_blank_fix_model_leaves_the_runtimes_own_default_model(env):
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import ModelRoute, Tier
+
+    cfg = _routed(FIXER_RUNTIME="claude", **env)
+    assert cfg.validation_errors() == ()
+    assert all(cfg.fix_route(t) == ModelRoute(RuntimeName.CLAUDE, None) for t in Tier)
+    assert cfg.triage_route() == cfg.steward_route() == ModelRoute(RuntimeName.CLAUDE, None)
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_tier_specs_are_unset_not_malformed(blank):
     from issue_agent.domain.routing import Tier
 
-    cfg = _routed(FIXER_RUNTIME="codex", FIX_MODEL_LOW="claude:claude-haiku-5-5")
-    assert cfg.fix_route(Tier.MED) == (RuntimeName.CODEX, None, None)  # CODEX_MODEL applies in the runner
-    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5", None)  # TRIAGE_MODEL unset: LOW's route
-    assert cfg.review_route(Tier.MED) == (RuntimeName.CODEX, "gpt-6.1-sol", None)  # no MED spec: REVIEW_MODEL
-    assert cfg.runtimes("fix") == frozenset({RuntimeName.CODEX, RuntimeName.CLAUDE})
+    cfg = _routed(FIX_MODEL_LOW=blank, FIX_MODEL_XHIGH=blank, TRIAGE_MODEL=blank, STEWARD_MODEL=blank)
+    assert cfg.validation_errors() == ()
+    assert cfg.fix_route(Tier.XHIGH) == cfg.fix_route(Tier.LOW) == cfg.triage_route() == cfg.steward_route()
+
+
+@pytest.mark.parametrize("tier_knob,tier", [("FIX_MODEL_LOW", "low"), ("FIX_MODEL_MED", "med"),
+                                            ("FIX_MODEL_HIGH", "high"), ("FIX_MODEL_XHIGH", "xhigh")])
+def test_each_tier_spec_routes_fix_and_review_for_that_tier_only(tier_knob, tier):
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import ModelRoute, Tier, parse_tier
+
+    cfg = _routed(**{tier_knob: "codex:gpt-6-luna:high"}, REVIEWER_RUNTIME="claude")
+    target = parse_tier(tier)
+    routed = ModelRoute(RuntimeName.CODEX, "gpt-6-luna", Effort.HIGH)
+    for t in Tier:
+        assert (cfg.fix_route(t) == routed) is (t is target)
+        assert (cfg.review_route(t) == routed) is (t is target)
 
 
 @pytest.mark.parametrize("env", [
     {"FIX_MODEL_HIGH": "opus"}, {"TRIAGE_MODEL": "codex:claude-haiku-5-5"}, {"STEWARD_MODEL": "sonnet"}, {"FIX_MODEL_LOW": "glm:glm-5"},
+    {"FIX_MODEL_MED": "claude:"}, {"FIX_MODEL_MED": "claude:a b"}, {"FIX_MODEL_MED": ":claude-haiku-5-5"},
+    {"FIX_MODEL_MED": "claude:claude-haiku-5-5:"}, {"FIX_MODEL_MED": "claude:" + "x" * 5000 + ":max"},
     {"TRIAGE_BUDGET_USD": "0"},
 ])
 def test_malformed_routing_knobs_are_reported_and_fall_back(env):
@@ -483,35 +515,65 @@ def test_malformed_routing_knobs_are_reported_and_fall_back(env):
 
     cfg = _routed(**env)
     assert cfg.validation_errors()
-    assert cfg.fix_route(Tier.HIGH)[0] is cfg.fixer_runtime
+    assert cfg.fix_route(Tier.HIGH).runtime is cfg.fixer_runtime
+    assert cfg.fix_route(Tier.MED).model is None  # the malformed spec is not half-applied
+
+
+@pytest.mark.parametrize("env,knob", [
+    ({"FIXER_RUNTIME": "claude", "FIX_MODEL": "gpt-6-luna"}, "FIX_MODEL"),
+    ({"FIXER_RUNTIME": "codex", "FIX_MODEL": "claude-opus-5-5"}, "FIX_MODEL"),
+    ({"REVIEWER_RUNTIME": "claude", "REVIEW_MODEL": "gpt-6.1-sol"}, "REVIEW_MODEL"),
+    ({"FIX_MODEL": "has space"}, "FIX_MODEL"),
+])
+def test_a_default_model_belonging_to_another_runtime_fails_validation(env, knob):
+    # The pair is a route like any other: a Codex model on the Claude fixer
+    # would launch and fail on every leg.
+    assert any(knob in e for e in _routed(**env).validation_errors())
+
+
+@pytest.mark.parametrize("knob,value,replacement", [
+    ("CODEX_MODEL", "gpt-6-luna", "FIX_MODEL"),
+    ("FIX_EFFORT", "high", "FIX_MODEL_<TIER>"),
+])
+def test_a_removed_knob_fails_startup_naming_its_replacement(knob, value, replacement):
+    cfg = _routed(**{knob: value})
+    with pytest.raises(ValueError, match=rf"{knob} was removed.*{replacement}"):
+        cfg.validate()
+
+
+@pytest.mark.parametrize("knob", ["CODEX_MODEL", "FIX_EFFORT"])
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_a_removed_knob_left_blank_is_not_an_error(knob, blank):
+    assert _routed(**{knob: blank}).validation_errors() == ()
 
 
 def test_route_effort_reaches_every_route_and_an_omitted_one_stays_unset():
     from issue_agent.domain.agent_task import RuntimeName
-    from issue_agent.domain.routing import Tier
+    from issue_agent.domain.routing import ModelRoute, Tier
 
     cfg = _routed(FIX_MODEL_LOW="claude:claude-haiku-5-5:low", FIX_MODEL_HIGH="codex:gpt-6-luna:xhigh",
                   TRIAGE_MODEL="claude:claude-haiku-5-5:medium", REVIEWER_RUNTIME="claude")
     assert cfg.validation_errors() == ()
-    assert cfg.fix_route(Tier.LOW) == (RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.LOW)
-    assert cfg.fix_route(Tier.MED)[2] is None
-    assert cfg.review_route(Tier.HIGH) == (RuntimeName.CODEX, "gpt-6-luna", Effort.XHIGH)
-    assert cfg.triage_route()[2] is Effort.MEDIUM
+    assert cfg.fix_route(Tier.LOW) == ModelRoute(RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.LOW)
+    assert cfg.fix_route(Tier.MED).effort is None
+    assert cfg.review_route(Tier.HIGH) == ModelRoute(RuntimeName.CODEX, "gpt-6-luna", Effort.XHIGH)
+    assert cfg.triage_route().effort is Effort.MEDIUM
     assert "low=claude:claude-haiku-5-5:low" in cfg.describe()
 
 
 def test_the_steward_route_falls_back_to_triage_then_to_the_low_route():
     from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import ModelRoute
 
     own = _routed(STEWARD_MODEL="claude:claude-sonnet-5-5:high", TRIAGE_MODEL="claude:claude-haiku-5-5:high")
     assert own.validation_errors() == ()
-    assert own.steward_route() == (RuntimeName.CLAUDE, "claude-sonnet-5-5", Effort.HIGH)
-    assert own.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.HIGH)
+    assert own.steward_route() == ModelRoute(RuntimeName.CLAUDE, "claude-sonnet-5-5", Effort.HIGH)
+    assert own.triage_route() == ModelRoute(RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.HIGH)
 
-    assert _routed(TRIAGE_MODEL="claude:claude-haiku-5-5:low").steward_route() == (
+    assert _routed(TRIAGE_MODEL="claude:claude-haiku-5-5:low").steward_route() == ModelRoute(
         RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.LOW)
-    assert _routed(FIX_MODEL_LOW="claude:claude-haiku-5-5").steward_route() == (
-        RuntimeName.CLAUDE, "claude-haiku-5-5", None)
+    assert _routed(FIX_MODEL_LOW="claude:claude-haiku-5-5").steward_route() == ModelRoute(
+        RuntimeName.CLAUDE, "claude-haiku-5-5")
     assert _routed(FIXER_RUNTIME="codex", STEWARD_MODEL="claude:claude-sonnet-5-5").runtimes("fix") == frozenset(
         {RuntimeName.CODEX, RuntimeName.CLAUDE})
     assert "steward=claude:claude-sonnet-5-5:high" in own.describe()
@@ -531,8 +593,3 @@ def test_an_invalid_route_effort_fails_config_validation(name):
     assert any(name in e and "effort" in e for e in cfg.validation_errors())
     with pytest.raises(ValueError, match=name):
         cfg.validate()
-
-
-@pytest.mark.parametrize("value", ["xhigh", "max"])
-def test_fix_effort_knob_rejects_route_only_efforts(value):
-    assert any("FIX_EFFORT" in e for e in _routed(FIX_EFFORT=value).parse_errors)
