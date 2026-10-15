@@ -1080,6 +1080,8 @@ export interface components {
              * @enum {string}
              */
             outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done";
+            /** Question */
+            question?: string | null;
         } & {
             [key: string]: unknown;
         };

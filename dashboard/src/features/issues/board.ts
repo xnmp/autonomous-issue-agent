@@ -346,7 +346,7 @@ export const OUTCOME_MARK: Record<TrackChip["outcome"], { glyph: string; label: 
   failed: { glyph: "✕", label: "failed" },
   changes_requested: { glyph: "±", label: "changes requested" },
   asked: { glyph: "?", label: "asked a question" },
-  done: { glyph: "•", label: "done" },
+  done: { glyph: "✓", label: "done" },
   running: { glyph: "…", label: "running" },
 };
 

@@ -305,9 +305,8 @@ function History({ visits }: { visits: StageVisit[] }) {
             <span className="board-vchips">
               {line.chips.map((chip, chipIndex) => {
                 const mark = OUTCOME_MARK[chip.outcome];
-                return (
+                const pill = (
                   <span
-                    key={`${chip.kind}-${chipIndex}`}
                     className={`board-step board-step-${chip.outcome}`}
                     {...tipProps(`${kindLabel(chip.kind)}: ${mark.label}`)}
                   >
@@ -315,6 +314,15 @@ function History({ visits }: { visits: StageVisit[] }) {
                     {kindLabel(chip.kind)}
                     {chip.count > 1 ? <span className="board-step-rep num">×{chip.count}</span> : null}
                   </span>
+                );
+                // The question is agent prose: React renders it as text only.
+                return chip.outcome === "asked" && chip.question ? (
+                  <details key={`${chip.kind}-${chipIndex}`} className="board-ask">
+                    <summary>{pill}</summary>
+                    <p className="board-ask-text">{chip.question}</p>
+                  </details>
+                ) : (
+                  <span key={`${chip.kind}-${chipIndex}`}>{pill}</span>
                 );
               })}
               {line.backFrom ? (

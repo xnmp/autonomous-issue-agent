@@ -287,6 +287,8 @@ class TrackChip(Contract):
     outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done"]
     # Consecutive identical legs folded into this one.
     count: int
+    # An `asked` leg's question: agent prose, untrusted, render as plain text.
+    question: str | None = None
 
 
 class StageVisit(Contract):
