@@ -334,7 +334,8 @@ class AccountingRuntime(AgentRuntime):
                 **({"question": question_text(result.needs)} if leg is LegClass.ASKED else {}),
                 # A review's parsed verdict: the harness submits it (and can
                 # resubmit it after a crash) without buying the review again.
-                **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
+                **({"verdict": {"event": verdict.event, "body": verdict.body,
+                                "body_edited_at": task.body_edited_at}} if verdict is not None else {}),
                 # Kept on this host only: a gap report publishes none of it (`domain.gaps`).
                 **({"harness_issue": gap.record()} if gap is not None else {}),
                 # A machine end's class, from a fixed vocabulary: what a stall report names.

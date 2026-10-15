@@ -383,6 +383,26 @@ def test_a_re_review_after_a_body_edit_whose_submission_github_fails_is_resubmit
     assert len(reviewer.tasks) == 2
 
 
+def test_a_re_review_that_lands_with_its_reply_lost_is_never_posted_twice(roles):
+    # tauri #1182's shape: a change request, a description-only answer, a
+    # re-review whose POST lands but whose reply is lost. A replayed leg that
+    # reads GitHub before the landed review shows must read it back, not post.
+    gh = green()
+    reviewer = Agent(verdict("REQUEST_CHANGES", "List the runs on h1."), verdict("APPROVE", "Runs listed."))
+    review = roles.review(gh, reviewer)
+    tick(review)
+    gh.edit_body(100, "Runs green on h1.")
+    lagging = gh.prs[100]
+    gh.lose_reply.add("submit_review")
+    tick(review)
+    assert [(s[1], s[3]) for s in gh.submitted] == [("REQUEST_CHANGES", "h1"), ("APPROVE", "h1")]
+
+    gh.get_pr = lambda _number, **_kw: lagging
+    asyncio.run(roles.review(gh, Agent()).legs.run(RunAgent(AgentKind.REVIEW, 100, head="h1")))
+    assert [(s[1], s[3]) for s in gh.submitted] == [("REQUEST_CHANGES", "h1"), ("APPROVE", "h1")]
+    assert len(reviewer.tasks) == 2
+
+
 def test_a_body_edit_before_the_bots_verdict_buys_no_second_review(roles):
     gh = green()
     gh.edit_body(100, "Edited before the review.")

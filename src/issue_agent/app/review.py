@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
 
 from ..adapters.act import submit_review
 from ..adapters.control_store import LegRun
@@ -64,20 +63,19 @@ def review_choose(harness: Harness) -> Choose:
     return choose
 
 
-def stored_verdict(runs: Iterable[LegRun], pr: int, head: str, since: datetime | None = None) -> Verdict | None:
-    """The verdict of this head's newest agent REVIEW leg, if it parsed one.
-    The receipt holds what `parse_verdict` accepted; it is parsed again here,
-    since a receipt is only as trusted as the agent output it came from. With
-    `since` (the PR body edit a re-review answers, #472), only a leg that
-    ended after it counts, as its verdict would have: an earlier one was
-    answered by the edit. Local clock against GitHub's, but the edit is made
-    by a fix leg, which the review lease keeps apart from any REVIEW leg."""
+def stored_verdict(runs: Iterable[LegRun], pr: int, head: str, edited: str = "") -> Verdict | None:
+    """The verdict of this head's newest agent REVIEW leg, if it parsed one
+    and judged the description last edited at `edited` (GitHub's stamp
+    against GitHub's, #472; a receipt from before the stamp was recorded
+    judged ""). The receipt holds what `parse_verdict` accepted; it is parsed
+    again here, since a receipt is only as trusted as the agent output it
+    came from."""
     mine = [run for run, end in leg_ends(runs) if end.kind is AgentKind.REVIEW and run_item(run) == pr_key(pr)
-            and run.head == head and not end.machine and (since is None or run.completed_at > since)]
+            and run.head == head and not end.machine]
     if not mine or mine[-1].receipt is None:
         return None
     raw = mine[-1].receipt.get("verdict")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or raw.get("body_edited_at", "") != edited:
         return None
     return parse_verdict({"decision": raw.get("event"), "body": raw.get("body")})
 
@@ -178,7 +176,7 @@ class ReviewLegs:
         runs = self.control.leg_runs(self.settings.repository, (issue,))
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
                                  head=action.head, tier=action.tier.value if action.tier is not None else "")
-        verdict = stored_verdict(runs, action.number, action.head, edited)
+        verdict = stored_verdict(runs, action.number, action.head, pr.body_edited_at)
         if verdict is not None and not on_head:
             # A paid verdict whose submission never landed (a crash, or GitHub
             # refused it): submit it, free. A dismissed verdict is not resubmitted.
@@ -213,7 +211,8 @@ class ReviewLegs:
             self.log(f"PR #{pr}: {verdict.event} stands on {head[:12]}")
             return
         self.log(f"REVIEW PR #{pr}: GitHub refused the {verdict.event} on {head[:12]} (counted as an attempt)")
-        self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
+        self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body,
+                                                                "body_edited_at": judged_edit}})
 
     def _issue(self, issue: int, runs: Iterable[LegRun], *, required: bool) -> tuple[str, str]:
         """The issue's body and human comments, each bounded. Derive's
@@ -252,7 +251,7 @@ class ReviewLegs:
             prior_review=as_untrusted(prior) if prior else None,
         )
         task = tasks.build_review_task(action.number, issue, action.head, base, context, self.task_config)
-        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort)
+        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort, body_edited_at=pr.body_edited_at)
 
 
 def _bounded(author: str, text: str) -> str:
