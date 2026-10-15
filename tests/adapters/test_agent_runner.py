@@ -20,9 +20,9 @@ import pytest
 from issue_agent.adapters.agent_runner import (
     DEFAULT_MAX_BUFFER_BYTES,
     AgentRunner,
+    StreamUsage,
     _trace_message,
     build_option_kwargs,
-    merge_usage,
     resolve_claude_cli,
     result_to_agent_result,
 )
@@ -498,13 +498,94 @@ def test_trace_message_names_the_tool_and_its_first_argument_line():
 # result abort reported usage=None and ledgered $0.00 however long it ran (first
 # real deployment: 906s, four commits, $0.00). AssistantMessage.usage is the API
 # call's OWN per-turn block, so summing across turns gives billed totals.
-def test_merge_usage_sums_numeric_per_turn_blocks_and_keeps_absent_distinct():
-    acc = merge_usage(None, {"input_tokens": 10, "output_tokens": 2})
-    assert merge_usage(acc, {"input_tokens": 30, "output_tokens": 5}) == {"input_tokens": 40, "output_tokens": 7}
-    assert merge_usage(None, {"input_tokens": 5, "cached": True, "model": "opus"}) == {"input_tokens": 5}
-    assert merge_usage(None, None) is None  # nothing ever reported
-    assert merge_usage(None, {}) == {}  # reported, and it was empty
-    assert merge_usage(None, "not-a-dict") is None
+def _assistant(mid, prompt, out, *, parent=None, blocks=1):
+    """The CLI's stream for one call: one real AssistantMessage per content
+    block, each repeating the call's usage with the message_start placeholder
+    for output (#426)."""
+    sdk = pytest.importorskip("claude_agent_sdk")
+    usage = {"input_tokens": 2, "cache_read_input_tokens": prompt - 2, "cache_creation_input_tokens": 0,
+             "output_tokens": out}
+    return [sdk.AssistantMessage(content=[], model="m", parent_tool_use_id=parent, usage=dict(usage),
+                                 message_id=mid) for _ in range(blocks)]
+
+
+def _stream_total(*calls):
+    stream, total = StreamUsage(), None
+    for m in (m for call in calls for m in call):
+        total = stream.add(m)
+    return total
+
+
+def test_stream_usage_counts_each_call_once_however_many_blocks_repeat_it():
+    """#426: thinking+text+tool_use blocks of one call repeat its usage; summing
+    them put 2x the cache reads of tauri #1051 in the ledger."""
+    total = _stream_total(_assistant("m1", 1000, 3, blocks=3), _assistant("m2", 1500, 1, blocks=2))
+
+    assert total["cache_read_input_tokens"] == 998 + 1498
+    assert total["input_tokens"] == 4
+
+
+def test_stream_usage_bounds_output_by_prompt_growth_and_the_last_call_by_the_largest_seen():
+    """The stream's output_tokens is a placeholder; the next call's prompt holds
+    the previous output, so a capped leg is never charged below it."""
+    total = _stream_total(_assistant("m1", 1000, 3), _assistant("m2", 1600, 1), _assistant("m3", 1650, 1))
+
+    # m1 <= 600, m2 <= 50; the last call has no next prompt: the largest bound seen.
+    assert total["output_tokens"] == 600 + 50 + 600
+
+
+def test_stream_usage_never_counts_a_call_below_its_placeholder_across_a_compaction():
+    total = _stream_total(_assistant("m1", 9000, 40), _assistant("m2", 1000, 7))
+
+    assert total["output_tokens"] == 40 + 40
+
+
+def test_stream_usage_takes_the_largest_value_a_message_reported_for_each_field():
+    sdk = pytest.importorskip("claude_agent_sdk")
+    first, later = _assistant("m1", 1000, 3)[0], _assistant("m1", 1000, 90)[0]
+    stream = StreamUsage()
+    stream.add(first)
+    assert stream.add(later)["output_tokens"] == 90
+    assert stream.add(sdk.AssistantMessage(content=[], model="m", usage=dict(first.usage), message_id="m1"))["output_tokens"] == 90
+
+
+def test_stream_usage_keeps_a_subagent_thread_separate_from_the_main_loop():
+    main = [_assistant("a", 1000, 1), _assistant("c", 1100, 1)]
+    sub = [_assistant("b", 50_000, 1, parent="tool-1"), _assistant("d", 50_300, 1, parent="tool-1")]
+    total = _stream_total(main[0], sub[0], main[1], sub[1])
+
+    assert total["output_tokens"] == (100 + 100) + (300 + 300)
+
+
+def test_stream_usage_counts_an_id_less_message_and_ignores_unusable_usage():
+    sdk = pytest.importorskip("claude_agent_sdk")
+    stream = StreamUsage()
+    assert stream.add(sdk.AssistantMessage(content=[], model="m", usage=None, message_id="x")) is None
+    assert stream.add(sdk.AssistantMessage(content=[], model="m", usage="junk", message_id="y")) is None
+    total = stream.add(sdk.AssistantMessage(content=[], model="m", usage={"output_tokens": 5, "model": "o"}))
+    assert total == {"output_tokens": 5}
+
+
+def test_a_resultless_leg_settles_only_its_assistant_calls_not_task_events_or_follow_up_results(monkeypatch):
+    """The reviewer's shape: task progress events (usage {total_tokens, ...}, no
+    id) between main calls must not reset the thread, and a follow-up
+    task-notification result (cumulative usage) must not be added."""
+    sdk = pytest.importorskip("claude_agent_sdk")
+    progress = sdk.TaskProgressMessage(
+        subtype="task_progress", data={}, task_id="t", description="d", uuid="u", session_id="s",
+        usage={"total_tokens": 99_000, "tool_uses": 4, "duration_ms": 10})
+    follow_up = sdk.ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="s",
+        usage={"input_tokens": 9, "output_tokens": 2_900_000, "cache_read_input_tokens": 1,
+               "cache_creation_input_tokens": 1})
+    stream = [*_assistant("m1", 1000, 3, blocks=3), progress, *_assistant("m2", 1100, 1, blocks=2), progress, follow_up]
+    _install_fake_sdk(monkeypatch, stream)
+
+    r = _run()
+
+    assert r.exit_reason is ExitReason.NO_RESULT
+    assert r.usage == {"input_tokens": 4, "cache_read_input_tokens": 998 + 1098, "cache_creation_input_tokens": 0,
+                       "output_tokens": 100 + 100}
 
 
 def test_wall_timeout_result_carries_the_tokens_spent_before_the_abort():

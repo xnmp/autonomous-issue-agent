@@ -303,19 +303,62 @@ def error_forensics(msg: Any) -> str:
     return "; ".join(parts) or "envelope carried no diagnostic fields"
 
 
-def merge_usage(acc: dict | None, raw: Any) -> dict | None:
-    """Add one per-turn usage block (each API call's own, so the sum is the
-    billed total) to a running total, so an ABORTED run still knows what it
-    spent: dollars arrive only on the final ResultMessage (a 906s session once
-    ledgered $0.00). None until something is seen."""
-    if not isinstance(raw, dict):
-        return acc
-    out = dict(acc or {})
-    for k, v in raw.items():
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            continue
-        out[k] = out.get(k, 0) + v
-    return out
+class StreamUsage:
+    """Running token total of a stream, so an aborted run knows what it spent:
+    dollars arrive only on the final ResultMessage (a 906s session once
+    ledgered $0.00). ADR 0002: a killed leg is settled from usable evidence,
+    never charged below what the stream shows.
+
+    The CLI emits one AssistantMessage per content block, each repeating its
+    API call's usage, and `output_tokens` is the message_start placeholder
+    (1-3), never the final count (observed on CLI 2.1.294, #426); the true
+    output arrives only in the ResultMessage. So only AssistantMessages count
+    (task progress/notification and result messages carry other usage shapes),
+    each message id once with the per-field maximum of its blocks, and a call's
+    output is bounded above by what the stream still shows: the next call's
+    prompt (input+cache) contains this call's output, so the growth between
+    consecutive calls of one thread (a subagent's `parent_tool_use_id` is its
+    own thread) bounds it. The thread's last call has no next prompt; a
+    heuristic, not a bound, gives it the largest bound seen in its thread. The
+    growth over-counts tool results and under-counts only across a compaction;
+    it never falls below the placeholder."""
+
+    _PROMPT = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+    def __init__(self) -> None:
+        # thread -> call key -> per-field max usage, in arrival order. An id-less
+        # message cannot be deduplicated: it gets its own key, counted not dropped.
+        self._threads: dict[str | None, dict[object, dict[str, float]]] = {}
+
+    def add(self, message: Any) -> dict | None:
+        raw = getattr(message, "usage", None)
+        if type(message).__name__ != "AssistantMessage" or not isinstance(raw, dict):
+            return self.total()
+        mid = getattr(message, "message_id", None)
+        calls = self._threads.setdefault(getattr(message, "parent_tool_use_id", None), {})
+        key = mid if isinstance(mid, str) else object()
+        usage = calls.setdefault(key, {})
+        for k, v in raw.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                usage[k] = max(usage.get(k, v), v)
+        return self.total()
+
+    def total(self) -> dict | None:
+        calls_by_thread = [list(calls.values()) for calls in self._threads.values()]
+        if not any(calls_by_thread):
+            return None
+        total: dict[str, float] = {}
+        for calls in calls_by_thread:
+            prompts = [sum(c.get(k, 0) for k in self._PROMPT) for c in calls]
+            outputs = [max(c.get("output_tokens", 0), nxt - cur)
+                       for c, cur, nxt in zip(calls, prompts, prompts[1:])]
+            outputs.append(max([calls[-1].get("output_tokens", 0), *outputs]))
+            for call, out in zip(calls, outputs):
+                for k, v in call.items():
+                    total[k] = total.get(k, 0) + (out if k == "output_tokens" else v)
+                if out and "output_tokens" not in call:
+                    total["output_tokens"] = total.get("output_tokens", 0) + out
+        return total
 
 
 def _trace_message(msg: Any) -> str:
@@ -529,6 +572,7 @@ class AgentRunner(AgentRuntime):
                                        session_id=result.session_id or resolved_session or task.resume or "")
 
         usage_acc: dict | None = None
+        stream_usage = StreamUsage()
         # The clock is injectable: read it only when a cap is armed.
         started_at = self._wall_clock() if self._max_runtime is not None else 0.0
         agen = query(prompt=task.rendered_prompt, options=options).__aiter__()
@@ -599,7 +643,7 @@ class AgentRunner(AgentRuntime):
                 # assistant message may be a subagent's.
                 resolved_model = resolved_model or reported_model(message)
                 resolved_session = resolved_session or reported_session(message)
-                usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
+                usage_acc = stream_usage.add(message)
                 # A background-requested turn end carries terminal_reason on a
                 # non-Result message: the forensic for a no-result drop.
                 if tr := getattr(message, "terminal_reason", None):
