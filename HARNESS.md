@@ -408,6 +408,26 @@ the harness links it and posts one comment with the reason, or one saying why
 it refused. That comment ends the matter: delete the link on GitHub and the
 harness never re-adds it.
 
+A red base branch is the harness's to fix first (#313, #402, ADR 0017). A
+PR whose failing checks all fail on the base tip too waits uncharged. A
+workflow failing on the base's push runs gets one issue per red streak,
+`CI: <workflow> failing on <base> since <head>`, naming the first failing
+run; the harness closes it when the workflow passes, and a later failure, or
+one completing after a close while still red (a human's, or a fix's merge),
+gets the next streak's issue. On a non-default base, where `Closes #` closes
+nothing, once a run created after the merge has failed, the harness files
+that failure's issue and then closes the fixed one itself; runs from before
+the merge are ignored. To reopen
+such an issue and keep it open, label it `needs-human`. If the workflow has a check the base
+branch requires, the harness readies the issue itself and dispatches it ahead
+of everything else, without steward, triage or blocked-by, and its PR is
+charged the base's failures. Other work is not paused: required checks
+already keep PRs from merging onto the breakage. A non-required workflow's
+issue waits for a human's `ai-ready`, as does every issue while the branch's
+protection cannot be read. Label it `needs-human` to keep the harness off it.
+Doctor warns when base pushes cancel each other's runs
+(`cancel-in-progress: true` on a push trigger): a cancelled run is no verdict.
+
 The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Origin,
 and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
 account; it is not a multi-user authentication service.

@@ -581,3 +581,15 @@ def test_doctor_says_so_when_the_repo_has_no_workflows_at_all(tmp_path):
     result = _ci_doctor(tmp_path, {}, workflows=0)
     assert "no active Actions workflows" in result.stdout
     assert "NONE exactly like OK" in result.stdout
+
+
+def test_doctor_warns_when_base_pushes_cancel_each_others_runs(tmp_path):
+    """#402: a cancelled base run is no verdict, so a red base files nothing until a run completes."""
+    for name, workflow in {"cancels": "on: [push, pull_request]\nconcurrency:\n  cancel-in-progress: true\n",
+                           "prs-only": "on:\n  push:\nconcurrency:\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
+                           "no-push": "on: pull_request\nconcurrency:\n  cancel-in-progress: true\n"}.items():
+        target = tmp_path / name / "target"
+        (target / ".github" / "workflows").mkdir(parents=True)
+        (target / ".github" / "workflows" / "ci.yml").write_text(workflow)
+        result = _ci_doctor(tmp_path / name, {"TARGET_DIR": str(target)})
+        assert ("cancel-in-progress: true on a push-triggered workflow ( ci.yml )" in result.stdout) == (name == "cancels")

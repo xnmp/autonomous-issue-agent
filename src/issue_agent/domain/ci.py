@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 
-from .checks import BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
+from .checks import BaseCI, BaseIssue, BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -157,3 +157,30 @@ def base_verdicts(runs: Iterable[BaseRun]) -> tuple[tuple[BaseRun, BaseRun, bool
         out.append((latest, streak[-1], len(streak) <= len(older)))
     return tuple(out)
 
+
+
+def base_title(workflow: str, base: str, head: str = "") -> str:
+    """A base-CI issue's title, one per workflow per red streak (#402), named
+    by the head of the streak's first failing run. Without `head`: the prefix
+    all of the workflow's titles share, and an issue from before #402, which
+    counts as its workflow's current streak. The name is cut so the title
+    stays within GitHub's 256 characters."""
+    name = " ".join(workflow.split())[:max(1, min(200, 226 - len(base)))]
+    return f"CI: {name} failing on {base}" + (f" since {head[:7]}" if head else "")
+
+
+def workflow_issues(base_ci: BaseCI, workflow: str, base: str) -> tuple[BaseIssue, ...]:
+    """`workflow`'s base-CI issues, oldest first."""
+    prefix = base_title(workflow, base)
+    return tuple(sorted((i for i in base_ci.issues if i.title == prefix or i.title.startswith(prefix + " since ")),
+                        key=lambda i: i.number))
+
+
+def base_fix(base_ci: BaseCI | None, base: str) -> frozenset[int]:
+    """The open base-CI issues of workflows the base branch requires (#402):
+    the harness readies them and serves them first, without STEWARD, TRIAGE
+    or a blocker, and their PRs are charged the base's failures. None while
+    the required workflows are unread: the issues then wait for a human."""
+    if base_ci is None or base_ci.required is None:
+        return frozenset()
+    return frozenset(i.number for w in base_ci.required for i in workflow_issues(base_ci, w, base) if not i.closed_at)

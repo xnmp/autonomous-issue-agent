@@ -175,6 +175,7 @@ class PRView:
     # Head-branch pushes, any order. Empty = none observed.
     pushes: tuple[Push, ...] = ()
     needs_human_labeled_at: str = ""  # as on IssueView
+    merged_at: str = ""  # a merged PR's merge time ("" unread or not merged)
 
     @property
     def checks(self) -> tuple[Check, ...]:

@@ -11,14 +11,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
+from types import MappingProxyType
 
 from .actions import (
     ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel,
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
-from .checks import BaseCI
-from .ci import GREEN_CONCLUSIONS, base_verdicts, parse_timestamp
+from .checks import BaseCI, BaseRun
+from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
@@ -68,8 +69,9 @@ def actions(states: Mapping[ItemKey, DerivedState], harness: Harness) -> tuple[A
     return tuple(out)
 
 
-def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime]) -> list[ItemKey]:
-    """Who gets a scarce slot first: PR-stage items before issue-stage (finish
+def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime],
+                   first: frozenset[ItemKey] = frozenset()) -> list[ItemKey]:
+    """Who gets a scarce slot first: base-fix work (`first`, #402), then PR-stage items before issue-stage (finish
     work in progress before starting new), then the item that has waited
     longest (its newest leg end; none = never served = oldest), then by number
     so the order is total. Ordering only: every key keeps its place in the list.
@@ -77,7 +79,7 @@ def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, date
     A file-overlap preference (#394) was removed (#450): conflicts are the
     rebase act's job. A paid scheduler leg would replace this function (#388)."""
     never = datetime.min.replace(tzinfo=timezone.utc)
-    return sorted(keys, key=lambda k: (k.target is not Target.PR, waiting_since.get(k, never), k.number))
+    return sorted(keys, key=lambda k: (k not in first, k.target is not Target.PR, waiting_since.get(k, never), k.number))
 
 
 def needs_human_key(key: ItemKey, stop: NeedsHuman) -> str:
@@ -126,39 +128,68 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
             "the harness will not write that link again.")
 
 
-def base_title(workflow: str, base: str) -> str:
-    """A workflow's one base-CI issue is known by this title: the name is cut
-    so the title keeps its searched suffix within GitHub's 256 characters."""
-    return f"CI: {' '.join(workflow.split())[:max(1, min(200, 240 - len(base)))]} failing on {base}"
-
-
-def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str) -> tuple[Action, ...]:
-    """One issue per workflow on the base branch, for life, required or not
-    (#402 plans to fix forward through it). A red verdict files it (once:
-    keyed) or reopens it if the red streak began after it was closed; green
-    closes it. Unless the harness closed it, a streak whose start is past the
-    listed runs reopens nothing, so a human's close during a red streak holds
-    until the workflow passes and fails again."""
+def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str,
+                    labels: Mapping[int, frozenset[Label]] = MappingProxyType({}),
+                    merged: Mapping[int, str] = MappingProxyType({})) -> tuple[Action, ...]:
+    """One issue per workflow per red streak on the base branch, required or
+    not (#402, ADR 0017). Green closes the workflow's open issues. A red
+    verdict with none open files one, named and keyed by the streak's first
+    failing run; once an issue filed for this streak is closed while it stays
+    red (a human, a fix's merge), by the first failing run that completed
+    after that close. A close by the green before the streak never holds it
+    back. An open issue whose harness PR merged (`merged`: issue -> merged at;
+    a fix into a non-default base that `Closes #` does not close) has ended
+    once a failing run created at or after the merge has completed: that run
+    files the next issue, and the ended issue is closed only once another
+    issue of the workflow is seen open. The close never precedes the filing,
+    so a lost write (an error, a kill) leaves the next tick to derive what is
+    left. A run from before the merge counts for neither, and `needs-human`
+    keeps the issue open. A required
+    workflow's open issue is readied (`ai-ready`) unless it carries
+    `ai-ready` or `needs-human` (`labels`, of the open issues the fix role
+    reads)."""
     if base_ci is None:
         return ()
     out: list[Action] = []
     for latest, since, bounded in base_verdicts(base_ci.runs):
-        title = base_title(latest.workflow, base)
-        issue, name = base_ci.issue(title), _inert(" ".join(latest.workflow.split())[:200])
-        run = f"{since.url} (head `{since.head_sha}`)"
+        issues, name = workflow_issues(base_ci, latest.workflow, base), _inert(" ".join(latest.workflow.split())[:200])
+        opened = [i for i in issues if not i.closed_at]
         if latest.conclusion in GREEN_CONCLUSIONS:
-            if issue is not None and not issue.closed_at:
-                out.append(SetIssueState(issue.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
-                                                              f"{latest.url} (head `{latest.head_sha}`)."))
-        elif issue is None:
-            out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {'First' if bounded else 'Earliest listed'} failing run: {run}.\n\n"
-                                        "The harness closes this issue when it passes, and reopens it when it fails "
-                                        "again.", f"base-ci:{base}:{title}"))
-        elif (bounded or issue.harness_closed) and (finished := parse_timestamp(since.completed_at)) \
-                and (closed := parse_timestamp(issue.closed_at)) and finished > closed:
-            out.append(SetIssueState(issue.number, True, f"{marker}\n**{name}** is failing on `{base}` again. "
-                                                         f"First failing run: {run}."))
+            out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
+                                                      f"{latest.url} (head `{latest.head_sha}`).") for i in opened)
+            continue
+        streak = sorted((r for r in base_ci.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
+                         and _created(r) >= _created(since)), key=_created)
+        closed = {i.title: at for i in issues if (at := parse_timestamp(i.closed_at))}
+        failed = {i.number: next((r for r in streak if _created(r)[0] >= at), None) for i in opened
+                  if (at := parse_timestamp(merged.get(i.number, ""))) and Label.NEEDS_HUMAN not in labels.get(
+                      i.number, frozenset())}
+        ended = {n: r for n, r in failed.items() if r is not None}  # its fix merged, and a later run still fails
+        if len(ended) < len(opened):  # another issue stays open for the red base: the ended ones may close
+            out.extend(SetIssueState(n, False, f"{marker}\nIts fix merged, but **{name}** still fails on `{base}` "
+                                               f"after it: {r.url}. That failure has an issue of its own.")
+                       for n, r in sorted(ended.items()))
+            continue
+        after = max((closed[t] for r in streak if (t := base_title(latest.workflow, base, r.head_sha)) in closed),
+                    default=None)
+        first = min(ended.values(), key=_created) if ended else next((
+            r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed and (
+                after is None or (parse_timestamp(r.completed_at) or after) >= after)), None)
+        if first is None:
+            continue  # closed after every listed failure of the streak: the next failing run files
+        title = base_title(latest.workflow, base, first.head_sha)
+        lead = "Earliest listed" if first == since and not bounded else "First"
+        out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {lead} failing run: {first.url} "
+                                    f"(head `{first.head_sha}`).\n\nThe harness closes this issue when it passes; a "
+                                    "later failure gets an issue of its own.", f"base-ci:{base}:{title}"))
+    admitted = {n for n, held in labels.items() if Label.AI_READY in held or Label.NEEDS_HUMAN in held}
+    out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
+               for n in sorted(base_fix(base_ci, base) - admitted))
     return tuple(out)
+
+
+def _created(run: BaseRun) -> tuple[datetime, int]:
+    return (parse_timestamp(run.created_at) or datetime.min.replace(tzinfo=timezone.utc), run.run_id)
 
 
 _GAP_FOOTER = ("Filed by the harness from its own records: no agent-written text is published here. No automatic "
@@ -270,6 +301,6 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     raise TypeError(f"unknown derived state {state!r}")
 
 
-__all__ = ["QUESTION_LIMIT", "actions", "base_ci_actions", "base_title",
+__all__ = ["QUESTION_LIMIT", "actions", "base_ci_actions",
            "blocker_closed_comment", "blocker_comment", "dispatch_order", "gap_actions", "needs_human_key",
            "question_text", "triage_comment"]

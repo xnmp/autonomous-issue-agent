@@ -891,3 +891,11 @@ def test_the_link_is_read_in_one_query_and_written_with_add_blocked_by():
     assert "issue=I5" in calls[1] and "blocker=I4" in calls[1]
     with pytest.raises(ValueError):
         gateway.blocker_link(5, True)
+
+
+def test_a_merged_harness_prs_merge_time_is_read_and_a_missing_or_malformed_one_is_blank():
+    def at(merged_at):
+        return {"source": {**xref(10)["source"], "mergedAt": merged_at}}
+
+    times = [p.merged_at for p in parse_merged_harness_prs([at("2026-10-14T10:00:00Z"), xref(10), at(7)], "o/r")]
+    assert times == ["2026-10-14T10:00:00Z", "", ""]

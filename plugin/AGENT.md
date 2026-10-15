@@ -135,6 +135,15 @@ return `status=pushed`, with a summary that names the fixing change, gives the
 evidence for each criterion and ends with `Closes #<issue>`. The independent reviewer checks the claim, and the merge
 closes the issue.
 
+An issue titled `CI: <workflow> failing on $BASE_BRANCH since <head>` means
+that workflow fails on the base branch itself. Its body names the first
+failing run. Read the failing job's log and the pull requests merged since the
+last green run. When reverting one merged pull request alone clearly fixes it,
+revert it on your branch with `git revert` (`-m 1` for a merge commit) and say
+in the summary which pull request you reverted and why; otherwise fix forward.
+A flaky test that turned the base red is a defect: make it deterministic
+rather than retrying it. End the summary with `Closes #<issue>` as usual.
+
 Before blocking for a platform you cannot run locally, check whether CI runs it
 and collect its evidence, adding diagnostic instrumentation as needed (e.g.
 fail-fast timeouts, verbose logs, `always()` artifact uploads). After two

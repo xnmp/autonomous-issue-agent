@@ -59,7 +59,7 @@ Precedence, the single place it is defined (first match wins, per item):
                free): an issue act (no PR yet) whose issue GitHub marks
                "blocked by" an open issue, in any repository -> Wait (BLOCKED;
                the observation that shows every blocker closed lets it start;
-               an item with a PR is never gated); bot review rounds >= cap
+               an item with a PR is never gated, nor a base-fix issue, #402); bot review rounds >= cap
                (ADDRESS_REVIEW on a bot verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
                issue's lifetime cap cannot afford a leg -> NeedsHuman; machine
                backoff -> Backoff; daily or global headroom short -> Wait
@@ -101,7 +101,7 @@ from types import MappingProxyType
 from .actions import ISSUE_ACTS, ROUTED_ACTS, AgentKind, Evidence, Target, check_evidence, check_tier
 from .backoff import LegEnd, machine_backoff_until
 from .checks import Check, Observed
-from .ci import BaseRed, Clear, Failed, Waiting, charge, is_pending, parse_timestamp, reduce_ci
+from .ci import BaseRed, Clear, Failed, Waiting, base_fix, charge, is_pending, parse_timestamp, reduce_ci
 from .evidence import ChangeRequest, CiFailures, began, new_failures
 from .identity import login_eq
 from .labels import Label
@@ -408,6 +408,15 @@ DerivedState = (Dispatch | Merge | Refresh | Rerun | OpenPR | TriageNote | LinkB
                 | Busy | Backoff)
 
 
+class Origin(Enum):
+    """Who put the item on the harness: a human's `ai-ready`, or the harness
+    for a red required base workflow (#402): no STEWARD or TRIAGE, no blocker,
+    and its PR is charged the base's failures."""
+
+    HUMAN = "human"
+    BASE_FIX = "base-fix"
+
+
 @dataclass(frozen=True)
 class _Item:
     key: ItemKey
@@ -419,6 +428,8 @@ class _Item:
     labeled_at: str = ""
     base: tuple[Check, ...] | None = None  # the PR base's tip reports; None = unread
     blocked_by: tuple[BlockerRef, ...] = ()
+    origin: Origin = Origin.HUMAN
+
 
 
 # The title of the harness's own gap report (`policy.gap_actions`). No pickup
@@ -444,13 +455,17 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
     for b in world.branches:
         if (n := harness_branch_issue(b.name)) is not None:
             pushed.setdefault(n, []).append(b)
+    fixing = base_fix(world.base_ci, world.base.ref if world.base else "")
     items = [
         _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
-              labeled_at=i.needs_human_labeled_at, blocked_by=i.blocked_by)
+              labeled_at=i.needs_human_labeled_at, blocked_by=() if i.number in fixing else i.blocked_by,
+              origin=Origin.BASE_FIX if i.number in fixing else Origin.HUMAN)
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
-               base=world.base.reports if world.base and world.base.ref == p.base_ref_name else None)
+               # A base-fix PR must fix the base's failures: none of them is the base's to it.
+               base=world.base.reports if world.base and world.base.ref == p.base_ref_name and n not in fixing
+               else None)
          for p, n in prs if p.number > 0]
     observed = parse_timestamp(world.now)
     return {item.key: _decide(item, local, harness, observed) for item in items}
@@ -521,7 +536,9 @@ def _proceed(
     if pr is None:
         # STEWARD first: a duplicate stops before any grading is bought.
         steward = latest_steward(issue_legs)
-        if steward is None:
+        if item.origin is Origin.BASE_FIX:
+            step = Dispatch(AgentKind.RESOLVE)  # filed from CI evidence: nothing to steward or grade
+        elif steward is None:
             step = Dispatch(AgentKind.STEWARD)
         elif (stop := _duplicate_stop(steward, stops, anchor)) is not None:
             return stop

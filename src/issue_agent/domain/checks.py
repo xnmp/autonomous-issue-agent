@@ -107,23 +107,22 @@ class BaseRun:
 
 @dataclass(frozen=True)
 class BaseIssue:
-    """A base-CI issue the fixer opened, known by its title. `harness_closed`:
-    its last close was the fixer's own, not a human's or a merged PR's."""
+    """A base-CI issue the fixer opened, known by its title: one per workflow
+    per red streak (#402)."""
 
     number: int
     title: str
     closed_at: str = ""  # "" while open
-    harness_closed: bool = False
 
 
 @dataclass(frozen=True)
 class BaseCI:
-    """Base runs and the fixer's base-CI issues, open and closed. Only a
-    complete read constructs one; an unread base is absent, never empty."""
+    """Base runs and the fixer's base-CI issues, open and closed (the newest
+    100). `required`: the workflows with a check the base branch requires, by
+    the base tip's check runs; None when unread, and nothing is auto-readied.
+    Only a complete read of runs and issues constructs one; an unread base is
+    absent, never empty."""
 
     runs: tuple[BaseRun, ...]
     issues: tuple[BaseIssue, ...]
-
-    def issue(self, title: str) -> BaseIssue | None:
-        """The oldest issue with `title`: a duplicate never changes which one is meant."""
-        return next(iter(sorted((i for i in self.issues if i.title == title), key=lambda i: i.number)), None)
+    required: frozenset[str] | None = None

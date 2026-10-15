@@ -22,6 +22,7 @@ from ..adapters.control_store import LegRun
 from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
 from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
+from ..domain.ci import base_fix
 from ..domain.evidence import ChangeRequest, CiFailures
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
@@ -47,14 +48,15 @@ _LIGHT_ACTS = frozenset(kind for kind in AgentKind if not kind.holds_dispatch_sl
 def fix_actions(
     states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int, *, merge: bool = True,
     light: int | None = None, waiting_since: Mapping[ItemKey, datetime] = MappingProxyType({}),
+    first: frozenset[ItemKey] = frozenset(),
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches. At most
-    `slots` slot-holding dispatches, granted in `dispatch_order`; STEWARD and TRIAGE hold
+    `slots` slot-holding dispatches, granted in `dispatch_order` (base-fix issues `first`); STEWARD and TRIAGE hold
     no slot and is bounded by `light` (None: unbounded), in the same order. With
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     per_item = {key: policy_actions({key: state}, harness) for key, state in states.items()}
     granted: set[RunAgent] = set()
-    for key in dispatch_order(per_item, waiting_since):
+    for key in dispatch_order(per_item, waiting_since, first):
         for action in per_item[key]:
             if not isinstance(action, RunAgent) or action.kind not in _FIX_ACTS:
                 continue
@@ -345,12 +347,17 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
             issue = harness_branch_issue(pr.head_ref_name)
             if pr_key(pr.number) not in waiting and issue is not None and issue_key(issue) in waiting:
                 waiting[pr_key(pr.number)] = waiting[issue_key(issue)]
-        # The base branch's own CI is not an item: one issue per failing workflow, no lifecycle.
-        base = base_ci_actions(world.base_ci, settings.base_branch, settings.harness.marker)
+        # The base branch's own CI is not an item: one issue per failing workflow per red streak (#402).
+        merged = {n: p.merged_at for p in world.prs if p.state == "MERGED" and (n := harness_branch_issue(p.head_ref_name))}
+        base = base_ci_actions(world.base_ci, settings.base_branch, settings.harness.marker,
+                               {i.number: i.labels for i in world.issues}, merged)
+        fixing = base_fix(world.base_ci, settings.base_branch)
+        first = frozenset({issue_key(n) for n in fixing} | {
+            pr_key(p.number) for p in world.prs if p.state == "OPEN" and harness_branch_issue(p.head_ref_name) in fixing})
         gaps = gap_actions(local.legs, states, GapTarget(settings.repository, settings.target_public),
                            settings.harness_repo, settings.harness.marker, local.reported)
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
-                           light=slots.light, waiting_since=waiting) + base + gaps
+                           light=slots.light, waiting_since=waiting, first=first) + base + gaps
     return choose
 
 

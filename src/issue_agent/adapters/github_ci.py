@@ -125,23 +125,28 @@ def base_runs(payload, base: str) -> tuple[BaseRun, ...]:
 
 
 def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
-    """The issues `filer` opened in one complete page of issue-search results."""
+    """The issues `filer` opened in one page of issue-search results, newest
+    first: one issue per red streak accumulates (#402). A page shorter than
+    the count says (up to 100) is unread."""
     nodes = search.get("nodes") if isinstance(search, dict) else None
-    if (not isinstance(nodes, list) or search.get("issueCount") != len(nodes)
+    count = search.get("issueCount") if isinstance(search, dict) else None
+    if (not isinstance(nodes, list) or type(count) is not int or len(nodes) != min(count, 100)
             or any(not isinstance(n, dict) or type(n.get("number")) is not int or not isinstance(n.get("title"), str)
                    or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
                    for n in nodes)):
-        raise ValueError("issue search is absent, malformed or past one page")
-    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
-                           n["state"] == "CLOSED" and _closed_by(n, filer))
+        raise ValueError("issue search is absent, malformed or short")
+    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"])
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 
-def _closed_by(node: dict, filer: str) -> bool:
-    """Whether `filer` itself closed the issue last (not a merged PR it authored or merged)."""
-    events = (node.get("timelineItems") or {}).get("nodes") or [{}]
-    last = events[-1] if isinstance(events, list) and isinstance(events[-1], dict) else {}
-    return last.get("closer") is None and login_eq(str((last.get("actor") or {}).get("login") or ""), filer)
+def required_workflows(policy: frozenset[RequiredCheck], nodes: list) -> frozenset[str]:
+    """The workflows of the base tip's check runs that a required context
+    names (#402): whose base-CI issue the harness readies."""
+    contexts = {r.context for r in policy}
+    return frozenset(name for n in nodes if isinstance(n, dict) and n.get("__typename") == "CheckRun"
+                     and n.get("name") in contexts
+                     and isinstance(name := (((n.get("checkSuite") or {}).get("workflowRun") or {})
+                                             .get("workflow") or {}).get("name"), str) and name)
 
 
 def _checked_merge(selected):

@@ -526,6 +526,18 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$_WF_DIR" ]; then
     if [ -n "$_NONLINUX" ]; then
       warn "CI matrix includes $_NONLINUX — TEST_CMD runs on Linux only (this box), so failures on those platforms are invisible to preflight AND to the local gate. The harness cannot reproduce or fix them; each one costs a fix-ci leg that cannot converge. Verify those jobs are green before trusting auto-merge."
     fi
+    # #402: a base push that cancels the run before it leaves that run with no
+    # verdict, so a red base workflow files its issue only once a run completes.
+    _CANCEL=""
+    for _f in "${_WF_FILES[@]}"; do
+      if grep -qE '^[[:space:]]*cancel-in-progress:[[:space:]]*true([[:space:]]*(#.*)?)?$' "$_f" \
+         && grep -qE '^[[:space:]]*push:|^[[:space:]]*"?on"?:.*[^A-Za-z_-]push([^A-Za-z_-]|$)' "$_f"; then
+        _CANCEL="$_CANCEL ${_f##*/}"
+      fi
+    done
+    if [ -n "$_CANCEL" ]; then
+      warn "cancel-in-progress: true on a push-triggered workflow ($_CANCEL ) — base pushes cancel each other's runs, so a red '$_BASE' may go unfiled until a run completes (#402). Prefer cancel-in-progress: \${{ github.event_name == 'pull_request' }}."
+    fi
   fi
 fi
 
