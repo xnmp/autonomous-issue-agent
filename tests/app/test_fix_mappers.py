@@ -378,7 +378,11 @@ def _choose_gaps(runs, live_numbers, harness_repo="xnmp/autonomous-issue-agent",
 
     world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in live_numbers))
     loc = Local(now=T0 + timedelta(days=1), legs=local_legs(runs))
-    settings = FixSettings("o/r", True, "dev", "claude", "", H, harness_repo=harness_repo, target_public=target_public)
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import ModelRoute
+
+    settings = FixSettings("o/r", True, "dev", "", H, lambda _kind, _tier: ModelRoute(RuntimeName.CLAUDE, None),
+                           harness_repo=harness_repo, target_public=target_public)
     chosen = fix_choose(settings, lambda _m: None)(world, derive(world, loc, H), Slots(0, 0), loc)
     return [a for a in chosen if isinstance(a, ReportGap)]
 
