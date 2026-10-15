@@ -924,7 +924,8 @@ def bind_runtime(
 
     fix = role == "fix"
     state_dir = cfg.state_dir_for(role)
-    model = (cfg.codex_model if fix else cfg.review_model) or None
+    # The runner's default model; every routed leg carries its own.
+    model = ((cfg.fix_model if cfg.fixer_runtime is RuntimeName.CODEX else None) if fix else cfg.review_model) or None
     codex = CodexRunner(
         codex_bin=cfg.codex_bin,
         provider=CodexProvider(provider_id=cfg.codex_provider_id, name=cfg.codex_provider_name,

@@ -87,12 +87,16 @@ Important fields:
   legs run on `FIX_MODEL_<TIER>` (`runtime:model`, e.g. `claude:claude-sonnet-5-5`), one tier stronger per earlier attempt in the
   attempt run, capped at `xhigh`. Review legs run at the tier of the fix leg
   that produced the head, else the triaged tier, else `REVIEW_MODEL`. An unset
-  tier spec falls back to `FIX_MODEL` on `FIXER_RUNTIME`. `TRIAGE_MODEL`
+  tier spec falls back to `FIX_MODEL` (blank: the runtime's own default) on
+  `FIXER_RUNTIME`, which must be a model of that runtime. `TRIAGE_MODEL`
   (blank: the `low` spec) routes the tier-grading leg and `STEWARD_MODEL`
   (blank: `TRIAGE_MODEL`'s route) the leg that runs first, writing the
   acceptance criteria and flagging duplicates; `TRIAGE_BUDGET_USD` bounds each
   of the two. A suspected duplicate stops the issue with `needs-human`; a reply or label
-  removal releases it. Effort stays `FIX_EFFORT` / `CODEX_REASONING_EFFORT`.
+  removal releases it. Effort is the route's third segment
+  (`runtime:model:effort`); omitted, the runtime's own default applies
+  (`CODEX_REASONING_EFFORT` on codex). `CODEX_MODEL` and `FIX_EFFORT` were
+  removed (#447): a non-blank value fails startup naming its replacement.
 - Astra has built-in standard-context accounting estimates ($10/$50 per
   million input/output tokens, $1 cached input); existing configured model
   rates override them. These estimates are not provider invoices and do not

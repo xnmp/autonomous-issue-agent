@@ -21,7 +21,7 @@ from enum import Enum
 from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
-from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
+from ..domain.effort import Effort
 from ..domain.identity import normalize_login
 from ..domain.contracts import Money
 from ..domain.pricing import (
@@ -97,10 +97,8 @@ class HarnessConfig:
     fix_dispatch_concurrency: int = _knob(2)
     auto_merge: bool = _knob(True)
     merge_method: str = _knob("squash", coerce="choice", choices=("squash", "merge", "rebase"))
+    # The fix role's default model on FIXER_RUNTIME (blank: the runtime's own).
     fix_model: str | None = _knob(None)
-    # Base reasoning effort for fix legs (#16). Unset leaves each runtime on
-    # its own default (CODEX_REASONING_EFFORT for codex, the SDK's for Claude).
-    fix_effort: Effort | None = _knob(None, coerce="effort", choices=tuple(e.value for e in EFFORT_LADDER))
     # The reviewer when the reviewed head's fixer tier is unknown or that tier
     # has no FIX_MODEL_<TIER> spec. With tier specs set, review runs at the
     # fixer's tier (owner, 2026-10-13); independence is the separate leg and
@@ -108,7 +106,7 @@ class HarnessConfig:
     review_model: str | None = _knob("gpt-6.1-sol")
     # Routing: the `runtime:model[:effort]` each triage tier's fix legs run on, e.g.
     # `codex:gpt-6-luna:low` or `claude:claude-haiku-5-5`. Blank keeps the fixer
-    # runtime with FIX_MODEL (codex: CODEX_MODEL) for that tier.
+    # runtime with FIX_MODEL for that tier.
     fix_model_low: str = _knob("")
     fix_model_med: str = _knob("")
     fix_model_high: str = _knob("")
@@ -128,7 +126,6 @@ class HarnessConfig:
     fixer_runtime: RuntimeName = _knob(RuntimeName.CLAUDE, coerce="runtime", choices=_RUNTIMES)
     reviewer_runtime: RuntimeName = _knob(RuntimeName.CODEX, coerce="runtime", choices=_RUNTIMES)
     codex_bin: str = _knob("codex")
-    codex_model: str = _knob("")  # blank → CodexRunner default
     codex_provider_id: str = _knob("openai-custom")  # NOT "openai": reserved by codex-cli ≥0.142
     codex_provider_name: str = _knob("OpenAI")
     # Blank = codex's built-in provider + `codex login` OAuth. Set only for an
@@ -214,6 +211,12 @@ class HarnessConfig:
                             ("GLOBAL_DAILY_SPEND_CAP_USD", self.global_daily_spend_cap_usd)):
             if value < 0:
                 errors.append(f"{name} must be >= 0")
+        for name, runtime, model in (("FIX_MODEL", self.fixer_runtime, self.fix_model),
+                                     ("REVIEW_MODEL", self.reviewer_runtime, self.review_model)):
+            try:
+                ModelRoute(runtime, (model or "").strip() or None)
+            except ValueError as exc:
+                errors.append(f"{name} {model!r} on {runtime.value}: {exc}")
         for name, value in self._route_specs():
             if value.strip():
                 try:
@@ -229,8 +232,9 @@ class HarnessConfig:
         card = rate_table(self, RuntimeName.CLAUDE.value) if any(cap > 0 for cap in caps) else None
         routes = (*(self.fix_route(t) for t in TIER_LADDER), *(self.review_route(t) for t in (None, *TIER_LADDER)),
                   self.triage_route(), self.steward_route())
-        if card is not None and (unrated := sorted({model for runtime, model, _ in routes if model
-                                                    and runtime is RuntimeName.CLAUDE and not card.priceable(model)})):
+        if card is not None and (unrated := sorted({r.model for r in routes if r.model
+                                                    and r.runtime is RuntimeName.CLAUDE
+                                                    and not card.priceable(r.model)})):
             errors.append(f"armed spend caps need a harness rate for every Claude model; {', '.join(unrated)} has "
                           "none: add it to CODEX_COST_PER_MTOK or disable every spend cap")
         return tuple(errors)
@@ -244,37 +248,31 @@ class HarnessConfig:
         return _route(dict(zip(TIER_LADDER, (self.fix_model_low, self.fix_model_med, self.fix_model_high,
                                              self.fix_model_xhigh)))[tier])
 
-    def fix_route(self, tier: Tier) -> tuple[RuntimeName, str | None, Effort | None]:
-        """(runtime, model, effort) for a fix leg at `tier`. An unset or
-        invalid spec (validate() reports it) keeps today's single configured
-        fixer. No effort: fix legs use FIX_EFFORT when set; triage and review legs
-        leave the runtime's own default (CODEX_REASONING_EFFORT on codex)."""
-        route = self._tier_route(tier)
-        return (route.runtime, route.model, route.effort) if route is not None else (
-            self.fixer_runtime, self.fix_model, None)
+    def fix_route(self, tier: Tier) -> ModelRoute:
+        """The route of a fix leg at `tier`: its FIX_MODEL_<TIER> spec, else
+        FIXER_RUNTIME with FIX_MODEL. No effort leaves the runtime's own
+        default (CODEX_REASONING_EFFORT on codex)."""
+        return self._tier_route(tier) or _default_route(self.fixer_runtime, self.fix_model)
 
-    def review_route(self, tier: Tier | None) -> tuple[RuntimeName, str | None, Effort | None]:
-        """(runtime, model, effort) for a REVIEW at the fixer's `tier` (owner,
-        2026-10-13: the reviewer matches the fixer's tier). No tier, or no
-        spec for it, keeps REVIEWER_RUNTIME with REVIEW_MODEL."""
+    def review_route(self, tier: Tier | None) -> ModelRoute:
+        """The route of a REVIEW at the fixer's `tier` (owner, 2026-10-13: the
+        reviewer matches the fixer's tier). No tier, or no spec for it, keeps
+        REVIEWER_RUNTIME with REVIEW_MODEL."""
         route = self._tier_route(tier) if tier is not None else None
-        return (route.runtime, route.model, route.effort) if route is not None else (
-            self.reviewer_runtime, self.review_model, None)
+        return route or _default_route(self.reviewer_runtime, self.review_model)
 
-    def triage_route(self) -> tuple[RuntimeName, str | None, Effort | None]:
-        route = _route(self.triage_model)
-        return (route.runtime, route.model, route.effort) if route is not None else self.fix_route(Tier.LOW)
+    def triage_route(self) -> ModelRoute:
+        return _route(self.triage_model) or self.fix_route(Tier.LOW)
 
-    def steward_route(self) -> tuple[RuntimeName, str | None, Effort | None]:
-        route = _route(self.steward_model)
-        return (route.runtime, route.model, route.effort) if route is not None else self.triage_route()
+    def steward_route(self) -> ModelRoute:
+        return _route(self.steward_model) or self.triage_route()
 
     def runtimes(self, role: str) -> frozenset[RuntimeName]:
         """Every runtime a role may dispatch a leg on."""
         if role == "fix":
-            return frozenset({self.fixer_runtime, self.triage_route()[0], self.steward_route()[0],
-                              *(self.fix_route(t)[0] for t in TIER_LADDER)})
-        return frozenset({self.reviewer_runtime, *(self.review_route(t)[0] for t in TIER_LADDER)})
+            return frozenset({self.fixer_runtime, self.triage_route().runtime, self.steward_route().runtime,
+                              *(self.fix_route(t).runtime for t in TIER_LADDER)})
+        return frozenset({self.reviewer_runtime, *(self.review_route(t).runtime for t in TIER_LADDER)})
 
     def validate(self) -> None:
         if errors := self.validation_errors():
@@ -299,6 +297,9 @@ class HarnessConfig:
         def effort(e: Effort | None) -> str:
             return f":{e.value}" if e else ""
 
+        def spec(route: ModelRoute) -> str:
+            return f"{route.runtime.value}:{model(route.model)}{effort(route.effort)}"
+
         fix_budget = f"fix_budget=${self.fix_budget_usd:.2f}"
         if self.fixer_runtime is RuntimeName.CODEX:
             # codex has no budget flag: the runner kills a leg whose priced
@@ -309,9 +310,8 @@ class HarnessConfig:
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} poll={self.poll_seconds}s",
             f"fixer={self.fixer_runtime.value} fix_model={model(self.fix_model)} "
-            f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} {fix_budget}",
-            "routes: " + " ".join(f"{name}={route[0].value}:{model(route[1])}{effort(route[2])}" for name, route in (
+            "routes: " + " ".join(f"{name}={spec(route)}" for name, route in (
                 *((t.value, self.fix_route(t)) for t in TIER_LADDER), ("steward", self.steward_route()), ("triage", self.triage_route())))
             + f" triage_budget=${self.triage_budget_usd:.2f} (each of steward, triage)",
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
@@ -335,6 +335,15 @@ def budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
     return BudgetPolicy({**limits, ("fix", "TRIAGE"): Money.from_major("USD", cfg.triage_budget_usd),
                          ("fix", "STEWARD"): Money.from_major("USD", cfg.triage_budget_usd),
                          ("review", "REVIEW"): Money.from_major("USD", cfg.review_budget_usd)})
+
+
+def _default_route(runtime: RuntimeName, model: str | None) -> ModelRoute:
+    """A role's default route. An invalid pair (validate() reports it) drops
+    the model so describe() and the route accessors still answer."""
+    try:
+        return ModelRoute(runtime, (model or "").strip() or None)
+    except ValueError:
+        return ModelRoute(runtime, None)
 
 
 def _route(spec: str) -> ModelRoute | None:
@@ -466,10 +475,6 @@ def _parse(raw: str, key: str, definition, errors: list[str]) -> object:
         except ValueError:
             return bad("a number")
         return value if math.isfinite(value) else bad("a finite number")
-    if coercion == "effort":
-        # The Effort enum is wider than the knob (route specs): gate on choices.
-        effort = parse_effort(token, None)
-        return effort if effort is not None and effort.value in choices else bad(f"one of {list(choices)}")
     if coercion in ("choice", "runtime"):
         if token not in choices:
             return bad(f"one of {list(choices)}")
@@ -528,10 +533,19 @@ def _authoritative_env(e: dict) -> dict:
     return e if parsed is None else parsed
 
 
+# Knobs folded into the route knobs. A set one is a startup error, never a
+# silent no-op: the operator's intent would otherwise stop applying.
+_REMOVED_KNOBS = {
+    "CODEX_MODEL": "set FIX_MODEL (the default fixer's model on FIXER_RUNTIME) or a FIX_MODEL_<TIER> route",
+    "FIX_EFFORT": "put the effort in the route: FIX_MODEL_<TIER>=runtime:model:effort",
+}
+
+
 def from_env(env: dict | None = None) -> HarnessConfig:
     """Build one immutable snapshot from the metadata-backed config table."""
     e = _authoritative_env(env if env is not None else os.environ)
-    errors: list[str] = []
+    errors: list[str] = [f"{knob} was removed: {use} (unset it in the shell environment too, not only the env file)" for knob, use in _REMOVED_KNOBS.items()
+                         if str(e.get(knob) or "").strip()]
     values: dict[str, object] = {}
     for definition in fields(HarnessConfig):
         if not definition.metadata:

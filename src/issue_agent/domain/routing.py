@@ -60,28 +60,30 @@ _CLAUDE_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable"})
 class ModelRoute:
     """One `runtime:model[:effort]` spec. The explicit runtime prefix keeps a
     provider switch from becoming a model alias the other runtime cannot
-    resolve. No effort leaves the global knob for the runtime in force."""
+    resolve. No effort leaves the runtime's own default in force; no model (a
+    role default, never a parsed spec) leaves the runtime's default model."""
 
     runtime: RuntimeName
-    model: str
+    model: str | None
     effort: Effort | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.runtime, RuntimeName):
             raise ValueError("model route requires a supported runtime")
-        if not isinstance(self.model, str) or not _MODEL_ID.fullmatch(self.model):
-            raise ValueError("model route requires a nonempty model ID without whitespace")
-        claude_model = self.model.startswith("claude-") or self.model in _CLAUDE_ALIASES
-        if (self.model.startswith("gpt-") and self.runtime is not RuntimeName.CODEX
-                or claude_model and self.runtime is not RuntimeName.CLAUDE):
-            raise ValueError("model ID belongs to a different runtime")
+        if self.model is not None:
+            if not isinstance(self.model, str) or not _MODEL_ID.fullmatch(self.model):
+                raise ValueError("model route requires a nonempty model ID without whitespace")
+            claude_model = self.model.startswith("claude-") or self.model in _CLAUDE_ALIASES
+            if (self.model.startswith("gpt-") and self.runtime is not RuntimeName.CODEX
+                    or claude_model and self.runtime is not RuntimeName.CLAUDE):
+                raise ValueError("model ID belongs to a different runtime")
         if self.effort is not None and self.effort not in _EFFORTS[self.runtime]:
             raise ValueError(f"effort {getattr(self.effort, 'value', self.effort)!r} is not valid for "
                              f"{self.runtime.value} (one of {[e.value for e in _EFFORTS[self.runtime]]})")
 
     @property
     def spec(self) -> str:
-        return f"{self.runtime.value}:{self.model}" + (f":{self.effort.value}" if self.effort else "")
+        return f"{self.runtime.value}:{self.model or ''}" + (f":{self.effort.value}" if self.effort else "")
 
 
 def parse_model_route(value: object) -> ModelRoute:

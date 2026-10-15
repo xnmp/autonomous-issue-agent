@@ -28,7 +28,7 @@ class FixTaskConfig:
     base_branch: str = "dev"
     agent_md: str = ""               # plugin/AGENT.md text → appended system prompt
     max_budget_usd: float = 3.0
-    # One configured model and effort per role (refactor decision Q12).
+    # Set per leg from its route (FixLegs replaces both); None: the runtime's default.
     model: str | None = None
     effort: Effort | None = None
     runtime: RuntimeName | None = None

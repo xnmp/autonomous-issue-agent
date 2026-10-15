@@ -20,8 +20,7 @@ class Effort(Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
-    # Beyond EFFORT_LADDER (the FIX_EFFORT choices); reachable through a route
-    # spec. Claude SDK takes both; codex takes xhigh but not max.
+    # Beyond EFFORT_LADDER; reachable through a route spec. Claude SDK takes both; codex takes xhigh but not max.
     XHIGH = "xhigh"
     MAX = "max"
 
@@ -31,7 +30,7 @@ EFFORT_LADDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH)
 
 def parse_effort(raw: object, default: Effort | None = None) -> Effort | None:
     """Total: any junk (typo, None, wrong type) → `default`. Operator knobs are
-    free text and a misspelled `FIX_EFFORT` must not take a daemon down."""
+    free text and a misspelled route effort must not take a daemon down."""
     if isinstance(raw, Effort):
         return raw
     try:
