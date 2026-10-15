@@ -754,16 +754,17 @@ def human_comments(
     definition release, the reset floor and the fixer's reply text share.
 
     Not human: the harness's own (marker and login), a bot's, one whose
-    timestamp does not parse (it fails toward not a reply), and one inside one
-    of the item's leg windows (start, end]. The agent inherits the
-    ambient GitHub credentials and comments without the marker, under FIX_BOT
-    or the operator's login, which can be the same login (Q1), so its run
-    window is the only signal (#342). A leg without a start never launched
-    (the legs table stamps `started_at` at launch), so it posted nothing."""
+    timestamp does not parse (it fails toward not a reply), and one by FIX_BOT
+    inside one of the item's leg windows (start, end]. A leg acts only as
+    FIX_BOT (#423/#429/#437) and comments without the marker, and FIX_BOT can
+    be the operator's own login (Q1), so its run window is the only signal
+    (#342). Anyone else commenting mid-leg is a human and resets. A leg
+    without a start never launched (the legs table stamps `started_at` at
+    launch), so it posted nothing."""
     windows = [(leg.started_at, leg.ended_at) for leg in legs if leg.started_at is not None]
     picked = [(at, c) for c in comments
               if (at := parse_timestamp(c.created_at)) is not None and not harness.wrote(c) and not c.is_bot
-              and not any(start < at <= end for start, end in windows)]
+              and not (login_eq(c.author, harness.fix_bot) and any(start < at <= end for start, end in windows))]
     return tuple(sorted(picked, key=lambda p: p[0]))
 
 

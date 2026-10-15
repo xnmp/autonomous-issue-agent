@@ -941,12 +941,25 @@ def test_harness_and_bot_comments_are_never_human():
 
 
 def test_window_end_is_inclusive():
-    assert human_comments([human(5)], H, [windowed(FIX, 4, 5)]) == ()
+    assert human_comments([human(5, author="fix-bot")], H, [windowed(FIX, 4, 5)]) == ()
+
+
+def test_444_a_real_human_commenting_mid_leg_is_human():
+    # Legs act only as FIX_BOT, so the window disowns FIX_BOT's comments alone.
+    mid = human(4.5, author="alice", body="stop, wrong approach")
+    assert _bodies([mid], [windowed(FIX, 4, 5)]) == ["stop, wrong approach"]
+
+
+def test_444_a_human_comment_mid_leg_resets_attempts():
+    # The same comment by FIX_BOT stops at ATTEMPTS (the agent's own); by alice it is a reset.
+    mid = Comment("alice", "try the other approach", iso(2.5))
+    loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
+    assert isinstance(pr_state(pr(ci=RED, comments=(mid,)), loc), Dispatch)
 
 
 def test_ten_thousand_comments_against_many_legs():
     legs_ = [windowed(FIX, 2 * k, 2 * k + 1) for k in range(50)]
-    comments = [human(m + 0.5) for m in range(10_000)]
+    comments = [human(m + 0.5, author="fix-bot") for m in range(10_000)]
     # Inside: 2k+0.5 for k < 50; every other minute is outside.
     assert len(human_comments(comments, H, legs_)) == 10_000 - 50
 

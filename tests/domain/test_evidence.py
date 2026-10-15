@@ -163,7 +163,7 @@ def test_a_human_reset_after_the_push_ends_the_wait():
 
 def test_a_comment_inside_or_before_the_pushing_leg_does_not_end_the_wait():
     for minute in (29.5, 30):  # the agent's own comment inside its window, or one at its end
-        talk = pr(DONE, comments=(Comment("alice", "pushed a fix", at(minute).isoformat()),))
+        talk = pr(DONE, comments=(Comment("fix-bot", "pushed a fix", at(minute).isoformat()),))
         assert state(talk, fix_end(30, k(11), end_head="h2")) == Wait(WaitReason.CI_UNKNOWN)
 
 
