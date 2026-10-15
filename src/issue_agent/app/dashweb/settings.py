@@ -161,8 +161,9 @@ class WriteResult:
 
 def _vet(files: Files, target: str, after: str, key: str, value: str | None, scope: str,
          environ: Mapping[str, str], open_issues: Callable[[str], int | None], *, staging: str,
-         home: str) -> tuple[str, str]:
-    """`(refusal, warning)` for one deployment if `target` held `after`. The
+         home: str, edited: bool) -> tuple[str, str, bool]:
+    """`(refusal, warning, held)` for one deployment if `target` held
+    `after`; `held` leaves that deployment's composed files as they are. The
     candidate is composed with the real `compose-env.sh` in a scratch
     directory and parsed the daemons' way. Refused: an invalid result; a
     repo value that would not read back; a change to anything but live knobs
@@ -174,43 +175,48 @@ def _vet(files: Files, target: str, after: str, key: str, value: str | None, sco
         shared, overlay = (after if path == target else config_files.read_text(path)
                            for path in (files.shared, files.overlay))
     except (OSError, ValueError) as exc:
-        return f"refused, {deployment}: {exc}", ""
+        return f"refused, {deployment}: {exc}", "", False
     # The staged files hold the shared tokens: private and never left behind.
     try:
         scratch = tempfile.mkdtemp(prefix="issue-agent-settings-", dir=_staging_root(environ, staging))
     except OSError as exc:
-        return f"refused, {deployment}: no private staging directory: {exc}", ""
+        return f"refused, {deployment}: no private staging directory: {exc}", "", False
     try:
         staged, problem = config_files.compose_staged(files.harness_root, deployment, shared, overlay, environ,
                                                       scratch)
         if problem:
-            return f"refused, {deployment}: {problem}", ""
+            return f"refused, {deployment}: {problem}", "", False
         running = (*((files.active,) if os.path.isfile(files.active) else ()),
                    *config_files.service_snapshots(deployment, home))
         env = config_files.sourced((staged,), environ)
         pending = _pending(staged, running, environ)
     except ValueError as exc:
-        return f"refused, {deployment}: {exc}", ""
+        return f"refused, {deployment}: {exc}", "", False
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     cfg = from_env(env)
     if errors := cfg.validation_errors():
-        return f"refused, {deployment} would be invalid: " + "; ".join(errors), ""
+        return f"refused, {deployment} would be invalid: " + "; ".join(errors), "", False
+    if pending and not edited:
+        # #466: another deployment's pending edit (or a stopped run's stale
+        # `.active`) holds only that deployment back; the shared file still saves.
+        return "", (f"{deployment} has changes that need a restart ({', '.join(pending)}); "
+                    f"it takes this save at its next `issue-agent start`"), True
     if pending:
         return (f"refused, {deployment}: saving would also apply changes that need a restart "
-                f"({', '.join(pending)}); roll those out with `issue-agent start` first"), ""
+                f"({', '.join(pending)}); roll those out with `issue-agent start` first"), "", False
     if key == "ISSUE_PICKUP" and cfg.pickup is Pickup.OPEN:
         count = open_issues(deployment)
         if count is None:
-            return f"refused, {deployment}: its open issues could not be counted", ""
+            return f"refused, {deployment}: its open issues could not be counted", "", False
         if count >= FIX_MAX_ITEMS:
             return (f"refused, {deployment}: {count}+ open issues; the fix observation reads at most "
-                    f"{FIX_MAX_ITEMS - 1}"), ""
+                    f"{FIX_MAX_ITEMS - 1}"), "", False
     if value is not None and env.get(key) != value:
         if scope == "repo":
-            return f"{key} would read back as {env.get(key)!r}, not {value!r}", ""
-        return "", f"{deployment}: config/repos/{deployment}.env still sets {key}={env.get(key)!r}"
-    return "", ""
+            return f"{key} would read back as {env.get(key)!r}, not {value!r}", "", False
+        return "", f"{deployment}: config/repos/{deployment}.env still sets {key}={env.get(key)!r}", False
+    return "", "", False
 
 
 def _staging_root(environ: Mapping[str, str], state_dir: str) -> str:
@@ -267,12 +273,17 @@ def write_setting(
         return WriteResult(False, str(exc))
     affected = (name,) if scope == "repo" else tuple(n for n in names if os.path.isfile(Files(harness_root, n).active))
     warnings: list[str] = []
+    held: set[str] = set()
     for deployment in dict.fromkeys((name, *affected)):
-        refusal, warning = _vet(Files(harness_root, deployment), target, after, key, value, scope, environ,
-                                open_issues, staging=load(deployment).state_dir, home=home)
+        refusal, warning, hold = _vet(Files(harness_root, deployment), target, after, key, value, scope, environ,
+                                open_issues, staging=load(deployment).state_dir, home=home,
+                                edited=deployment == name)
         if refusal:
             return WriteResult(False, refusal)
+        if hold:
+            held.add(deployment)
         warnings += [warning] if warning else []
+    affected = tuple(n for n in affected if n not in held)
     old = {deployment: _text(getattr(load(deployment), _FIELD[key])) for deployment in affected}
     try:
         config_files.write_text(target, after, expected=before)

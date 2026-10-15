@@ -298,3 +298,28 @@ def test_staged_config_stays_private_and_is_removed(harness, monkeypatch, tmp_pa
     staging = tmp_path / "state" / "settings-staging"
     assert list(spill.iterdir()) == []
     assert staging.stat().st_mode & 0o777 == 0o700 and list(staging.iterdir()) == []
+
+
+def test_another_deployment_with_a_pending_edit_is_held_back_not_refusing_a_shared_save(harness):
+    """#466: a stopped run's stale `.active`, or another deployment's pending
+    hand edit, held every shared save hostage. Now only that deployment is
+    left as it is (its `.active` keeps its bytes, so nothing reloads onto the
+    edit) and the save names it; every other deployment takes the save."""
+    root, snapshot, tmp_path, client = harness
+    environ = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home")}
+    other = root / "config" / "repos" / "zz-other.env"
+    other.write_text(f"REPO=o/other\nTARGET_DIR={tmp_path}/other\nSTATE_DIR={tmp_path / 'other-state'}\n"
+                     f"REVIEW_STATE_DIR={tmp_path / 'other-review'}\n")
+    subprocess.run(["bash", str(root / "bin" / "compose-env.sh"), "zz-other"], env=environ, check=True,
+                   capture_output=True)
+    other.write_text(other.read_text() + "POLL_SECONDS=5\n")  # pending: needs a restart
+    active = root / "config" / ".active.zz-other.env"
+    launched = active.read_text()
+
+    body = client.post("/api/repos/demo/settings",
+                       json={"key": "DAILY_SPEND_CAP_USD", "value": "7", "scope": "shared"}).json()
+
+    assert body["ok"] is True, body
+    assert active.read_text() == launched
+    assert any("zz-other" in w and "POLL_SECONDS" in w for w in body["warnings"]), body
+    assert "DAILY_SPEND_CAP_USD='7'" in snapshot.read_text() or "DAILY_SPEND_CAP_USD=7" in snapshot.read_text()
