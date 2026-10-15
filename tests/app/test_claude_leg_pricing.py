@@ -393,9 +393,9 @@ def test_a_resumed_leg_with_no_baseline_settles_its_upper_bound(tmp_path, monkey
 def test_an_interrupted_previous_leg_is_bounded_by_charging_its_tokens_again(tmp_path, monkeypatch):
     leg, store = _session(tmp_path, monkeypatch)
     leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
-    streamed = types.SimpleNamespace(model=SONNET, usage={"input_tokens": 2, "output_tokens": 0,
-                                                         "cache_read_input_tokens": 20_000,
-                                                         "cache_creation_input_tokens": 0})
+    streamed = type("AssistantMessage", (), {})()
+    streamed.model, streamed.usage = SONNET, {"input_tokens": 2, "output_tokens": 0,
+                                              "cache_read_input_tokens": 20_000, "cache_creation_input_tokens": 0}
     leg(streamed)  # no result: its stream estimate is charged, and it leaves no snapshot
 
     leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)))
