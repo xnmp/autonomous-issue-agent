@@ -312,10 +312,15 @@ def test_merged_harness_prs_come_only_from_this_repository_and_fix_branches():
         xref(11, state="CLOSED"),
         xref(12, repo="fork/r"),
         xref(13, head="feat/5-x"),
-        {"source": None},
-        None,
+        {"source": {}},
     ]
     assert [(p.number, p.state) for p in parse_merged_harness_prs(items, "o/r")] == [(10, "MERGED")]
+
+
+@pytest.mark.parametrize("item", [None, {"source": None}, {"source": {"state": "MERGED"}}])
+def test_unknown_cross_references_are_not_proof_that_no_harness_pr_merged(item):
+    with pytest.raises(FixObservationIncomplete):
+        parse_merged_harness_prs([item], "o/r")
 
 
 # ── the bounded world build ──────────────────────────────────────────────────
@@ -598,7 +603,7 @@ class PagedGitHub:
         if name == "timelineItems":
             step = int(variables["cursor"].removeprefix("it")) + 1
             more = f"it{step}" if step < self.timeline_pages else None
-            nodes = [xref(9, head="fix/5-old")] if more is None else [xref(n, state="CLOSED") for n in range(100)]
+            nodes = [xref(9, head="fix/5-old")] if more is None else [xref(n, state="CLOSED") for n in range(1, 101)]
             return {name: _back(nodes, more)}
         if name == "files":
             return {name: _fwd([{"path": "src/a.py"}])}

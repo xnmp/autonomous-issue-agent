@@ -149,24 +149,28 @@ close and re-derived from the next observation if lost.
 
 The owner wants continuous architectural stewardship. This narrowly reverses
 refactor decision Q9's removal of that work, while retaining its two daemons:
-the fix role files `Architecture pass: <YYYY-MM-DD>` with the harness marker,
+the fix role files `Architecture pass (after #<previous pass number>)`, or
+`Architecture pass (first)` when none exists, with the harness marker,
 using the existing `FileIssue` act as FIX_BOT. There is no repository-scoped
 leg or nullable issue identity. Money, leases, caps, branches, PR publication,
 review and merge keep the ordinary issue path.
 
-A pure trigger owes a pass when the ledger is absent; at least five PRs into
-the base have merged since the last base commit touching
-`docs/architecture-pressure.md`; or that commit is older than 24 hours and the
-base tip differs. An open pass issue suppresses filing, including one parked
-with `needs-human`. Inputs are read afresh from GitHub each tick: base and
-ledger commit identities, ledger commit time, merged-PR count, and a complete
-bounded open-pass issue search. Missing or malformed required facts defer the
-affected rule; an unavailable merge count still permits the independent age
-rule. There is no watermark, counter, table, daemon or configuration knob.
+A pure trigger owes a pass when no pass issue exists, or at least five PRs
+merged into the base strictly after the newest pass ended. A pass ends at its
+harness PR's merge time, or otherwise its issue's close time. The strict
+boundary excludes the pass PR itself. Only the newest pass matters: it is in
+flight while open without a merged harness PR, including when parked with
+`needs-human`. A merged PR ends even an issue left open on a non-default base.
+Each tick searches the newest five bot-authored pass issues, open or closed,
+with state, close time and existing harness-PR cross-reference facts, then
+counts merges after the end when needed: at most two extra GraphQL requests.
+Missing, malformed or truncated required facts defer filing. Ledger history,
+base-head comparisons and elapsed age do not participate in the trigger.
+There is no watermark, counter, table, daemon or configuration knob.
 
-Like required base-CI issues, an observed open pass is readied with `ai-ready`
+Like required base-CI issues, the newest in-flight pass is readied with `ai-ready`
 unless already ready or marked `needs-human`. Recognition requires FIX_BOT's
-authorship, the marker in the body, and the `Architecture pass:` title prefix;
+authorship and the `Architecture pass` title prefix only;
 a human's similarly titled issue has no privilege. `Origin.ARCHITECTURE` skips
 STEWARD and TRIAGE and supplies a fixed HIGH starting tier through existing
 routing and escalation. Base-fix priority and base-failure charging remain
@@ -193,7 +197,8 @@ Crash points reuse ADR 0001's keyed filing and label read-back: before filing,
 the next tick still owes it; an unanswered successful filing or a lagging
 search is found by act's own-issue listing; after filing but before readiness,
 the next observation readies the issue; a lost label is retried from its
-observed labels. A closed daily title is not refiled that day, by the existing
-exact-title read-back. Tests: `tests/domain/test_architecture.py`,
+observed labels. The previous pass number fixes both title and idempotency key
+across ticks and UTC midnight, so exact-title read-back also suppresses a
+repeat filing while search lags. Tests: `tests/domain/test_architecture.py`,
 `tests/adapters/test_architecture_observe.py`, and
 `tests/app/test_architecture_steward.py`.

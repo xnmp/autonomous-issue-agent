@@ -509,7 +509,7 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
         if (n := harness_branch_issue(b.name)) is not None:
             pushed.setdefault(n, []).append(b)
     fixing, held = base_fix(world.base), base_held(world.base)
-    architecture = {i.number for i in world.issues if architecture_pass(i, harness.fix_bot, harness.marker)}
+    architecture = {i.number for i in world.issues if architecture_pass(i, harness.fix_bot)}
     items = [
         _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
               labeled_at=i.needs_human_labeled_at, blocked_by=() if i.number in fixing else i.blocked_by,

@@ -19,7 +19,7 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
-from .architecture import architecture_owed, architecture_pass
+from .architecture import PassEnded, PassInFlight, architecture_owed
 from .checks import BaseHealth, BaseIssue, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_unsettled, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
@@ -134,17 +134,13 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
 def architecture_actions(world: WorldState, harness: Harness) -> tuple[Action, ...]:
     """File and ready an ordinary pass issue through the base-CI path (ADR 0017)."""
     observed = world.architecture
-    now = parse_timestamp(world.now) if isinstance(world.now, str) and len(world.now) <= 64 else None
-    if observed is None:
+    if isinstance(observed, PassInFlight):
+        issue = observed.issue
+        return ((Relabel(Target.ISSUE, issue.number, None, Label.AI_READY),)
+                if not issue.labels & {Label.AI_READY, Label.NEEDS_HUMAN} else ())
+    if not architecture_owed(observed):
         return ()
-    opened = tuple(i for i in observed.issues if i.state == "open"
-                   and architecture_pass(i, harness.fix_bot, harness.marker))
-    if opened:
-        return tuple(Relabel(Target.ISSUE, i.number, None, Label.AI_READY) for i in opened
-                     if not i.labels & {Label.AI_READY, Label.NEEDS_HUMAN})
-    if now is None or not architecture_owed(observed.history, now):
-        return ()
-    title = f"Architecture pass: {now.date().isoformat()}"
+    title = f"Architecture pass (after #{observed.number})" if isinstance(observed, PassEnded) else "Architecture pass (first)"
     return (FileIssue(title, f"{harness.marker}\nFollow the Architecture pass section of the fixer instructions "
                       "in plugin/AGENT.md. Update docs/architecture-pressure.md, "
                       "then commit and push your normal fix branch. The harness opens the PR.", f"architecture:{title}"),)

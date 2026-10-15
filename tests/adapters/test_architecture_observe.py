@@ -1,34 +1,43 @@
-"""Offline GitHub responses exercise the production history and pass-issue reads."""
+"""Offline GitHub responses exercise pass discovery and strict merge boundaries."""
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
 
 from issue_agent.adapters.github import GhUnavailable, GitHubGateway
-from issue_agent.domain.architecture import architecture_owed
-from issue_agent.domain.policy import architecture_actions
-from issue_agent.domain.state import Dispatch, Harness, Local, derive, issue_key
-from issue_agent.domain.actions import AgentKind, Relabel, Target
+from issue_agent.domain.actions import AgentKind, FileIssue, Relabel, Target
 from issue_agent.domain.labels import Label
+from issue_agent.domain.policy import architecture_actions
 from issue_agent.domain.routing import Tier
+from issue_agent.domain.state import Dispatch, Harness, Local, derive, issue_key
 from tests.adapters.test_github_fix_observe import ServedGitHub, issue_node, labels, labeled
 
 NOW = datetime(2026, 10, 16, tzinfo=timezone.utc)
-HEAD, LEDGER = "b" * 40, "a" * 40
 H = Harness("fix-bot", "review-bot")
 
 
-def ledger_page():
-    return {"ledgerFile": {"__typename": "Blob"}, "ledgerTip": {"name": "dev", "target": {
-        "oid": HEAD, "history": {"nodes": [{"oid": LEDGER, "committedDate": NOW.isoformat()}]}}}}
+def merge(at=NOW, *, issue=7, base="dev", repo="o/r"):
+    return {"number": issue + 100, "state": "MERGED", "mergedAt": at.isoformat(),
+            "headRefName": f"fix/{issue}-pass", "baseRefName": base, "repository": {"nameWithOwner": repo}}
+
+
+def pass_issue(number=7, *, pr=None, closed=None, **changes):
+    return issue_node(number, title="Architecture pass (first)", author={"login": "FIX-BOT "}, labels=labels(),
+                      state="CLOSED" if closed else "OPEN", closedAt=closed,
+                      timelineItems={"pageInfo": {"hasPreviousPage": False},
+                                     "nodes": [{"source": pr}] if pr else []}, **changes)
+
+
+def work_merges(count):
+    return tuple(merge(NOW + timedelta(seconds=i + 1), issue=20 + i) for i in range(count))
 
 
 class Server(ServedGitHub):
-    def __init__(self, ledger=None, count=5, passes=(), issues=(), search=None):
+    def __init__(self, *, passes=(), merges=(), count=..., issues=(), search=None):
         super().__init__(issues=issues)
-        self.ledger = ledger_page() if ledger is None else ledger
-        self.count, self.passes, self.search = count, passes, search
-        self.count_queries = []
+        self.passes, self.merges, self.count, self.search = passes, merges, count, search
+        self.pass_queries, self.count_queries, self.graphql_queries = [], [], []
 
     def __call__(self, argv, token):
         if argv[:2] == ["gh", "api"] and any(a.startswith("repos/") for a in argv):
@@ -40,18 +49,22 @@ class Server(ServedGitHub):
             return json.dumps({"workflow_runs": [], "workflows": [], "total_count": 0})
         pairs = dict(argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "-f")
         query = pairs.get("query", "")
-        if "ledgerFile:" in query:
-            return json.dumps({"data": {"repository": self.ledger}})
+        self.graphql_queries.append(query)
         if "search(query:$q,type:ISSUE,first:1)" in query:
             self.count_queries.append(pairs["q"])
             if isinstance(self.count, Exception):
                 raise self.count
-            return json.dumps({"data": {"search": {"issueCount": self.count}}})
+            boundary = datetime.fromisoformat(pairs["q"].split("merged:>")[1])
+            count = sum(p["baseRefName"] == "dev" and p["repository"]["nameWithOwner"] == "o/r"
+                        and datetime.fromisoformat(p["mergedAt"]) > boundary for p in self.merges)
+            return json.dumps({"data": {"search": {"issueCount": count if self.count is ... else self.count}}})
         if "search(" in query:
-            result = ({"nodes": list(self.passes), "issueCount": len(self.passes)} if "Architecture pass:" in pairs["q"]
-                      else {"nodes": [], "issueCount": 0})
-            if "Architecture pass:" in pairs["q"] and self.search is not None:
-                result = self.search
+            result = {"nodes": [], "issueCount": 0}
+            if '"Architecture pass"' in pairs["q"]:
+                self.pass_queries.append(pairs["q"])
+                result = self.search if self.search is not None else {
+                    "nodes": sorted(self.passes, key=lambda n: n["number"], reverse=True)[:5],
+                    "issueCount": len(self.passes)}
             return json.dumps({"data": {"search": result}})
         return super().__call__(argv, token)
 
@@ -60,99 +73,186 @@ def world(server):
     return GitHubGateway("o/r", runner=server).build_world("dev", filed_by=H.fix_bot)
 
 
-@pytest.mark.parametrize("count,owed", [(4, False), (5, True), (10**12, True)])
-def test_count_scopes_merges_to_base_and_the_last_ledger_commit(count, owed):
-    server = Server(count=count)
-    assert architecture_owed(world(server).architecture.history, NOW) is owed
+def filing(observed):
+    return tuple(a for a in architecture_actions(observed, H) if isinstance(a, FileIssue))
+
+
+def test_no_pass_ever_files_first_without_a_count_or_ledger_read():
+    server = Server()
+    (action,) = filing(world(server))
+    assert action.title == "Architecture pass (first)"
+    assert server.pass_queries == ['repo:o/r is:issue author:fix-bot in:title "Architecture pass" sort:created-desc']
+    assert not server.count_queries
+    assert all("ledgerFile" not in q and "history(" not in q for q in server.graphql_queries)
+
+
+@pytest.mark.parametrize("count,owed", [(0, False), (4, False), (5, True)])
+@pytest.mark.parametrize("state", ["open", "closed"])
+def test_merged_pass_ends_at_merge_even_if_open_or_closed_later(count, owed, state):
+    pr = merge()
+    closed = (NOW + timedelta(hours=1)).isoformat() if state == "closed" else None
+    node = pass_issue(pr=pr, closed=closed)
+    # The pass PR, another simultaneous merge, older work, and a different base do not count.
+    merges = (pr, merge(issue=8), merge(NOW - timedelta(days=2)),
+              merge(NOW + timedelta(minutes=1), base="other")) + work_merges(count)
+    server = Server(passes=(node,), merges=merges, issues=(node,) if state == "open" else ())
+    observed = world(server)
+    assert bool(filing(observed)) is owed
+    assert server.count_queries == [f'repo:o/r is:pr is:merged base:"dev" merged:>{NOW.isoformat()}']
+    assert len(server.pass_queries) + len(server.count_queries) == 2
+    assert not derive(observed, Local(now=NOW), H)  # An unclosed merged pass stays done.
+    if owed:
+        assert filing(observed)[0].title == "Architecture pass (after #7)"
+    else:
+        assert architecture_actions(replace(observed, now=(NOW + timedelta(days=3)).isoformat()), H) == ()
+
+
+@pytest.mark.parametrize("count,owed", [(4, False), (5, True)])
+def test_closed_unmerged_pass_counts_from_close_time(count, owed):
+    node = pass_issue(closed=NOW.isoformat())
+    server = Server(passes=(node,), merges=(merge(issue=8),) + work_merges(count))
+    assert bool(filing(world(server))) is owed
     assert server.count_queries == [f'repo:o/r is:pr is:merged base:"dev" merged:>{NOW.isoformat()}']
 
 
-def test_only_an_explicit_null_file_means_absent():
-    page = ledger_page()
-    page["ledgerFile"] = None
-    server = Server(page)
-    assert architecture_owed(world(server).architecture.history, NOW)
+def test_open_pass_is_in_flight_and_unlabelled_pass_is_readied_without_its_body():
+    node = pass_issue()
+    server = Server(passes=(node,), merges=work_merges(5))
+    assert architecture_actions(world(server), H) == (Relabel(Target.ISSUE, 7, None, Label.AI_READY),)
     assert not server.count_queries
-    del page["ledgerFile"]
-    assert world(Server(page)).architecture is None
-
-
-@pytest.mark.parametrize("count", [None, True, -1, "5", {}, 2**1000, GhUnavailable("server", "unavailable")])
-def test_bad_or_unavailable_count_never_becomes_five(count):
-    observed = world(Server(count=count))
-    assert not architecture_owed(observed.architecture.history, NOW)
-
-
-def test_unavailable_count_still_allows_the_independent_age_rule():
-    page = ledger_page()
-    page["ledgerTip"]["target"]["history"]["nodes"][0]["committedDate"] = (NOW - timedelta(days=2)).isoformat()
-    assert architecture_owed(world(Server(page, count=GhUnavailable("server", "down"))).architecture.history, NOW)
-
-
-@pytest.mark.parametrize("field,bad", [
-    ("ledgerFile", {}), ("ledgerFile", {"__typename": "Tree"}), ("ledgerTip", None),
-    ("ledgerTip", {"name": "other"}), ("ledgerTip", {"name": "dev", "target": None}),
-])
-def test_malformed_history_defers_without_losing_ordinary_issue_work(field, bad):
-    page = ledger_page()
-    page[field] = bad
-    observed = world(Server(page, issues=(issue_node(),)))
-    assert observed.architecture is None
-    assert [i.number for i in observed.issues] == [5]
-
-
-@pytest.mark.parametrize("search", [
-    {}, {"nodes": [], "issueCount": True}, {"nodes": [], "issueCount": 1},
-    {"nodes": [{}] * 101, "issueCount": 101}, {"nodes": [None], "issueCount": 1},
-])
-def test_incomplete_pass_inventory_never_looks_empty(search):
-    assert world(Server(search=search)).architecture is None
-
-
-def test_unlabelled_pass_is_observed_and_readied_then_full_observation_resolves_at_high():
-    node = issue_node(7, title="Architecture pass: 2026-10-16", body=H.marker, author={"login": "FIX-BOT "}, labels=labels())
-    server = Server(passes=(node,))
-    observed = world(server)
-    assert architecture_actions(observed, H) == (Relabel(Target.ISSUE, 7, None, Label.AI_READY),)
     node = {**node, "labels": labels("ai-ready"), "labeled": labeled(("ai-ready", NOW.isoformat()))}
     observed = world(Server(passes=(node,), issues=(node,)))
     assert architecture_actions(observed, H) == ()
     assert derive(observed, Local(now=NOW), H) == {issue_key(7): Dispatch(AgentKind.RESOLVE, tier=Tier.HIGH)}
 
 
-def test_unrecognised_search_hit_does_not_hide_five_new_merges():
-    from dataclasses import replace
-    from issue_agent.domain.actions import FileIssue
-    node = issue_node(7, title="Architecture pass: 2026-10-16", body="no harness marker", author={"login": "fix-bot"})
-    observed = replace(world(Server(passes=(node,), count=5)), now=NOW.isoformat())
-    (action,) = architecture_actions(observed, H)
-    assert isinstance(action, FileIssue) and action.title == "Architecture pass: 2026-10-16"
+def test_only_the_newest_bot_authored_pass_anchors_the_count():
+    passes = tuple(pass_issue(n) for n in range(1, 8))
+    latest = pass_issue(8, closed=NOW.isoformat())
+    stranger = {**pass_issue(9), "author": {"login": "alice"}}
+    server = Server(passes=passes + (latest, stranger), merges=work_merges(5))
+    assert filing(world(server))[0].title == "Architecture pass (after #8)"
+
+
+def test_newest_means_creation_order_from_the_search():
+    newest = pass_issue(7, closed=NOW.isoformat())
+    search = {"nodes": [newest, pass_issue(8)], "issueCount": 2}
+    assert filing(world(Server(search=search, merges=work_merges(5))))[0].title == "Architecture pass (after #7)"
+
+
+def test_older_pass_details_and_label_history_do_not_control_the_trigger():
+    newest = {**pass_issue(8, closed=NOW.isoformat()), "labels": labels("needs-human")}
+    older = {**pass_issue(7), "state": None, "labels": None, "timelineItems": None}
+    assert filing(world(Server(passes=(older, newest), merges=work_merges(5))))[0].title == "Architecture pass (after #8)"
+
+
+@pytest.mark.parametrize("changes", [{"author": {"login": "alice"}}, {"title": "Discuss Architecture pass"}])
+def test_non_bot_or_non_prefix_search_hits_are_ignored(changes):
+    node = {**pass_issue(), **changes}
+    assert filing(world(Server(passes=(node,))))[0].title == "Architecture pass (first)"
+
+
+def test_a_merge_for_another_issue_or_repo_does_not_end_an_open_pass():
+    for pr in (merge(issue=8), merge(repo="fork/r")):
+        observed = world(Server(passes=(pass_issue(pr=pr),), merges=work_merges(5)))
+        assert architecture_actions(observed, H) == (Relabel(Target.ISSUE, 7, None, Label.AI_READY),)
+
+
+@pytest.mark.parametrize("count", [None, True, -1, "5", {}, 2**1000, GhUnavailable("server", "unavailable")])
+def test_bad_or_unavailable_count_never_becomes_five(count):
+    observed = world(Server(passes=(pass_issue(closed=NOW.isoformat()),), count=count, issues=(issue_node(),)))
+    assert architecture_actions(observed, H) == ()
+    assert [i.number for i in observed.issues] == [5]
+
+
+def test_large_valid_count_is_owed():
+    assert filing(world(Server(passes=(pass_issue(closed=NOW.isoformat()),), count=10**12)))
+
+
+@pytest.mark.parametrize("search", [
+    {}, {"nodes": [], "issueCount": True}, {"nodes": [], "issueCount": 1},
+    {"nodes": [], "issueCount": 2**1000}, {"nodes": [{}] * 100_000, "issueCount": 100_000},
+    {"nodes": [None], "issueCount": 1},
+    {"nodes": [{**pass_issue(n), "title": "Discuss Architecture pass"} for n in range(1, 6)], "issueCount": 6},
+])
+def test_incomplete_or_huge_inventory_never_looks_empty(search):
+    observed = world(Server(search=search, issues=(issue_node(),)))
+    assert architecture_actions(observed, H) == () and len(observed.issues) == 1
+
+
+@pytest.mark.parametrize("changes", [
+    {"title": {}}, {"title": "Architecture pass" + "x" * 100_000},
+    {"number": True}, {"number": 0}, {"number": 2**1000}, {"state": "UNKNOWN"}, {"author": None},
+    {"author": {"login": "x" * 100_000}},
+    {"timelineItems": {"pageInfo": {"hasPreviousPage": True}, "nodes": []}},
+    {"timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": [None] * 100_000}},
+])
+def test_malformed_pass_inventory_defers(changes):
+    node = {**pass_issue(), **changes}
+    observed = world(Server(search={"nodes": [node], "issueCount": 1}))
+    assert architecture_actions(observed, H) == ()
+
+
+@pytest.mark.parametrize("stamp", [None, "", {}, "x" * 100_000, "2026-10-16", "invalid"])
+@pytest.mark.parametrize("merged", [False, True])
+def test_unknown_or_malformed_end_never_falls_back_to_an_older_boundary(stamp, merged):
+    node = pass_issue(closed=NOW.isoformat(), pr={**merge(), "mergedAt": stamp} if merged else None)
+    if not merged:
+        node["closedAt"] = stamp
+    observed = world(Server(passes=(node,), merges=work_merges(5)))
+    assert architecture_actions(observed, H) == ()
+
+
+@pytest.mark.parametrize("field", ["number", "headRefName", "repository", "state"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_unreadable_pr_reference_never_falls_back_to_close_time(field, missing):
+    pr = merge()
+    if missing:
+        del pr[field]
+    else:
+        pr[field] = None
+    node = pass_issue(closed=NOW.isoformat(), pr=pr)
+    observed = world(Server(passes=(node,), merges=work_merges(5), issues=(issue_node(),)))
+    assert architecture_actions(observed, H) == () and len(observed.issues) == 1
+
+
+def test_non_pr_cross_references_do_not_hide_a_closed_pass():
+    node = pass_issue(closed=NOW.isoformat(), pr={})
+    node["timelineItems"]["nodes"] = [{"source": {}}]
+    assert filing(world(Server(passes=(node,), merges=work_merges(5))))
+
+
+def test_empty_pr_head_is_unknown_completion():
+    node = pass_issue(closed=NOW.isoformat(), pr={**merge(), "headRefName": ""})
+    assert architecture_actions(world(Server(passes=(node,), merges=work_merges(5))), H) == ()
+
+
+def test_unreadable_pass_pr_is_not_resolved_again_and_other_work_survives():
+    node = {**pass_issue(pr={**merge(), "number": None}), "labels": labels("ai-ready"),
+            "labeled": labeled(("ai-ready", NOW.isoformat()))}
+    observed = world(Server(passes=(node,), issues=(node, issue_node())))
+    assert architecture_actions(observed, H) == ()
+    assert derive(observed, Local(now=NOW), H) == {issue_key(5): Dispatch(AgentKind.STEWARD)}
+
+
+def test_optional_graphql_error_does_not_lose_ordinary_work():
+    class ErrorServer(Server):
+        def __call__(self, argv, token):
+            result = super().__call__(argv, token)
+            if any(a.startswith("query=") and "first:5)" in a for a in argv):
+                return json.dumps({"data": {"search": None}, "errors": [{"message": "unreadable"}]})
+            return result
+    observed = world(ErrorServer(issues=(issue_node(),)))
+    assert architecture_actions(observed, H) == () and len(observed.issues) == 1
+
+
+def test_fix_issue_reads_keep_bodies_out_of_the_tick_payload():
+    server = Server(issues=(issue_node(),))
+    world(server)
+    assert any("id number title state author{login}" in query for query in server.graphql_queries)
+    assert all("number title body state" not in query for query in server.graphql_queries)
 
 
 def test_tech_debt_label_survives_github_parsing():
     node = issue_node(labels=labels("tech-debt"))
     assert Label.TECH_DEBT in world(Server(issues=(node,))).issues[0].labels
-
-
-@pytest.mark.parametrize("changes", [
-    {"title": {}}, {"title": "Architecture pass:" + "x" * 100_000},
-    {"body": ["bad"]}, {"body": H.marker + "x" * 100_000},
-])
-def test_malformed_pass_inventory_never_claims_no_pass_exists(changes):
-    node = issue_node(7, title="Architecture pass: 2026-10-16", body=H.marker, author={"login": "fix-bot"}, labels=labels())
-    assert world(Server(passes=({**node, **changes},))).architecture is None
-
-
-@pytest.mark.parametrize("field", ["ledgerFile", "ledgerTip"])
-def test_graphql_errors_on_optional_history_do_not_lose_normal_work(field):
-    class ErrorServer(Server):
-        def __call__(self, argv, token):
-            result = super().__call__(argv, token)
-            if any(a.startswith("query=") and "ledgerFile:" in a for a in argv):
-                raw = json.loads(result)
-                raw["data"]["repository"][field] = None
-                raw["errors"] = [{"path": ["repository", field], "message": "unreadable"}]
-                return json.dumps(raw)
-            return result
-    observed = world(ErrorServer(issues=(issue_node(),)))
-    assert observed.architecture is None and len(observed.issues) == 1
