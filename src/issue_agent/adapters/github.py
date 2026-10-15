@@ -353,7 +353,7 @@ _BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid sta
              + _BASE_CONTEXTS.format(after="") + "}}}}")
 
 _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount "
-                "nodes{... on Issue{number title state closedAt author{login}}}}}")
+                "nodes{... on Issue{number title state createdAt closedAt author{login}}}}}")
 
 
 def _escaped(fields: str) -> str:

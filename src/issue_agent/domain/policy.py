@@ -19,7 +19,7 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
-from .checks import BaseHealth, BaseRun
+from .checks import BaseHealth, BaseIssue, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
@@ -174,8 +174,8 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
                                                f"after it: {r.url}. That failure has an issue of its own.")
                        for n, r in sorted(ended.items()))
             continue
-        after = max((_ended(at, latest.workflow, health.runs) for i in issues if (at := parse_timestamp(i.closed_at))),
-                    default=None)
+        after = max((_ended(i, at, latest.workflow, health.runs) for i in issues
+                     if (at := parse_timestamp(i.closed_at))), default=None)
         first = min(ended.values(), key=_created) if ended else next((
             r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
             and (after is None or _created(r)[0] >= after)), None)
@@ -201,15 +201,21 @@ def base_ci_actions(health: BaseHealth | None, marker: str,
     return tuple(out)
 
 
-def _ended(closed_at: datetime, workflow: str, runs: Iterable[BaseRun]) -> datetime:
-    """How new the code was that ended a base-CI issue closed at `closed_at`:
-    a green close's run, if the workflow's latest verdict by then was green
-    (a red run created after it, overlapping its close, still files);
+def _ended(issue: BaseIssue, closed_at: datetime, workflow: str, runs: Iterable[BaseRun]) -> datetime:
+    """How new the code was that ended `issue`, closed at `closed_at`: the
+    newest green run that was the workflow's latest verdict when a run
+    completed while the issue was open (its creation unread: at the close),
+    since the harness closes on green and its write can land after a later
+    red run completes (a red run overlapping that green still files);
     otherwise the close itself (a human, `Closes #` on a merge), so a run
     created before a merged fix never files (tauri #1150 -> #1179)."""
-    done = max((r for r in runs if r.workflow == workflow and r.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS
-                and (at := parse_timestamp(r.completed_at)) is not None and at <= closed_at), key=_created, default=None)
-    return _created(done)[0] if done is not None and done.conclusion in GREEN_CONCLUSIONS else closed_at
+    done = [(at, r) for r in runs if r.workflow == workflow and r.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS
+            and (at := parse_timestamp(r.completed_at)) is not None and at <= closed_at]
+    opened = parse_timestamp(issue.created_at)
+    moments = {at for at, _ in done if at >= opened} if opened else {closed_at}
+    latest = (max((r for at, r in done if at <= t), key=_created, default=None) for t in moments)
+    return max((_created(r)[0] for r in latest if r is not None and r.conclusion in GREEN_CONCLUSIONS),
+               default=closed_at)
 
 
 def _created(run: BaseRun) -> tuple[datetime, int]:

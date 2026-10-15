@@ -106,13 +106,18 @@ identify a failure the same way:
 - **Refiling is anchored on creation, not completion.** Superseding the
   completion-time rule above: after the workflow's last issue closed (any
   title, a legacy one too), the next issue is filed by the first failing run
-  created at or after what ended it. A close by green (the workflow's latest
-  verdict by the close was green) is anchored on that green run's creation,
-  so a red run overlapping it still files; any other close (a human,
-  `Closes #` on a merge into the default branch) is anchored on the close, so
-  a run that tested pre-fix code never files. Incident: tauri #1150, a legacy
-  issue closed by #1178's merge at 11:55:46Z; the next tick refiled the
-  streak as #1179 from a run of `e6daf55`.
+  created at or after what ended it. A close by green is anchored on that
+  green run's creation, so a red run overlapping it still files: a close is
+  by green when, at some run's completion while the issue was open, the
+  workflow's latest verdict was green (the harness's close can land after a
+  later red run completed). Any other close (a human, `Closes #` on a merge
+  into the default branch) is anchored on the close, so a run that tested
+  pre-fix code never files. Incident: tauri #1150, a legacy issue closed by
+  #1178's merge at 11:55:46Z; the next tick refiled the streak as #1179 from
+  a run of `e6daf55`. Residual: the merge commit's run must be created after
+  the close (GitHub closed 1-2 s before it on all 13 recent tauri merges); a
+  human's close of a red streak waits for a run created after it, not a
+  re-run of an older one.
 - An open base-CI issue whose workflow is neither in the listed runs nor
   among the repository's active workflows is **closed** (renamed, removed or
   disabled), unless it carries `needs-human`. The 100 listed runs span hours,

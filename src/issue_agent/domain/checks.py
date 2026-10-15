@@ -98,6 +98,7 @@ class BaseIssue:
     number: int
     title: str
     closed_at: str = ""  # "" while open
+    created_at: str = ""
 
 
 @dataclass(frozen=True)

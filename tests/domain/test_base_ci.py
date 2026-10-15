@@ -93,6 +93,17 @@ def test_a_green_close_never_holds_back_a_red_run_that_overlapped_it():
         assert filed.title == f"{PREFIX} since sha2"
 
 
+def test_a_green_close_landing_after_an_overlapping_red_run_completed_still_files_it():
+    # The tick read G green and closed at 10:23; red R, created 10:05 while G ran, completed 10:22 in between.
+    green, red = _run(1, "success", "10:00:00", "10:20:00"), _run(2, "failure", "10:05:00", "10:22:00")
+    old = _run(9, "failure", "08:00:00", "08:30:00")
+    issue = [BaseIssue(40, f"{PREFIX} since sha9", "2026-10-14T10:23:00Z", "2026-10-14T08:31:00Z")]
+    (filed,) = _act(old, green, red, issues=issue)
+    assert filed.title == f"{PREFIX} since sha2"
+    # No green while it was open: the close ended it, and the run created before it never files.
+    assert _act(old, _run(3, "failure", "09:00:00", "10:00:00"), red, issues=issue) == ()
+
+
 def test_after_a_close_mid_streak_only_a_failure_created_at_or_after_it_files():
     issues = [BaseIssue(40, f"{PREFIX} since sha1", "2026-10-14T10:21:00Z")]  # closed by its fix's merge
     first = _run(1, "failure", "09:00:00", "09:30:00")
@@ -119,8 +130,8 @@ MERGE_RUN = "11:55:47"  # the merge commit's own run
 
 
 def test_a_merge_closing_the_streaks_issue_files_nothing_until_the_merges_own_run_fails():
-    for title in (PREFIX, f"{PREFIX} since sha1"):  # the incident's legacy title, and a streak title
-        issues = [BaseIssue(40, title, MERGE_CLOSED)]
+    for title, opened in ((PREFIX, ""), (PREFIX, "2026-10-14T20:00:00Z"), (f"{PREFIX} since sha1", "")):
+        issues = [BaseIssue(40, title, MERGE_CLOSED, opened)]  # the incident's legacy title, and a streak title
         assert _act(*OLD_RED, issues=issues) == ()
         assert _act(*OLD_RED, IN_FLIGHT, issues=issues) == ()
         (filed,) = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", MERGE_RUN, "12:30:00"), issues=issues)

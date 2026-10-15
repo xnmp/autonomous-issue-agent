@@ -150,7 +150,8 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
                    or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
                    for n in nodes)):
         raise ValueError("issue search is absent, malformed or short")
-    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"])
+    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
+                           n["createdAt"] if isinstance(n.get("createdAt"), str) else "")
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 

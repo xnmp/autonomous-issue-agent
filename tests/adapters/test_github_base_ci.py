@@ -24,8 +24,9 @@ def run_row(name="macOS Smoke", run=1, conclusion="failure", *, branch="dev", ev
             "updated_at": at, **extra}
 
 
-def found(number, title, state="OPEN", author="fix-bot", closed=None) -> dict:
-    return {"number": number, "title": title, "state": state, "closedAt": closed, "author": {"login": author}}
+def found(number, title, state="OPEN", author="fix-bot", closed=None, created=None) -> dict:
+    return {"number": number, "title": title, "state": state, "closedAt": closed, "createdAt": created,
+            "author": {"login": author}}
 
 
 def job(name, workflow, *, event="push", run="FAILURE", status="COMPLETED", conclusion="FAILURE") -> dict:
@@ -89,13 +90,14 @@ def observe(github: GitHub, filed_by="fix-bot"):
 def test_the_read_composes_the_bases_completed_push_runs_and_the_fixers_issues():
     github = GitHub(
         runs={"total_count": 9_999, "workflow_runs": [run_row("macOS Smoke", 3), run_row("Lint", 7, "success")]},
-        issues=search(found(40, "CI: Docs failing on dev"), found(41, "CI: Lint failing on dev", "CLOSED",
+        issues=search(found(40, "CI: Docs failing on dev", created="2026-10-12T00:00:00Z"), found(41, "CI: Lint failing on dev", "CLOSED",
                                                                     closed="2026-10-13T00:00:00Z"),
                       found(42, "CI: macOS Smoke failing on dev", author="someone-else")),
     )
     base = observe(github).base
     assert base is not None and base.runs is not None and [r.run_id for r in base.runs] == [3, 7]
     assert [(i.number, i.closed_at) for i in base.issues] == [(40, ""), (41, "2026-10-13T00:00:00Z")]
+    assert [i.created_at for i in base.issues] == ["2026-10-12T00:00:00Z", ""]  # unread: judged at the close
     listing = github.rest("/actions/runs?")[0][2]
     assert "branch=dev" in listing and "event=push" in listing
     query = next(a for c in github.calls for a in c if a.startswith("q="))
