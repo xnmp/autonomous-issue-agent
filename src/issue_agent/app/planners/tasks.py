@@ -28,8 +28,9 @@ class FixTaskConfig:
     base_branch: str = "dev"
     agent_md: str = ""               # plugin/AGENT.md text → appended system prompt
     max_budget_usd: float = 3.0
-    # The role's default model; each leg's route supplies its own.
+    # Set per leg from its route (FixLegs replaces both); None: the runtime's default.
     model: str | None = None
+    effort: Effort | None = None
     runtime: RuntimeName | None = None
 
 
@@ -66,6 +67,7 @@ def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None =
         append_system_prompt=cfg.agent_md,
         model=cfg.model,
         runtime=cfg.runtime,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
         resume=session_id,
