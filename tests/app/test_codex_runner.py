@@ -38,9 +38,7 @@ from issue_agent.domain.outcome import (
     AgentResult,
     ExitReason,
     LegClass,
-    Outcome,
     classify_leg,
-    classify_outcome,
     infra_class_failure,
     infra_death,
     resumable_session,
@@ -814,7 +812,6 @@ def test_run_returns_blocked_result_when_not_ready(monkeypatch):
     logged: list[str] = []
     res = asyncio.run(CodexRunner(codex_bin="nope-not-real-bin", log=logged.append).run(RuntimePlan(prompt="x")))
     assert res.is_error and res.status == "blocked"
-    assert classify_outcome(res) == Outcome.ERROR
     assert res.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
     assert "not found on PATH" in res.summary
     assert any("NOT READY" in m for m in logged)
@@ -949,7 +946,7 @@ def test_a_run_whose_counters_are_malformed_ends_as_an_agent_attempt(tmp_path):
     )
 
     assert r.is_error is True and r.exit_reason is ExitReason.AGENT_ERROR
-    assert classify_leg(r, resumed=False) is LegClass.AGENT
+    assert classify_leg(r) is LegClass.AGENT
     assert "malformed" in r.summary
     assert r.cost_usd == 3.0  # the reservation's maximum, never zero
 
@@ -1097,7 +1094,7 @@ def test_the_result_reports_the_model_that_actually_ran(tmp_path):
 # resume. Pin the vocabulary here so a schema change breaks loudly.
 _FIXER_TERMINAL_STATUSES = frozenset({"pushed", "blocked", "failed"})
 # `done` is in no schema and `pr_opened` left it in slice 5b (the harness opens
-# the PR now); classify_outcome still accepts both, so a codex run (or a
+# the PR now); a result that is no error is real output either way, so a codex run (or a
 # resumed pre-5b session) that emits one must still count as real output.
 _LEGACY_OK_ALIASES = frozenset({"done", "pr_opened"})
 
@@ -1119,7 +1116,7 @@ def test_a_captured_envelope_is_never_a_transport_drop_whatever_its_terminal_sta
         last_message=json.dumps({"status": status, "summary": "s"}),
         stderr="ERROR: stream disconnected before completion",
     )
-    assert classify_outcome(result) is not Outcome.ERROR
+    assert not result.is_error
     assert _is_transport_drop(1, "ERROR: stream disconnected before completion", result) is False
 
 

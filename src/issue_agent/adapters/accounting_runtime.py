@@ -28,7 +28,6 @@ from ..domain.outcome import (
     RETURN_REFUSED_STATUS,
     LegClass,
     classify_leg,
-    leg_cap,
     machine_end,
     resumable_session,
 )
@@ -84,11 +83,11 @@ class AccountingRuntime(AgentRuntime):
     # A branch's remote commit (`Worktrees.remote_head`), recorded as the head a leg left.
     remote_head: Callable[[str], str] | None = None
     _context: contextvars.ContextVar[
-        tuple[int | None, str, int, int | None, str, bool, str]
+        tuple[int | None, str, int, int | None, str, str]
     ] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}",
-            default=(None, "", 0, None, "", False, ""),
+            default=(None, "", 0, None, "", ""),
         ),
         init=False,
         repr=False,
@@ -112,12 +111,11 @@ class AccountingRuntime(AgentRuntime):
         claim_target: int | None = None,
         *,
         head: str = "",
-        resumed: bool = False,
         tier: str = "",
     ) -> None:
-        if not isinstance(head, str) or type(resumed) is not bool or not isinstance(tier, str):
-            raise ValueError("accounting context head and tier must be text and resumed an exact bool")
-        self._context.set((issue, kind, number, claim_target, head, resumed, tier))
+        if not isinstance(head, str) or not isinstance(tier, str):
+            raise ValueError("accounting context head and tier must be text")
+        self._context.set((issue, kind, number, claim_target, head, tier))
 
     def _reserve_reclaiming_dead_headroom(
         self,
@@ -165,7 +163,7 @@ class AccountingRuntime(AgentRuntime):
         so the item's attempt cap stops it at `needs-human` instead of a free
         retry looping forever.
         """
-        issue, kind, number, *_, head, _resumed, _tier = self._context.get()
+        issue, kind, number, *_, head, _tier = self._context.get()
         if self.role not in LEG_ROLES or issue is None or not kind:
             return
         try:
@@ -181,7 +179,7 @@ class AccountingRuntime(AgentRuntime):
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return self._refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
-        issue, kind, number, claim_target, head, resumed, tier = self._context.get()
+        issue, kind, number, claim_target, head, tier = self._context.get()
         # ADR 0008: paid admission binds the decision-side target unchanged.
         target = (
             claim_target
@@ -280,7 +278,7 @@ class AccountingRuntime(AgentRuntime):
         if self.role in LEG_ROLES:
             # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
-            leg = classify_leg(result, resumed=resumed)
+            leg = classify_leg(result)
             triage = steward = None
             if kind in ("TRIAGE", "STEWARD"):
                 # They ask no one: a `blocked` claim in their output is not a question.
@@ -326,8 +324,6 @@ class AccountingRuntime(AgentRuntime):
                 **({"evidence": list(task.evidence)} if task.evidence else {}),
                 # Read-your-writes: the branch's remote commit as the leg left it.
                 **({"end_head": end_head} if end_head else {}),
-                # A per-leg cap ended it: it did not finish with its evidence, which derive hands on (#411).
-                **({"capped": True} if leg_cap(result.exit_reason) else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result, maximum)
 

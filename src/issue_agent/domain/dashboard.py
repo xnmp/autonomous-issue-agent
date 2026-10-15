@@ -86,7 +86,9 @@ class LegRow:
     charged_usd: float | None = None
     basis: str = ""
     origin: str = ""
-    leg_class: str = ""  # agent | asked | machine | "" (never returned)
+    # agent | asked | machine as derive reads the leg (`tick.leg_end`); "" when it reads none
+    # (running, carried, or of no act).
+    leg_class: str = ""
     session_id: str = ""
     tokens: Tokens | None = None
     summary: str = ""
@@ -117,8 +119,9 @@ class LegRow:
 
     @property
     def derived(self) -> bool:
-        """A leg derive counts: it ran or may still run, and is not carried."""
-        return self.counted and not self.carried
+        """A launched leg derive reads (it has derive's class), or one in
+        flight. A released refusal launched nothing; a carried leg derive never reads."""
+        return self.running and not self.carried or self.counted and self.leg_class != ""
 
     @property
     def cost_usd(self) -> float:
@@ -156,19 +159,21 @@ def issue_legs(legs: Iterable[LegRow], issue: int) -> tuple[LegRow, ...]:
     return tuple(sorted((leg for leg in legs if leg.issue == issue), key=lambda leg: (leg.reserved_at, leg.leg_id)))
 
 
+def _newest_agent_end(legs: Iterable[LegRow], kind: AgentKind) -> LegRow | None:
+    """The newest agent end of `kind` by end time, as derive picks it (a tie goes to the later row)."""
+    ended = [leg for leg in legs if leg.kind == kind.name and leg.leg_class in ("agent", "asked") and leg.ended_at]
+    return sorted(ended, key=lambda leg: leg.ended_at or leg.at)[-1] if ended else None
+
+
 def issue_triage(legs: Iterable[LegRow]) -> Triage | None:
     """The triage derive routes by: the newest agent-ended TRIAGE leg's result."""
-    triaged = [leg for leg in legs if leg.kind == AgentKind.TRIAGE.name and leg.derived
-               and leg.leg_class in ("agent", "asked")]
-    latest = max(triaged, key=lambda leg: leg.at, default=None)
+    latest = _newest_agent_end(legs, AgentKind.TRIAGE)
     return latest.triage if latest is not None else None
 
 
 def issue_steward(legs: Iterable[LegRow]) -> Steward | None:
     """The steward result derive reads: the newest agent-ended STEWARD leg's."""
-    stewarded = [leg for leg in legs if leg.derived and leg.leg_class in ("agent", "asked")
-                 and leg.kind == AgentKind.STEWARD.name]
-    latest = max(stewarded, key=lambda leg: leg.at, default=None)
+    latest = _newest_agent_end(legs, AgentKind.STEWARD)
     return latest.steward if latest is not None else None
 
 

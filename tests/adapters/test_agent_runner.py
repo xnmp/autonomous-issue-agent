@@ -28,7 +28,7 @@ from issue_agent.adapters.agent_runner import (
 )
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.effort import EFFORT_LADDER, Effort
-from issue_agent.domain.outcome import ExitReason, LegClass, classify_leg, resumable_session
+from issue_agent.domain.outcome import CUT_OFF_ENDS, ExitReason, LegClass, classify_leg, machine_end, resumable_session
 
 
 def _run(**runner):
@@ -784,8 +784,8 @@ def test_a_provider_api_error_end_is_a_machine_failure_whose_session_stays_resum
         is_error=True, subtype="success", terminal_reason="api_error", session_id="s1",
         result="Failed to authenticate: OAuth session expired", total_cost_usd=0.1))
     assert r.is_error
-    assert classify_leg(r, resumed=False) is LegClass.MACHINE
-    assert classify_leg(r, resumed=True) is LegClass.AGENT  # a permanent error must not loop free
+    assert classify_leg(r) is LegClass.MACHINE  # a cut-off end: `domain.attempt` bounds its resume
+    assert machine_end(r) in CUT_OFF_ENDS
     assert resumable_session(r) == "s1"
 
 
@@ -793,13 +793,13 @@ def test_a_provider_api_error_end_is_a_machine_failure_whose_session_stays_resum
 def test_an_agent_error_without_a_provider_terminal_reason_stays_an_attempt(terminal):
     r = result_to_agent_result(FakeResult(is_error=True, terminal_reason=terminal, session_id="s1"))
     assert r.exit_reason is ExitReason.AGENT_ERROR
-    assert classify_leg(r, resumed=False) is LegClass.AGENT
+    assert classify_leg(r) is LegClass.AGENT
 
 
 def test_a_clean_envelope_is_not_reclassified_by_a_stale_api_error_terminal_reason():
     r = result_to_agent_result(FakeResult(subtype="success", terminal_reason="api_error"))
     assert r.exit_reason is ExitReason.OK
-    assert classify_leg(r, resumed=False) is LegClass.AGENT
+    assert classify_leg(r) is LegClass.AGENT
 
 
 def test_a_claude_leg_with_no_credential_of_its_own_is_blocked_before_launch(tmp_path, monkeypatch):

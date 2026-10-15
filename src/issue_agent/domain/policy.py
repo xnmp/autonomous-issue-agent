@@ -229,8 +229,7 @@ def gap_actions(
     for item in sorted(legs, key=lambda k: k.sort_key):
         for leg in legs[item]:
             if leg.harness_gap:
-                ended = ("it asked a human too" if leg.question is not None
-                         else "stopped at a per-leg cap" if leg.capped else "returned")
+                ended = "it asked a human too" if leg.question is not None else "returned"
                 report(item, "agent-report", "agent-reported harness defect", leg, ended,
                        f"The agent's report is in the leg receipt `{leg.leg_id or 'unrecorded'}` on the harness "
                        "host (the control store's `harness_issue`) and in that deployment's journal.")

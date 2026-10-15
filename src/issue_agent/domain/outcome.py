@@ -1,10 +1,9 @@
 """Agent-result interpretation. Pure.
 
-* `classify_outcome` reads the decision from the envelope, never prose: only an
-  explicit is_error==false counts as success.
 * `ExitReason` says WHY a session ended, separately from WHAT it decided.
-* `classify_leg` maps a returned leg to the attempt classes derive counts
-  (design rule 3: a machine failure never counts as an attempt).
+* `classify_leg` maps a returned leg to the class its receipt records
+  (design rule 3: a machine failure never counts as an attempt); whether a
+  cut-off end counts is `domain.attempt`'s, from the item's earlier legs.
 
 ## Why runtime unavailability is a machine failure (keifu #130, 2026-08-02)
 
@@ -46,15 +45,9 @@ def declared_status(structured: object) -> str:
     return ""
 
 
-class Outcome(str, Enum):
-    OK = "ok"
-    BLOCKED = "blocked"
-    ERROR = "error"
-
-
 class ExitReason(str, Enum):
-    """WHY a session ended, orthogonal to `Outcome` (what it decided). Every
-    terminal path is named so a log line says which watchdog fired."""
+    """WHY a session ended, orthogonal to what it decided. Every terminal path
+    is named so a log line says which watchdog fired."""
 
     OK = "ok"                              # clean envelope, no error
     AGENT_ERROR = "agent_error"            # the agent finished and reported failure
@@ -80,13 +73,6 @@ def infra_death(reason: ExitReason | None) -> bool:
     return reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.TRANSPORT_DEATH)
 
 
-def leg_cap(reason: ExitReason | None) -> bool:
-    """The harness ended a live session at a per-leg resource cap: its wall
-    clock or its spend ceiling (owner, 2026-10-14: a budget hit is a wall
-    timeout). The session is intact, so the work continues by resuming it."""
-    return reason in (ExitReason.WALL_TIMEOUT, ExitReason.BUDGET_EXHAUSTED)
-
-
 def runtime_unavailable(reason: ExitReason | None) -> bool:
     """Whether the runtime never got a session off the ground (keifu #130)."""
     return reason is ExitReason.RUNTIME_UNAVAILABLE
@@ -108,6 +94,9 @@ MACHINE_ENDS = frozenset({reason.value for reason in ExitReason} | {PROVIDER_REF
 # Machine ends no harness fix removes: a teardown, or a provider's capacity or
 # quota window. They are no harness gap (`domain.gaps`).
 OUTSIDE_ENDS = frozenset({ExitReason.OPERATOR_CANCELLED.value, PROVIDER_REFUSED_SUBTYPE})
+# The cut-off ends: a per-leg cap or the provider ended a live session, which
+# stays resumable. Whether one is an attempt is `domain.attempt.cut_off_counts`.
+CUT_OFF_ENDS = frozenset({ExitReason.WALL_TIMEOUT.value, ExitReason.BUDGET_EXHAUSTED.value, PROVIDER_REFUSED_SUBTYPE})
 
 
 def machine_end(result: "AgentResult") -> str:
@@ -190,18 +179,15 @@ class LegClass(str, Enum):
     MACHINE = "machine"
 
 
-def classify_leg(result: "AgentResult", *, resumed: bool) -> LegClass:
-    """Classify a returned leg. A per-leg cap hit (`leg_cap`: wall clock or
-    spend) or a provider-refused end is a machine failure on a fresh session
-    and an attempt on a resumed one: the item resumes once at the same tier
-    (the leg runner resumes the latest machine end's session) and a second
-    such end on that resume counts. A provider error can be permanent (a 400),
-    and without the second rule it would retry free forever (#418). An orderly harness teardown is never an attempt. The
-    per-issue lifetime cap is not a leg cap: it refuses admission and stops
-    for a human."""
-    if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE or leg_cap(result.exit_reason):
-        return LegClass.AGENT if resumed else LegClass.MACHINE
-    if infra_class_failure(result) or result.exit_reason is ExitReason.OPERATOR_CANCELLED:
+def classify_leg(result: "AgentResult") -> LegClass:
+    """A returned leg's class, as its receipt records it. A cut-off end
+    (`CUT_OFF_ENDS`, `machine_end`), an infra failure and an orderly teardown
+    are MACHINE; `domain.attempt` counts a cut-off end that was the item's free
+    resume, or of a kind that never resumes, as an attempt when the receipt is
+    read (#441). The per-issue lifetime cap is not a leg cap: it refuses
+    admission and stops for a human."""
+    if (machine_end(result) in CUT_OFF_ENDS or infra_class_failure(result)
+            or result.exit_reason is ExitReason.OPERATOR_CANCELLED):
         return LegClass.MACHINE
     if not result.is_error and result.status == "blocked":
         return LegClass.ASKED
@@ -287,14 +273,3 @@ class AgentResult:
     session_usage: tuple[ModelUsage, ...] = ()
     # Accounting-authored settlement provenance for completion telemetry.
     pricing_basis: PricingBasis | None = None
-
-def classify_outcome(result: AgentResult) -> Outcome:
-    """Port of agent/lib.sh:claude_outcome. Error wins; then map status."""
-    if result.is_error:
-        return Outcome.ERROR
-    if result.status in ("pr_opened", "pushed", "done"):
-        return Outcome.OK
-    if result.status == "blocked":
-        return Outcome.BLOCKED
-    # Unknown/empty status: treat as ok (the bash defaulted to ENV_STATUS or ok).
-    return Outcome.OK

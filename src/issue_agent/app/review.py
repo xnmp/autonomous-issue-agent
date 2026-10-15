@@ -29,7 +29,6 @@ from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.agent_task import RuntimeName
 from ..domain.identity import login_eq
 from ..domain.leg import Leg, LegTarget
-from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
@@ -41,7 +40,7 @@ from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
 from .config import REVIEW_DISPATCH_CAPACITY, HarnessConfig
 from .planners import tasks
-from .tick import Choose, Slots, Role, compose_role, leg_class, local_legs, run_item, run_leg, steward_criteria, stderr_log
+from .tick import Choose, Slots, Role, compose_role, leg_ends, local_legs, run_item, run_leg, steward_criteria, stderr_log
 
 
 def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int) -> tuple[Action, ...]:
@@ -65,8 +64,8 @@ def stored_verdict(runs: Iterable[LegRun], pr: int, head: str) -> Verdict | None
     """The verdict of this head's newest agent REVIEW leg, if it parsed one.
     The receipt holds what `parse_verdict` accepted; it is parsed again here,
     since a receipt is only as trusted as the agent output it came from."""
-    mine = sorted((r for r in runs if r.kind == AgentKind.REVIEW.name and run_item(r) == pr_key(pr)
-                   and r.head == head and leg_class(r) is not LegClass.MACHINE), key=lambda r: r.completed_at)
+    mine = [run for run, end in leg_ends(runs) if end.kind is AgentKind.REVIEW and run_item(run) == pr_key(pr)
+            and run.head == head and not end.machine]
     if not mine or mine[-1].receipt is None:
         return None
     raw = mine[-1].receipt.get("verdict")
@@ -163,10 +162,8 @@ class ReviewLegs:
             self.log(f"REVIEW PR #{action.number}: skipped — already reviewed at {action.head[:12]}")
             return
         runs = self.control.leg_runs(self.settings.repository, (issue,))
-        # A REVIEW leg never resumes a session, so a leg cap (wall or spend) is an attempt.
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
-                                 head=action.head, resumed=True,
-                                 tier=action.tier.value if action.tier is not None else "")
+                                 head=action.head, tier=action.tier.value if action.tier is not None else "")
         verdict = stored_verdict(runs, action.number, action.head)
         if verdict is not None and not on_head:
             # A paid verdict whose submission never landed (a crash, or GitHub

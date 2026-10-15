@@ -17,7 +17,7 @@ from ...domain.triage import parse_triage, steward_from_record
 
 _COLUMNS = (
     "leg_id, role, kind, issue, number, head, runtime, state, reserved_at, started_at, ended_at, "
-    "end_reason, reserved_micros, charged_micros, basis, origin, leg_class, session_id, usage_json, result_json"
+    "end_reason, reserved_micros, charged_micros, basis, origin, session_id, usage_json, result_json"
 )
 
 
@@ -56,7 +56,6 @@ def parse_leg(row: sqlite3.Row) -> LegRow | None:
         charged_usd=_usd(row["charged_micros"]),
         basis=str(row["basis"] or ""),
         origin=str(row["origin"] or ""),
-        leg_class=str(row["leg_class"] or ""),
         session_id=str(row["session_id"] or ""),
         tokens=_tokens(_object(row["usage_json"])),
         summary=_text(result.get("summary")),

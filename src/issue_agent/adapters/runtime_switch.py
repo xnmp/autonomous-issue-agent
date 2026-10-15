@@ -24,13 +24,11 @@ class RuntimeSwitch:
         return getattr(object.__getattribute__(self, "chains")[object.__getattribute__(self, "default")], name)
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None,
-                    claim_target: int | None = None, *, head: str = "", resumed: bool = False,
-                    tier: str = "") -> None:
+                    claim_target: int | None = None, *, head: str = "", tier: str = "") -> None:
         # Every chain: the leg's runtime is known only once its plan is built.
         for chain in self.chains.values():
             if isinstance(chain, ContextualRuntime):
-                chain.set_context(role, kind, number, issue, claim_target=claim_target, head=head, resumed=resumed,
-                                  tier=tier)
+                chain.set_context(role, kind, number, issue, claim_target=claim_target, head=head, tier=tier)
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         chain = self.chains.get(task.runtime or self.default)

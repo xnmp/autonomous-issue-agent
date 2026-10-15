@@ -21,6 +21,7 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.github import Accepted, BlockerLinkFacts, GhUnavailable, Refused
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
+from issue_agent.app.tick import leg_ends
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.effort import Effort
@@ -357,6 +358,13 @@ def seed_light_legs(composed, number: int, **results) -> None:
         composed.control.record_unpaid_leg(
             RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind=kind, owner_id="seed",
             issue=number, number=number, head="", runtime="claude", leg_class="agent", result=results.get(kind, {}))
+
+
+def _classes(composed, *kinds: str) -> list[str | None]:
+    """Each `kinds` leg of issue 5 as derive classes it (`tick.leg_ends`), oldest
+    first; None for a leg that left no receipt."""
+    return [None if run.receipt is None else "machine" if end.machine else "asked" if end.question else "agent"
+            for run, end in leg_ends(composed.control.leg_runs("o/r", (5,))) if run.kind in kinds]
 
 
 @pytest.fixture
@@ -769,12 +777,7 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     assert tick(composed) == []  # a machine end: backing off, no attempt
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)
-    legs = [
-        r.receipt["leg"]
-        for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
-        if r.receipt is not None and r.kind == "FIX_CI"
-    ]
-    assert legs == ["machine", "agent"]
+    assert _classes(composed, "FIX_CI") == ["machine", "agent"]
 
 
 def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(role, later):
@@ -787,9 +790,7 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)  # dies, no receipt
     assert dispatched(tick(composed), AgentKind.FIX_CI)  # continues the wall-capped session
-    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "FIX_CI"),
-                  key=lambda r: r.completed_at)
-    assert [r.receipt["leg"] if r.receipt else None for r in runs] == ["machine", None, "agent"]
+    assert _classes(composed, "FIX_CI") == ["machine", None, "agent"]
     assert agent.tasks[2].resume == "s-wall"
 
 
@@ -836,9 +837,7 @@ def test_a_provider_ended_leg_is_a_machine_end_and_a_second_on_its_resume_counts
 
 
 def _resolve_legs(composed) -> list[str | None]:
-    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "RESOLVE"),
-                  key=lambda r: r.completed_at)
-    return [r.receipt["leg"] if r.receipt else None for r in runs]
+    return _classes(composed, "RESOLVE")
 
 
 def test_a_first_budget_hit_resumes_its_session_at_the_same_tier_and_is_no_attempt(role, later):
@@ -948,9 +947,9 @@ def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session
     assert dispatched(tick(composed), AgentKind.RESOLVE)
 
     assert resumes == [None, "s-init"]
-    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind not in ("STEWARD", "TRIAGE")),
-                  key=lambda r: r.completed_at)
-    assert [(r.receipt["leg"], r.receipt["session"]) for r in runs] == [("machine", "s-init"), ("agent", "s-init")]
+    assert _classes(composed, "RESOLVE") == ["machine", "agent"]
+    assert [end.session for _, end in leg_ends(composed.control.leg_runs("o/r", (5,)))
+            if end.kind is AgentKind.RESOLVE] == ["s-init", "s-init"]
 
 
 def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(role):

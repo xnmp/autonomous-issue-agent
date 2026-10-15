@@ -5,8 +5,8 @@ from __future__ import annotations
 from issue_agent.domain.outcome import (
     AgentResult,
     ExitReason,
-    Outcome,
-    classify_outcome,
+    LegClass,
+    classify_leg,
     infra_class_failure,
     reclassify_pending_background_block,
 )
@@ -20,7 +20,7 @@ def _blocked() -> AgentResult:
 
 def test_blocked_with_pending_children_becomes_an_agent_attempt_error():
     out = reclassify_pending_background_block(_blocked(), 2)
-    assert classify_outcome(out) is Outcome.ERROR
+    assert out.is_error and classify_leg(out) is LegClass.AGENT
     assert out.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
     assert not infra_class_failure(out)
     assert (out.status, out.needs, out.session_id) == ("blocked", "wait for reviewer", "s")
@@ -29,7 +29,7 @@ def test_blocked_with_pending_children_becomes_an_agent_attempt_error():
 def test_no_pending_children_leaves_a_genuine_block_alone():
     for pending in (0, -1):
         out = reclassify_pending_background_block(_blocked(), pending)
-        assert classify_outcome(out) is Outcome.BLOCKED
+        assert classify_leg(out) is LegClass.ASKED
         assert not infra_class_failure(out)
 
 

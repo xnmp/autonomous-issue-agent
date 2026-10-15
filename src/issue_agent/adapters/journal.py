@@ -102,12 +102,10 @@ class JournalingRuntime:
         return self._context.get()
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None,
-                    claim_target: int | None = None, *, head: str = "", resumed: bool = False,
-                    tier: str = "") -> None:
+                    claim_target: int | None = None, *, head: str = "", tier: str = "") -> None:
         self._context.set(RunContext(role, kind, number, issue, uuid.uuid4().hex[:12]))
         if isinstance(self.inner, ContextualRuntime):
-            self.inner.set_context(role, kind, number, issue, claim_target=claim_target, head=head,
-                                   resumed=resumed, tier=tier)
+            self.inner.set_context(role, kind, number, issue, claim_target=claim_target, head=head, tier=tier)
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         """Review C3: a runner that raises on a pre-result transport death used

@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -43,7 +43,7 @@ from ...domain.state import DerivedState, Harness, ItemKey, derive
 from ...domain.world import WorldState
 from .. import config
 from ..config import HarnessConfig
-from ..tick import Facts, headroom, lifetime_capped
+from ..tick import Facts, headroom, leg_ends, lifetime_capped
 from . import views
 from .ports import GitHubQueries
 
@@ -72,6 +72,15 @@ def _role_facts(cfg: HarnessConfig, store: ReadOnlyControlStore, leg_usd: float,
     Nothing is in flight in this process; leases come from the store."""
     return Facts(store, cfg.repo, active=tuple, headroom=headroom(cfg, store, leg_usd),
                  lifetime_capped=lifetime_capped(cfg, store), log=_unlogged, now=now)
+
+
+def leg_rows(store: ReadOnlyControlStore, repository: str) -> tuple[dash.LegRow, ...]:
+    """The repository's legs, each with the class derive reads it as (`tick.leg_end`)."""
+    legs = read_legs(store, repository)
+    issues = {leg.issue for leg in legs if leg.issue is not None}
+    ends = {run.leg_id: end for run, end in leg_ends(store.leg_runs(repository, issues))} if repository else {}
+    return tuple(replace(leg, leg_class=("machine" if end.machine else "asked" if end.question is not None else "agent")
+                         if (end := ends.get(leg.leg_id)) is not None else "") for leg in legs)
 
 
 def _unlogged(_message: str) -> None:
@@ -253,7 +262,7 @@ class Backend:
             return StoreRead(problem=dep.store_problem)
         try:
             with ReadOnlyControlStore(dep.control_path) as store:
-                legs = read_legs(store, dep.cfg.repo)
+                legs = leg_rows(store, dep.cfg.repo)
                 repository = canonical_repository(dep.cfg.repo) if dep.cfg.repo else ""
                 leases = tuple(lease for lease in store.leases() if lease.repository == repository)
                 facts = {role: _role_facts(dep.cfg, store, usd, self.now_fn)

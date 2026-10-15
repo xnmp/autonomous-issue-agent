@@ -4,8 +4,6 @@ from issue_agent.domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
-    Outcome,
-    classify_outcome,
     deterministic_death,
     infra_death,
     offending_path,
@@ -14,20 +12,6 @@ from issue_agent.domain.outcome import (
 
 def _ok(status="pr_opened", **kw):
     return AgentResult(is_error=False, status=status, **kw)
-
-
-def test_error_envelope_wins():
-    assert classify_outcome(AgentResult(is_error=True, status="pr_opened")) is Outcome.ERROR
-
-
-def test_status_maps_to_outcome():
-    assert classify_outcome(_ok("pr_opened")) is Outcome.OK
-    assert classify_outcome(_ok("pushed")) is Outcome.OK
-    assert classify_outcome(_ok("blocked")) is Outcome.BLOCKED
-
-
-def test_unknown_status_defaults_ok():
-    assert classify_outcome(_ok("")) is Outcome.OK
 
 
 # ── infra death: WHY the session ended, separate from WHAT it decided ─────────
@@ -109,7 +93,9 @@ import pytest
 
 from dataclasses import replace
 
-from issue_agent.domain.outcome import PROVIDER_REFUSED_SUBTYPE, LegClass, classify_leg, resumable_session
+from issue_agent.domain.outcome import (
+    CUT_OFF_ENDS, PROVIDER_REFUSED_SUBTYPE, LegClass, classify_leg, machine_end, resumable_session,
+)
 
 
 @pytest.mark.parametrize(
@@ -121,10 +107,9 @@ from issue_agent.domain.outcome import PROVIDER_REFUSED_SUBTYPE, LegClass, class
         ExitReason.OPERATOR_CANCELLED,
     ],
 )
-@pytest.mark.parametrize("resumed", [False, True])
-def test_a_harness_or_provider_death_is_never_an_attempt(reason, resumed):
+def test_a_harness_or_provider_death_is_recorded_as_a_machine_end(reason):
     result = AgentResult(is_error=True, status="", exit_reason=reason)
-    assert classify_leg(result, resumed=resumed) is LegClass.MACHINE
+    assert classify_leg(result) is LegClass.MACHINE
 
 
 _WALL = AgentResult(is_error=True, status="", exit_reason=ExitReason.WALL_TIMEOUT, session_id="s-wall")
@@ -133,10 +118,11 @@ _SPENT = AgentResult(is_error=True, status=MAX_BUDGET_STATUS, envelope_subtype=M
 
 
 @pytest.mark.parametrize("capped", [_WALL, _SPENT], ids=["wall", "budget"])
-def test_a_leg_cap_is_a_machine_end_once_then_an_attempt_on_the_resume(capped):
-    # Owner, 2026-10-14: a per-leg budget hit is a wall timeout, one rule.
-    assert classify_leg(capped, resumed=False) is LegClass.MACHINE
-    assert classify_leg(capped, resumed=True) is LegClass.AGENT
+def test_a_leg_cap_is_recorded_as_a_cut_off_machine_end(capped):
+    # Owner, 2026-10-14: a per-leg budget hit is a wall timeout, one rule. Whether
+    # it is an attempt is `domain.attempt`'s, from the legs before it (#441).
+    assert classify_leg(capped) is LegClass.MACHINE
+    assert machine_end(capped) in CUT_OFF_ENDS
 
 
 @pytest.mark.parametrize("capped", [_WALL, _SPENT], ids=["wall", "budget"])
@@ -146,21 +132,23 @@ def test_a_leg_cap_leaves_its_session_resumable(capped):
 
 
 def test_a_blocked_return_is_a_question_and_an_error_is_agent_work():
-    assert classify_leg(_ok("blocked", needs="which API?"), resumed=False) is LegClass.ASKED
-    assert classify_leg(AgentResult(is_error=True, status="blocked"), resumed=False) is LegClass.AGENT
-    assert classify_leg(_ok("pushed"), resumed=False) is LegClass.AGENT
-    assert classify_leg(_ok("failed"), resumed=True) is LegClass.AGENT
+    assert classify_leg(_ok("blocked", needs="which API?")) is LegClass.ASKED
+    # The envelope wins over the claim: an error that claims `blocked` asked no one.
+    assert classify_leg(AgentResult(is_error=True, status="blocked")) is LegClass.AGENT
+    assert classify_leg(_ok("pushed")) is LegClass.AGENT
+    assert classify_leg(_ok("failed")) is LegClass.AGENT
 
 
 def test_unknown_or_garbage_status_counts_as_agent_work():
     for status in ("", "pr_opened", "x" * 100_000, "BLOCKED"):
-        assert classify_leg(_ok(status), resumed=False) is LegClass.AGENT
+        assert classify_leg(_ok(status)) is LegClass.AGENT
 
 
 @pytest.mark.parametrize("reason", [ExitReason.TRANSPORT_DEATH, ExitReason.AGENT_ERROR])
-def test_a_provider_refused_end_is_machine_fresh_and_an_attempt_on_its_resume(reason):
-    # Claude's api_error and codex's provider failure share this marker; a
-    # permanent provider error must not loop free (#418).
+def test_a_provider_refused_end_is_recorded_as_a_cut_off_machine_end(reason):
+    # Claude's api_error and codex's provider failure share this marker (#418);
+    # `domain.attempt` bounds its resume like a leg cap's.
     ended = AgentResult(is_error=True, exit_reason=reason, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s")
-    assert classify_leg(ended, resumed=False) is LegClass.MACHINE
-    assert classify_leg(ended, resumed=True) is LegClass.AGENT
+    assert classify_leg(ended) is LegClass.MACHINE
+    assert machine_end(ended) in CUT_OFF_ENDS
+    assert resumable_session(ended) == "s"

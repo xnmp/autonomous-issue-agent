@@ -35,6 +35,15 @@ scope in the new file, keeps the old file under
 `control.db.retired-v<N>-<stamp>`, and swaps the new file in with one atomic
 rename; a crash leaves the old file intact or the new one complete.
 
+A leg's `leg_class` is the raw class it returned with; attempt classification
+is derived on read (#441: `tick.leg_end` with `domain/attempt.py`), from the
+order the item's legs ended, which is exact because the per-issue fix lease
+runs one fix leg per issue at a time, so the legs ended before a leg are the
+legs its dispatch saw. A counted cut-off (a per-leg cap or provider-ended turn
+on the free resume, or of a kind that never resumes) is stored `machine` and
+read as an attempt, so operator SQL that counts infra deaths from
+`leg_class = 'machine'` overcounts; count `result_json`'s `end` class instead.
+
 No network, model, or subprocess work occurs inside a transaction. The JSONL
 journal is never read to make an authorization, accounting, or idempotency
 decision.
