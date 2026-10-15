@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -17,6 +20,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .atomic_file import atomic_write
+from .leg_sandbox import SandboxRefused
 from ..domain.contracts import RunId
 from .signal_log import send_signal
 
@@ -58,6 +62,7 @@ class ProcessSupervisor:
         self.state_dir = Path(state_dir).resolve()
         self.directory = self.state_dir / "process-groups"
         self.intent_directory = self.state_dir / "launch-intents"
+        self.tmp_directory = self.state_dir / "leg-tmp"
         self.grace_seconds = grace_seconds
 
     def supervised_command(
@@ -119,6 +124,19 @@ class ProcessSupervisor:
             "ISSUE_AGENT_SUPERVISED_TARGET": json.dumps(list(command)),
             **self.launch_guard_env(),
         }
+
+    def leg_tmp(self, run_id: RunId) -> str:
+        """Where the run's sandbox puts the leg's disk-backed /tmp (#470). It
+        goes with the run's processes (`kill_tree`), or with recovery after a
+        crash. It is filed under this daemon's identity, because the sandbox
+        makes it before any launch intent exists: a recovery in another daemon
+        tells a crash's leftover from a live launch by that identity alone,
+        so a leg whose launcher has none is refused (a host without /proc)."""
+        me = self.process_identity(os.getpid())
+        if me is None:
+            raise SandboxRefused("the daemon's process identity is unreadable (no /proc), so a leg's temp "
+                                 "directory could not be told from a crash's leftover")
+        return str(self.tmp_directory / f"{me.pid}-{me.start_ticks}" / self._safe_name(run_id))
 
     def prepare_launch(self, run_id: RunId) -> str:
         """Persist a generation-token intent before a provider can be spawned."""
@@ -233,9 +251,21 @@ class ProcessSupervisor:
                     "cancelled",
                     intent.launcher,
                 )
-            self._write_intent(intent)
             registration = self._read(self._path(run_id))
+            unwritten: OSError | None = None
+            try:
+                self._write_intent(intent)
+            except OSError as exc:
+                # Without the tombstone a pending launch could still register,
+                # so nothing is torn down. A registered group dies anyway, with
+                # the wrapper that would check it: a full disk must not keep the
+                # group alive and its temp directory filling that disk.
+                if registration is None:
+                    raise
+                unwritten = exc
         if registration is None:
+            # The cancelled intent stops any registration, so nothing runs.
+            self._remove_tmp(run_id)
             return
         grace = self.grace_seconds if grace_seconds is None else grace_seconds
         self._terminate(registration, grace, reason, run_id)
@@ -250,10 +280,17 @@ class ProcessSupervisor:
                 and current_intent.state == "cancelled"
             ):
                 self._remove_intent(run_id)
+        self._remove_tmp(run_id)
+        if unwritten is not None:
+            raise unwritten
 
     def recover_orphans(self) -> tuple[RunId, ...]:
+        # Leftovers go first: they may be what filled the disk the reaping writes to.
+        self._remove_leftover_tmp()
         self._discard_dead_launcher_intents()
-        return self._reap_registered(self.grace_seconds)
+        recovered = self._reap_registered(self.grace_seconds)
+        self._remove_leftover_tmp()
+        return recovered
 
     def recover_abandoned_orphans(self) -> tuple[RunId, ...]:
         """Reap a registry another daemon may own: only groups whose launcher
@@ -293,6 +330,7 @@ class ProcessSupervisor:
             recovered.append(registration.run_id)
 
         self._discard_dead_launcher_intents()
+        self._remove_leftover_tmp()
         return tuple(recovered)
 
     def force_kill_all(self) -> tuple[RunId, ...]:
@@ -322,11 +360,44 @@ class ProcessSupervisor:
             recovered.append(registration.run_id)
         return tuple(recovered)
 
-    def _path(self, run_id: RunId) -> Path:
+    @staticmethod
+    def _safe_name(run_id: RunId) -> str:
         safe = str(run_id)
         if not safe or safe in {".", ".."} or "/" in safe or "\0" in safe:
             raise ValueError("run id is not safe for a registry filename")
-        return self.directory / f"{safe}.json"
+        return safe
+
+    def _path(self, run_id: RunId) -> Path:
+        return self.directory / f"{self._safe_name(run_id)}.json"
+
+    def _launcher_directories(self) -> list[Path]:
+        if not self.tmp_directory.is_dir():
+            return []
+        return [p for p in self.tmp_directory.iterdir() if p.is_dir() and not p.is_symlink()]
+
+    def _remove_tmp(self, run_id: RunId) -> None:
+        # A file a dying sandbox process still writes may survive until a recovery's sweep.
+        name = self._safe_name(run_id)
+        for launcher in self._launcher_directories():
+            _remove_tree(launcher / name)
+
+    def _remove_leftover_tmp(self) -> None:
+        """Remove temp directories no process can use: their launching daemon
+        is dead and their run holds no registration (a registered group is
+        reaped by `kill_tree`, which removes its directory)."""
+        for launcher in self._launcher_directories():
+            pid, _, ticks = launcher.name.partition("-")
+            if pid.isdigit() and ticks.isdigit() and self.matches_identity(int(pid), int(ticks)):
+                continue
+            try:
+                runs = list(launcher.iterdir())
+            except OSError:  # a sibling's recovery swept it first
+                continue
+            for run in runs:
+                if not (self.directory / f"{run.name}.json").exists():
+                    _remove_tree(run)
+            with contextlib.suppress(OSError):
+                launcher.rmdir()  # once empty
 
     def _intent_path(self, run_id: RunId) -> Path:
         safe = str(run_id)
@@ -617,3 +688,25 @@ class ProcessSupervisor:
             )
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         cls._terminate_identities(tuple(owned.values()), 0.0, reason, run_id)
+
+
+def _remove_tree(path: Path) -> None:
+    """Remove a leg's temp directory, never following a link the leg planted.
+    A leg can leave a directory it made read-only (a permission test, an
+    extracted archive) that rmtree alone cannot empty, so every directory is
+    made the owner's first. Called once the run's processes are gone: the
+    check before each chmod is not atomic against a live writer."""
+    if not path.is_dir() or path.is_symlink():
+        return
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700)
+        for _root, dirs, _files, fd in os.fwalk(path):
+            for name in dirs:
+                with contextlib.suppress(OSError):
+                    if stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                        os.chmod(name, 0o700, dir_fd=fd)
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.lexists(path):
+        # Both walks hold a descriptor per level: a tree deeper than the open
+        # file limit (raised to the hard limit at daemon start) stays.
+        sys.stderr.write(f"[process-supervisor] could not remove leg temp directory {path}\n")

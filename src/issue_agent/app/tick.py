@@ -991,7 +991,7 @@ def bind_runtime(
         debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
         idle_timeout=cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None,
         max_runtime=cfg.agent_max_runtime if cfg.agent_max_runtime > 0 else None,
-        process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)) if state_dir else None,
+        process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)),
         spend_evidence_dir=spend_evidence_dir(state_dir),
         rate_table=rate_table(cfg, RuntimeName.CODEX.value),
         leg_sandbox=leg_sandbox(cfg, role),

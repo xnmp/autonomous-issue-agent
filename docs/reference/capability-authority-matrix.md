@@ -23,7 +23,8 @@ What a leg sees (`domain/sandbox.py`):
 | `~/.cargo/registry`, `~/.cargo/git`, `~/.cache/uv`, `~/.bun/install/cache`, `~/.npm` | per-leg overlay (writes discarded) |
 | the runtime session store (`~/.claude/projects/<checkout>`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write (codex's login too: refresh rotates it) |
 | the rest of Claude's config dir `~/.claude` (login, settings, hooks, history, other projects' transcripts) | not mounted: a Claude leg authenticates with its own `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, and a launch without one is refused |
-| HOME, `/tmp` (with an empty `/tmp/.X11-unix`, so a leg's own Xvfb has a socket directory), `/var/tmp` | empty, leg-private |
+| HOME, `/tmp/.X11-unix` (so a leg's own Xvfb has a socket directory) | empty, leg-private tmpfs |
+| `/tmp`, `/var/tmp` | read-write, empty and leg-private: two fresh 0700 directories on disk under the deployment's process registry (`leg-tmp/<daemon>/<run>`), removed with the run's process group or by recovery once their daemon is dead. A tmpfs here was charged to the unit's memory (#470). They take the state filesystem's mount flags: a noexec state directory refuses every leg |
 | GPU render nodes (`/dev/dri/renderD*`, never the display `card*` nodes): NVIDIA's EGL library aborts Xvfb and WebKitGTK without one | device |
 | network | on (no egress filter) |
 

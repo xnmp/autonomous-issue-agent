@@ -12,6 +12,7 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 import uuid
@@ -71,8 +72,14 @@ def sandbox(host: dict[str, Path], *, writable: bool = True, credential: str | N
                       credential=credential, protected=(str(host["harness"]),))
 
 
+def leg_tmp(host: dict[str, Path]) -> str:
+    """A fresh path for one leg's temp directories, as the supervisor names them."""
+    return str(host["tmp"] / "state" / "leg-tmp" / uuid.uuid4().hex)
+
+
 def run_leg(box: LegSandbox, host: dict[str, Path], script: str, **launch) -> subprocess.CompletedProcess:
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8"}
+    launch.setdefault("tmp", leg_tmp(host))
     leg = box.launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env, **launch)
     return subprocess.run(leg.argv, env={**env, **leg.env}, capture_output=True, text=True, timeout=60)
 
@@ -143,6 +150,108 @@ def test_dev_shm_is_its_own_mount_inside_a_leg(host):
     assert done.stdout.split() == ["/dev/shm", "writable"], done.stderr
 
 
+@needs_bwrap
+def test_a_legs_tmp_and_var_tmp_are_private_directories_on_disk_not_memory(host):
+    # #470: Chrome's traces in a tmpfs /tmp were charged to the fix unit's
+    # memory and OOM-killed it. The leg's writes land in its directory on disk.
+    tmp = Path(leg_tmp(host))
+
+    done = run_leg(sandbox(host), host, 'echo a > /tmp/a && echo b > /var/tmp/b && ls -A /tmp /var/tmp; '
+                                        'stat -f -c %T /dev/shm', tmp=str(tmp))
+
+    assert done.returncode == 0, done.stderr
+    assert (tmp / "tmp/a").read_text() == "a\n" and (tmp / "var-tmp/b").read_text() == "b\n"
+    assert ".X11-unix" in done.stdout  # still the leg's own socket directory
+    assert done.stdout.split()[-1] == "tmpfs"  # /dev/shm stays its own tmpfs
+    for path in (tmp, tmp / "tmp", tmp / "var-tmp"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700, path
+
+
+@needs_bwrap
+def test_one_leg_never_sees_another_legs_temp_files(host):
+    first = Path(leg_tmp(host))
+    run_leg(sandbox(host), host, "echo planted-secret > /tmp/s; echo planted-secret > /var/tmp/s", tmp=str(first))
+
+    done = run_leg(sandbox(host), host, f'cat /tmp/s /var/tmp/s "{first}/tmp/s" 2>/dev/null; ls -A /var/tmp; echo done')
+
+    assert done.stdout.split() == ["done"], done.stdout
+
+
+@needs_bwrap
+def test_a_temp_directory_that_already_exists_is_never_handed_to_a_leg(host):
+    planted = host["tmp"] / "planted"
+    (planted / "tmp").mkdir(parents=True)
+    (planted / "tmp/earlier").write_text("an earlier leg's file\n")
+    linked = host["tmp"] / "linked"
+    linked.symlink_to(host["home"] / ".ssh")
+
+    for tmp in (planted, linked):
+        with pytest.raises(SandboxRefused, match="cannot be created fresh"):
+            sandbox(host).launch(["/bin/true"], tmp=str(tmp), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+    assert (planted / "tmp/earlier").exists()
+    assert (host["home"] / ".ssh/id_ed25519").read_text() == "planted-ssh-key\n"
+
+
+@needs_bwrap
+@pytest.mark.parametrize("tmp", ["", "relative/leg-tmp", "/", "bad\0path", "huge"])
+def test_an_absent_or_malformed_temp_path_refuses_the_leg(host, tmp):
+    if tmp == "huge":  # a writable parent: refused for its length alone
+        tmp = str(host["tmp"] / ("a" * 5000))
+    with pytest.raises(SandboxRefused):
+        sandbox(host).launch(["/bin/true"], tmp=tmp, cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+
+
+@needs_bwrap
+def test_a_temp_path_that_is_or_holds_home_or_the_harness_refuses_the_leg(host):
+    for tmp in (host["home"], host["harness"], host["tmp"]):
+        with pytest.raises(SandboxRefused, match="would expose"):
+            sandbox(host).launch(["/bin/true"], tmp=str(tmp), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+
+
+@needs_bwrap
+def test_a_temp_directory_on_a_noexec_filesystem_refuses_the_leg(host, monkeypatch):
+    # bwrap keeps the source's mount flags: a noexec /tmp breaks every leg
+    # that runs what it builds there.
+    real = os.statvfs
+
+    class NoExec:
+        def __init__(self, path):
+            self.f_flag = real(path).f_flag | os.ST_NOEXEC
+
+    monkeypatch.setattr(os, "statvfs", NoExec)
+    tmp = Path(leg_tmp(host))
+
+    with pytest.raises(SandboxRefused, match="noexec"):
+        sandbox(host).launch(["/bin/true"], tmp=str(tmp), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+    assert not tmp.exists()
+
+
+@needs_bwrap
+def test_a_launch_refused_after_planning_leaves_no_temp_directory(host):
+    tmp = Path(leg_tmp(host))
+
+    with pytest.raises(SandboxRefused, match="missing"):
+        sandbox(host).launch(["/bin/true"], tmp=str(tmp), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"},
+                             runtime_state=(str(host["tmp"] / "absent-session-store"),))
+    assert not tmp.exists()
+
+
+@needs_bwrap
+def test_a_supervised_legs_temp_directory_goes_when_the_leg_ends(host):
+    supervisor = ProcessSupervisor(str(host["tmp"] / "supervision"))
+    run = RunId("leg-1")
+    tmp = Path(supervisor.leg_tmp(run))
+
+    outside = host["harness"] / "config"  # a host path the leg names but cannot see
+    done = run_leg(sandbox(host), host, f'head -c 1048576 /dev/zero > /tmp/trace && ln -s "{outside}" /tmp/link && '
+                                        'echo wrote', tmp=str(tmp))
+    assert done.stdout.strip() == "wrote", done.stderr
+    supervisor.kill_tree(run)
+
+    assert not tmp.exists()
+    assert (outside / "shared.env").exists()  # the removal never follows a leg's link
+
+
 _XVFB = shutil.which("Xvfb")
 _XVFB_RUN = shutil.which("xvfb-run")
 _XPROP = shutil.which("xprop")
@@ -159,7 +268,7 @@ def test_two_legs_each_start_their_own_virtual_display(host):
     second = "sleep 2; xvfb-run -d -s '-screen 0 320x240x24' sh -c 'echo $DISPLAY; xprop -root LEG'"
     box = sandbox(host)
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8"}
-    legs = [box.launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env) for script in (first, second)]
+    legs = [box.launch(["/bin/sh", "-c", script], tmp=leg_tmp(host), cwd=str(host["worktree"]), env=env) for script in (first, second)]
     running = [subprocess.Popen(leg.argv, env={**env, **leg.env}, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True) for leg in legs]
     (one, err_one), (two, err_two) = (p.communicate(timeout=60) for p in running)
@@ -175,7 +284,7 @@ def test_two_legs_each_start_their_own_virtual_display(host):
 def test_a_leg_without_the_credential_holds_no_token_even_if_its_env_had_one(host):
     env = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": str(host["home"]), "GH_TOKEN": "ambient"}
     leg = sandbox(host, writable=False).launch(["/bin/sh", "-c", 'echo "${GH_TOKEN:-none}"'],
-                                               cwd=str(host["worktree"]), env=env)
+                                               tmp=leg_tmp(host), cwd=str(host["worktree"]), env=env)
 
     done = subprocess.run(leg.argv, env={**env, **leg.env}, capture_output=True, text=True, timeout=60)
 
@@ -185,7 +294,7 @@ def test_a_leg_without_the_credential_holds_no_token_even_if_its_env_had_one(hos
 
 @needs_bwrap
 def test_the_token_never_appears_in_the_sandbox_argv(host):
-    leg = sandbox(host).launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
+    leg = sandbox(host).launch(["/bin/true"], tmp=leg_tmp(host), cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
 
     assert FAKE_TOKEN not in " ".join(leg.argv)
     assert FAKE_TOKEN not in leg.summary and FAKE_TOKEN not in repr(sandbox(host))
@@ -235,7 +344,7 @@ def test_tearing_down_the_registered_group_kills_every_sandboxed_process(host):
     marker = f"sandboxed-sleeper-{uuid.uuid4().hex}"
     env = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": str(host["home"])}
     leg = sandbox(host).launch(["/bin/sh", "-c", f'sleep 300 & sleep 301 & echo {marker} > started; wait'],
-                               cwd=str(host["worktree"]), env=env)
+                               tmp=leg_tmp(host), cwd=str(host["worktree"]), env=env)
     supervisor = ProcessSupervisor(str(host["tmp"] / "supervision"), grace_seconds=0.5)
     run_id = RunId("sandboxed-leg")
     process = subprocess.Popen(supervisor.supervised_command(run_id, leg.argv), env={**env, **leg.env},
@@ -262,7 +371,7 @@ def test_a_launcher_killed_outright_takes_the_sandbox_with_it(host):
     # --die-with-parent and the PID namespace leave no sandboxed orphan.
     env = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": str(host["home"])}
     leg = sandbox(host).launch(["/bin/sh", "-c", "sleep 300 & echo up > started; wait"],
-                               cwd=str(host["worktree"]), env=env)
+                               tmp=leg_tmp(host), cwd=str(host["worktree"]), env=env)
     supervisor = ProcessSupervisor(str(host["tmp"] / "supervision"), grace_seconds=0.5)
     process = subprocess.Popen(supervisor.supervised_command(RunId("killed-leader"), leg.argv),
                                env={**env, **leg.env}, start_new_session=True)
@@ -317,7 +426,7 @@ def test_runtime_state_is_shared_with_the_host_at_the_same_path(host):
 def _fix_leg(host: dict[str, Path], script: str) -> subprocess.Popen:
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8",
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-    leg = sandbox(host).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env)
+    leg = sandbox(host).launch(["/bin/sh", "-c", script], tmp=leg_tmp(host), cwd=str(host["worktree"]), env=env)
     return subprocess.Popen(leg.argv, env={**env, **leg.env}, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
 
@@ -393,7 +502,7 @@ def test_a_merged_branch_the_repository_pruned_never_breaks_a_fix_legs_fetch(hos
                  ["reflog", "expire", "--expire=now", "--all"], ["gc", "-q", "--prune=now"]):
         _git(*step, cwd=host["target"])
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"])}
-    leg_env = sandbox(host).launch(["/bin/true"], cwd=clone, env=env).env
+    leg_env = sandbox(host).launch(["/bin/true"], tmp=leg_tmp(host), cwd=clone, env=env).env
 
     def fetch(extra: dict[str, str]) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, env={**os.environ, **extra},
@@ -460,7 +569,7 @@ def test_a_checkout_link_into_another_worktree_is_refused(host, review):
 @needs_bwrap
 def test_a_fix_leg_never_writes_a_shared_worktree(host, review):
     with pytest.raises(SandboxRefused):
-        sandbox(host).launch(["/bin/true"], cwd=str(review), env={"PATH": "/usr/bin:/bin"})
+        sandbox(host).launch(["/bin/true"], tmp=leg_tmp(host), cwd=str(review), env={"PATH": "/usr/bin:/bin"})
 
 
 def test_a_missing_bwrap_is_named_and_refuses_every_launch(host):
@@ -470,7 +579,7 @@ def test_a_missing_bwrap_is_named_and_refuses_every_launch(host):
     assert "not installed" in (box.preflight() or "")
     assert box.posture().startswith("unavailable:")
     with pytest.raises(SandboxRefused):
-        box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+        box.launch(["/bin/true"], tmp=leg_tmp(host), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
 
 
 @needs_bwrap
@@ -498,7 +607,7 @@ def test_a_commondir_that_is_not_a_plain_file_refuses_the_leg(host, plant):
         commondir.symlink_to(host["tmp"] / "elsewhere")
 
     with pytest.raises(SandboxRefused, match="commondir"):
-        sandbox(host).launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
+        sandbox(host).launch(["/bin/true"], tmp=leg_tmp(host), cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
     assert not (host["tmp"] / "elsewhere").exists()
 
 
@@ -511,7 +620,7 @@ def test_a_bwrap_too_old_for_overlays_is_named_and_refuses_every_launch(host):
 
     assert "0.10 or newer" in (box.preflight() or "")
     with pytest.raises(SandboxRefused):
-        box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+        box.launch(["/bin/true"], tmp=leg_tmp(host), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
 
 
 def test_a_bwrap_that_cannot_create_namespaces_refuses_every_launch(host):
@@ -523,7 +632,7 @@ def test_a_bwrap_that_cannot_create_namespaces_refuses_every_launch(host):
 
     assert "uid map" in (box.preflight() or "")
     with pytest.raises(SandboxRefused):
-        box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+        box.launch(["/bin/true"], tmp=leg_tmp(host), cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
 
 
 def _plant_claude_config(host: dict[str, Path]) -> Path:
@@ -556,7 +665,7 @@ def test_a_claude_leg_with_its_own_credential_sees_only_its_session_store_of_the
            name: "leg-login"}
     store = claude_runtime_state(env, str(host["worktree"]))
     script = 'find "$HOME/.claude" | sort; echo "gh=${GH_TOKEN:-none}${GITHUB_TOKEN:-}"; echo "cred=$' + name + '"'
-    leg = sandbox(host, writable=False).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env,
+    leg = sandbox(host, writable=False).launch(["/bin/sh", "-c", script], tmp=leg_tmp(host), cwd=str(host["worktree"]), env=env,
                                                runtime_state=store)
 
     out = subprocess.run(leg.argv, env={**env, **leg.env}, capture_output=True, text=True, timeout=60).stdout

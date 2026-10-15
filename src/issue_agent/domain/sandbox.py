@@ -39,6 +39,17 @@ class Mount:
     # Skipped when the host lacks the path (distribution layouts differ). A
     # required mount the host lacks refuses the leg.
     optional: bool = False
+    # The host directory shown at `path` when it is not `path` itself: a
+    # leg's disk-backed /tmp.
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if self.source and (self.access is not Access.READ_WRITE or self.optional):
+            raise UnsafeMount(f"{self.path} shows another directory, so it must be a required read-write bind")
+
+    @property
+    def host(self) -> str:
+        return self.source or self.path
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,10 @@ class LegFacts:
     writable: bool
     git: GitLink | None
     runtime_binary: str
+    # A fresh directory of the leg's own on disk, outside the checkout, holding
+    # its /tmp and /var/tmp. A tmpfs is charged to the unit's memory: one
+    # leg's Chrome traces in its /tmp OOM-killed the fix unit (#470).
+    tmp: str
     # The directories the runtime ships its helpers in (codex's code-mode host
     # beside its binary). Read-only, dropped when one would expose a protected path.
     runtime_support: tuple[str, ...] = ()
@@ -123,6 +138,9 @@ HOME_SECRETS = (
 )
 
 
+# The leg's temp dirs: (path in the leg, directory under `LegFacts.tmp`).
+LEG_TMP = (("/tmp", "tmp"), ("/var/tmp", "var-tmp"))
+
 # Temp dirs point inside the sandbox; XDG overrides fall back to HOME, which is private.
 LEG_ENV: tuple[tuple[str, str | None], ...] = (
     ("TMPDIR", "/tmp"), ("TMP", "/tmp"), ("TEMP", "/tmp"),
@@ -181,6 +199,8 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     cwd = _normal(facts.cwd)
     writable = Access.READ_WRITE if facts.writable else Access.READ_ONLY
 
+    tmp = _normal(facts.tmp)
+    leg_tmp = [Mount(path, Access.READ_WRITE, source=posixpath.join(tmp, name)) for path, name in LEG_TMP]
     required: list[Mount] = [Mount(_normal(facts.runtime_binary), Access.READ_ONLY)]
     required += [Mount(_normal(p), Access.READ_WRITE) for p in (*facts.runtime_state, *facts.build_cache,
                                                                  *facts.scratch)]
@@ -200,9 +220,9 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
             dot = posixpath.join(cwd, ".git")
             required += [Mount(dot, Access.READ_WRITE),
                          *(Mount(posixpath.join(dot, name), Access.READ_ONLY) for name in ("config", "hooks", "commondir"))]
-    for mount in required:
-        if exposed := exposes(mount.path, protected):
-            raise UnsafeMount(f"{mount.access.value} mount {mount.path} would expose {exposed}")
+    for mount in (Mount(tmp, Access.READ_WRITE), *leg_tmp, *required):
+        if exposed := exposes(mount.host, protected):
+            raise UnsafeMount(f"{mount.access.value} mount {mount.host} would expose {exposed}")
 
     optional = [Mount(p, Access.READ_ONLY, optional=True) for p in SYSTEM_ROOTS]
     optional += [Mount(_normal(p), Access.READ_ONLY, optional=True) for p in facts.runtime_support]
@@ -218,20 +238,21 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     # socket file in its private /tmp, not only on the abstract socket every
     # leg and the host share. /dev/shm is its own tmpfs, as on a host: bwrap's
     # /dev makes it a plain directory, and tauri's tests rely on the mount.
-    private = [Mount(home, Access.PRIVATE), Mount("/tmp", Access.PRIVATE), Mount("/tmp/.X11-unix", Access.PRIVATE),
-               Mount("/var/tmp", Access.PRIVATE), Mount("/dev/shm", Access.PRIVATE)]
-    # One mount per path, the first named winning: required facts over
+    private = [Mount(home, Access.PRIVATE), Mount("/tmp/.X11-unix", Access.PRIVATE),
+               Mount("/dev/shm", Access.PRIVATE)]
+    # One mount per path, the first named winning: the leg's temp dirs (so no
+    # other fact, not even HOME, claims /tmp), then required facts over
     # optional conventions. A stable depth sort puts parents first and, at one
     # depth, private directories before binds.
     chosen: dict[str, Mount] = {}
-    for mount in (*private, *required, *optional):
+    for mount in (*leg_tmp, *private, *required, *optional):
         chosen.setdefault(mount.path, mount)
     ordered = sorted(chosen.values(), key=lambda m: (0 if m.path == "/" else m.path.count("/"),
                                                      m.access is not Access.PRIVATE))
-    # An optional mount adds nothing inside one with the same or write access
-    # and could narrow it (a PATH entry inside the checkout would turn that
-    # directory read-only). Only the nearest enclosing mount decides what a
-    # path shows.
+    # An optional mount adds nothing inside one of the same host path with the
+    # same or write access, and could narrow it (a PATH entry inside the
+    # checkout would turn that directory read-only). Only the nearest
+    # enclosing mount decides what a path shows.
     by_path = {m.path: m for m in ordered}
 
     def enclosing(path: str) -> list[Mount]:
@@ -246,7 +267,7 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
         if not m.optional:
             return False
         around = enclosing(m.path)
-        return bool(around) and around[0].access in (m.access, Access.READ_WRITE)
+        return bool(around) and not around[0].source and around[0].access in (m.access, Access.READ_WRITE)
 
     ordered = [m for m in ordered if not dropped(m)]
     credentials = PUBLICATION_ENV[2:] if facts.writable else PUBLICATION_ENV

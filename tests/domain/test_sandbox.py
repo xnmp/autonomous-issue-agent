@@ -8,6 +8,7 @@ from issue_agent.domain.sandbox import (
     Access,
     GitLink,
     LegFacts,
+    Mount,
     UnsafeMount,
     claude_session_store,
     leg_mount_plan,
@@ -21,10 +22,11 @@ REPOSITORY = "/home/op/Repos/target/.git"
 GIT = GitLink(f"{REPOSITORY}/objects")  # a fix clone borrows the repository's objects
 REVIEW_GIT = GitLink(REPOSITORY)  # a review worktree reads the repository's .git
 CLAUDE = "/home/op/.claude"
+LEG_TMP = f"{STATE}/process-supervision/d/leg-tmp/run-1"
 
 def facts(**overrides) -> LegFacts:
     values = dict(
-        home=HOME, cwd=WORKTREE, writable=True, git=GIT, runtime_binary="/usr/bin/claude",
+        home=HOME, cwd=WORKTREE, writable=True, git=GIT, runtime_binary="/usr/bin/claude", tmp=LEG_TMP,
         runtime_state=("/home/op/.claude/projects/x",),
         search_path=("/home/op/.cargo/bin", "/usr/bin"), protected=(HARNESS, STATE),
     )
@@ -34,6 +36,11 @@ def facts(**overrides) -> LegFacts:
 
 def access(plan, path: str) -> Access | None:
     return next((m.access for m in plan.mounts if m.path == path), None)
+
+
+def shown(plan, path: str) -> str | None:
+    """The host directory the mount at `path` shows."""
+    return next((m.host for m in plan.mounts if m.path == path), None)
 
 
 def visible(plan, path: str) -> Access | None:
@@ -128,8 +135,45 @@ def test_toolchains_are_read_only_and_download_caches_are_thrown_away():
     assert visible(plan, "/home/op/.cargo/config.toml") is Access.READ_ONLY  # linker and rustflags
     assert visible(plan, "/home/op/.cargo/credentials.toml") is Access.PRIVATE
     assert visible(plan, "/usr/lib/libc.so") is Access.READ_ONLY
-    assert visible(plan, "/tmp/scratch") is Access.PRIVATE
     assert visible(plan, "/run/user/1000/bus") is None
+
+
+def test_a_legs_temp_dirs_are_its_own_directories_on_disk_never_a_tmpfs():
+    # #470: a tmpfs /tmp is charged to the unit's memory; one leg's Chrome
+    # traces in it OOM-killed the fix unit.
+    plan = leg_mount_plan(facts())
+    other = leg_mount_plan(facts(tmp=f"{STATE}/process-supervision/d/leg-tmp/run-2"))
+
+    for path, name in (("/tmp", "tmp"), ("/var/tmp", "var-tmp")):
+        assert access(plan, path) is Access.READ_WRITE
+        assert shown(plan, path) == f"{LEG_TMP}/{name}"
+        assert shown(other, path) != shown(plan, path)
+    assert visible(plan, "/tmp/trace.json") is Access.READ_WRITE
+    assert access(plan, "/tmp/.X11-unix") is Access.PRIVATE
+    assert access(plan, "/dev/shm") is Access.PRIVATE
+    assert access(plan, HOME) is Access.PRIVATE
+
+
+@pytest.mark.parametrize("override", [{"build_cache": ("/tmp",), "search_path": ("/tmp", "/var/tmp")},
+                                      {"home": "/tmp"}, {"home": "/var/tmp"}])
+def test_no_other_fact_claims_the_legs_tmp(override):
+    plan = leg_mount_plan(facts(**override))
+
+    assert shown(plan, "/tmp") == f"{LEG_TMP}/tmp" and shown(plan, "/var/tmp") == f"{LEG_TMP}/var-tmp"
+    assert access(plan, "/tmp") is Access.READ_WRITE and access(plan, "/var/tmp") is Access.READ_WRITE
+
+
+@pytest.mark.parametrize("kind", [dict(access=Access.READ_ONLY), dict(access=Access.PRIVATE),
+                                  dict(access=Access.DEVICE), dict(access=Access.READ_WRITE, optional=True)])
+def test_only_a_required_read_write_bind_may_show_another_directory(kind):
+    with pytest.raises(UnsafeMount):
+        Mount("/tmp", source="/home/op/.local/state/leg-tmp/r/tmp", **kind)
+
+
+def test_a_path_entry_under_tmp_still_shows_the_hosts_directory():
+    plan = leg_mount_plan(facts(search_path=("/tmp/tools/bin",)))
+
+    assert access(plan, "/tmp/tools/bin") is Access.READ_ONLY
 
 
 def test_a_leg_gets_gpu_render_nodes_and_its_own_x_socket_directory_but_no_host_display():
@@ -170,6 +214,7 @@ def test_a_path_entry_that_would_expose_a_protected_path_is_not_mounted(entry):
 @pytest.mark.parametrize("override", [
     {"cwd": HOME}, {"cwd": "/"}, {"cwd": "/home"}, {"cwd": HARNESS}, {"runtime_state": (STATE,)},
     {"scratch": ("/home/op/.local",)}, {"build_cache": ("/home/op/Repos",)}, {"runtime_binary": "/home"},
+    {"tmp": "/"}, {"tmp": HOME}, {"tmp": "/home"}, {"tmp": HARNESS}, {"tmp": STATE}, {"tmp": "/home/op/.ssh/.."},
 ])
 def test_a_required_mount_that_would_expose_a_protected_path_refuses_the_leg(override):
     with pytest.raises(UnsafeMount):
@@ -177,7 +222,8 @@ def test_a_required_mount_that_would_expose_a_protected_path_refuses_the_leg(ove
 
 
 @pytest.mark.parametrize("override", [{"cwd": "relative"}, {"cwd": ""}, {"home": "~"},
-                                      {"runtime_state": ("x/y",)}, {"cwd": "/a\0b"}])
+                                      {"runtime_state": ("x/y",)}, {"cwd": "/a\0b"}, {"tmp": ""},
+                                      {"tmp": "leg-tmp/run-1"}, {"tmp": "/a\0b"}, {"tmp": None}])
 def test_relative_or_malformed_paths_are_refused(override):
     with pytest.raises(UnsafeMount):
         leg_mount_plan(facts(**override))

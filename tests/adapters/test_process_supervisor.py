@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -123,6 +124,162 @@ def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
     assert supervisor.recover_orphans() == (RunId("run-0"), RunId("run-1"))
     for process in processes:
         _wait_dead(process)
+
+
+# Above the kernel's largest pid_max: a launcher that can never be alive.
+DEAD_LAUNCHER = "4194305-1"
+
+
+def _leg_tmp(supervisor, run_id: str, launcher: str = "") -> Path:
+    """A leg's temp directory as its sandbox leaves it, made by this process
+    or by `launcher`: written, with a link out, directories it made read-only
+    or closed, and /tmp itself read-only."""
+    path = (supervisor.tmp_directory / launcher / run_id) if launcher else Path(supervisor.leg_tmp(RunId(run_id)))
+    (path / "tmp/archive/deep").mkdir(parents=True)
+    (path / "tmp/trace.json").write_text("{}")
+    (path / "tmp/archive/deep/file").write_text("x")
+    (path / "tmp/closed").mkdir()
+    (path / "tmp/closed/file").write_text("x")
+    (path / "tmp/link").symlink_to(supervisor.state_dir.parent / "keep")
+    for directory, mode in (("tmp/archive/deep", 0o500), ("tmp/archive", 0o500), ("tmp/closed", 0o000),
+                            ("tmp", 0o500)):
+        (path / directory).chmod(mode)
+    return path
+
+
+def _disk_full(monkeypatch) -> None:
+    import errno
+
+    import issue_agent.adapters.process_supervisor as module
+
+    def full(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(module, "atomic_write", full)
+
+
+def test_a_legs_temp_directory_goes_with_its_process_group(tmp_path) -> None:
+    (tmp_path / "keep").mkdir(mode=0o755)
+    (tmp_path / "keep").chmod(0o755)
+    (tmp_path / "keep/file").write_text("kept")
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (process,) = _sleepers(supervisor, "leg", 1)
+    tmp = _leg_tmp(supervisor, "leg-0")
+
+    supervisor.kill_tree(RunId("leg-0"))
+
+    _wait_dead(process)
+    assert not tmp.exists()
+    assert (tmp_path / "keep/file").read_text() == "kept"  # never follows the leg's link
+    assert stat.S_IMODE((tmp_path / "keep").stat().st_mode) == 0o755  # nor chmods through it
+
+
+def test_a_legs_temp_directory_goes_when_its_process_never_registered(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"))
+    (tmp_path / "keep").mkdir()
+    tmp = _leg_tmp(supervisor, "never-ran")
+
+    supervisor.kill_tree(RunId("never-ran"))
+
+    assert not tmp.exists()
+
+
+def test_a_full_disk_still_kills_the_group_and_frees_its_temp_directory(tmp_path, monkeypatch) -> None:
+    # The cancellation receipt cannot be written; the group must not survive
+    # to keep filling the disk with its /tmp (review of #474).
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "leg", 1)
+    tmp = _leg_tmp(supervisor, "leg-0")
+    _disk_full(monkeypatch)
+
+    with pytest.raises(OSError):
+        supervisor.kill_tree(RunId("leg-0"))
+
+    _wait_dead(process)
+    assert not tmp.exists()
+
+
+def test_boot_recovery_on_a_full_disk_frees_leftovers_and_kills_orphans(tmp_path, monkeypatch) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "orphan", 1)
+    left = [_leg_tmp(supervisor, "orphan-0"), _leg_tmp(supervisor, "crashed", launcher=DEAD_LAUNCHER)]
+    _disk_full(monkeypatch)
+
+    with pytest.raises(OSError):
+        supervisor.recover_orphans()
+
+    _wait_dead(process)
+    assert not any(path.exists() for path in left)
+
+
+def test_boot_recovery_removes_temp_directories_a_crash_left(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "orphan", 1)
+    left = [_leg_tmp(supervisor, "orphan-0"),
+            _leg_tmp(supervisor, "crashed-before-registering", launcher=DEAD_LAUNCHER),
+            _leg_tmp(supervisor, "malformed-launcher", launcher="not-a-daemon")]
+
+    supervisor.recover_orphans()
+
+    _wait_dead(process)
+    assert not any(path.exists() for path in left)
+    assert not (supervisor.tmp_directory / DEAD_LAUNCHER).exists()
+    assert ProcessSupervisor(str(tmp_path / "absent")).recover_orphans() == ()  # nothing to sweep
+
+
+def test_any_recovery_removes_a_dead_daemons_unregistered_temp_directory_but_no_live_one(tmp_path) -> None:
+    # A retired registry (an old checkout, the sibling role) never boots again.
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "live", 1)  # a legacy receipt its live parent keeps
+    live_launch = _leg_tmp(supervisor, "launching")  # this daemon is alive: a launch in progress
+    leftover = _leg_tmp(supervisor, "crashed", launcher=DEAD_LAUNCHER)
+    still_registered = _leg_tmp(supervisor, "live-0", launcher=DEAD_LAUNCHER)
+    try:
+        assert supervisor.recover_abandoned_orphans() == ()
+
+        assert not leftover.exists()
+        assert (live_launch / "tmp/trace.json").exists() and (still_registered / "tmp/trace.json").exists()
+    finally:
+        supervisor.kill_tree(RunId("live-0"))
+        supervisor.kill_tree(RunId("launching"))
+        _wait_dead(process)
+    assert not still_registered.exists() and not live_launch.exists()
+
+
+def test_a_daemon_without_a_process_identity_gets_no_leg_temp_directory(tmp_path, monkeypatch) -> None:
+    # Filed under no identity, a live leg's directory would read as a dead
+    # daemon's leftover and a wake recovery could delete it.
+    from issue_agent.adapters.leg_sandbox import SandboxRefused
+
+    monkeypatch.setattr(ProcessSupervisor, "process_identity", classmethod(lambda cls, pid: None))
+    supervisor = ProcessSupervisor(str(tmp_path / "state"))
+
+    with pytest.raises(SandboxRefused, match="identity"):
+        supervisor.leg_tmp(RunId("leg"))
+    assert not supervisor.tmp_directory.exists()
+
+
+def test_wake_recovery_keeps_a_live_legs_temp_directory(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    (tmp_path / "keep").mkdir()
+    (process,) = _sleepers(supervisor, "live", 1)
+    tmp = _leg_tmp(supervisor, "live-0")
+    try:
+        assert supervisor.recover_abandoned_orphans() == ()
+        assert (tmp / "tmp/trace.json").exists()
+    finally:
+        supervisor.kill_tree(RunId("live-0"))
+        _wait_dead(process)
+
+
+@pytest.mark.parametrize("run_id", ["", ".", "..", "../escape", "a/b", "a\0b"])
+def test_a_run_id_that_is_not_a_plain_name_has_no_temp_directory(tmp_path, run_id) -> None:
+    with pytest.raises(ValueError):
+        ProcessSupervisor(str(tmp_path)).leg_tmp(RunId(run_id))
 
 
 def test_legacy_recovery_does_not_reap_a_live_sibling_owner(tmp_path) -> None:

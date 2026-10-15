@@ -532,6 +532,7 @@ class AgentRunner(AgentRuntime):
                 leg_env = {**os.environ, **kwargs["env"]}
                 try:
                     launch = self._sandbox.launch(command, cwd=cwd, env=leg_env,
+                                                  tmp=self._process_supervisor.leg_tmp(supervised_run_id),
                                                   runtime_state=claude_runtime_state(leg_env, cwd),
                                                   read_only=task.read_only)
                 except SandboxRefused as exc:
@@ -541,7 +542,11 @@ class AgentRunner(AgentRuntime):
                 self._log(f"sdk: {launch.summary}")
                 command = launch.argv
                 kwargs["env"] = {**kwargs["env"], **launch.env}
-            wrapper, supervisor_env = self._process_supervisor.supervised_cli(supervised_run_id, command)
+            try:
+                wrapper, supervisor_env = self._process_supervisor.supervised_cli(supervised_run_id, command)
+            except BaseException:
+                self._process_supervisor.kill_tree(supervised_run_id)  # ends the run's leg directory too
+                raise
             kwargs["cli_path"] = wrapper
             kwargs["env"] = {**kwargs.get("env", {}), **supervisor_env}
             kwargs["env"][CHILD_ENV_MANIFEST] = " ".join(sorted(kwargs["env"]))

@@ -708,13 +708,14 @@ class _Sandbox:
         self.refuse, self.launches = refuse, []
         self.launcher = "/usr/bin/bwrap"  # an executable stand-in, set per test
 
-    def launch(self, command, *, cwd, env, runtime_state=(), scratch=(), read_only=False):
+    def launch(self, command, *, cwd, env, tmp, runtime_state=(), scratch=(), read_only=False):
         from issue_agent.adapters.leg_sandbox import Launch, SandboxRefused
 
         if self.refuse:
             raise SandboxRefused(self.refuse)
+        os.makedirs(os.path.join(tmp, "tmp"))  # as the real sandbox makes the leg's /tmp
         self.launches.append({"command": tuple(command), "cwd": cwd, "runtime_state": tuple(runtime_state),
-                              "read_only": read_only})
+                              "read_only": read_only, "tmp": tmp})
         return Launch((self.launcher, "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
 
 
@@ -755,6 +756,9 @@ def test_a_claude_leg_execs_its_cli_through_the_sandbox_with_its_credential(tmp_
     # The session store `--resume` needs is the CLI's own, for this checkout.
     store = sandbox.launches[0]["runtime_state"][0]
     assert store.endswith("/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(tmp_path)))
+    # The leg's disk-backed /tmp lives in the deployment's state, outside the checkout, and goes with the leg.
+    leg_tmp = sandbox.launches[0]["tmp"]
+    assert leg_tmp.startswith(str(tmp_path / "sup" / "leg-tmp") + "/") and not os.path.exists(leg_tmp)
 
 
 def test_a_claude_leg_the_sandbox_refuses_never_starts(tmp_path, monkeypatch):
@@ -772,6 +776,18 @@ def test_a_claude_leg_the_sandbox_refuses_never_starts(tmp_path, monkeypatch):
     assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE and result.is_error
     assert "bwrap is not installed" in result.summary
     assert started == []
+
+
+def test_a_claude_leg_whose_launch_fails_after_the_sandbox_leaves_no_leg_directory(tmp_path, monkeypatch):
+    _install_fake_sdk(monkeypatch, [_ResultMessage(structured_output={"status": "done"}, session_id="s1")])
+    sandbox = _Sandbox()
+    runner, _ = _supervised_cli_runner(tmp_path, monkeypatch, sandbox)
+    os.chmod(sandbox.launcher, 0o644)  # the supervisor's wrapper refuses an unexecutable command
+
+    with pytest.raises(ValueError):
+        asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
+
+    assert sandbox.launches and not os.path.exists(sandbox.launches[0]["tmp"])
 
 
 def test_a_sandbox_without_a_process_supervisor_is_a_wiring_error():
