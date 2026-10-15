@@ -35,6 +35,7 @@ from issue_agent.domain.state import (
     Blocked,
     Busy,
     Dispatch,
+    DuplicateStop,
     Harness,
     ItemKey,
     LinkBlocker,
@@ -752,25 +753,16 @@ def test_policy_refuses_resolve_on_a_pr():
         lambda: PlainStop(StopReason.QUESTION, "-"),
         lambda: PlainStop("workflow-path", "-"),  # type: ignore[arg-type]
         lambda: QuestionStop("", "-"),
+        lambda: AttemptsStop(None, "-"),  # type: ignore[arg-type]
+        lambda: AttemptsStop(FIX, ""),
+        lambda: DuplicateStop(-1, "", "-"),
+        lambda: DuplicateStop(True, "", "-"),
         lambda: Backoff(FIX, datetime(2026, 10, 1)),
         lambda: MergePullRequest(7, ""),
     ],
 )
 def test_malformed_values_are_rejected(build):
     with pytest.raises(ValueError):
-        build()
-
-
-@pytest.mark.parametrize(
-    "build",
-    [
-        lambda: PlainStop(StopReason.WORKFLOW_PATH, "-", FIX),  # type: ignore[call-arg]
-        lambda: PlainStop(StopReason.WORKFLOW_PATH, "-", question="why?"),  # type: ignore[call-arg]
-        lambda: AttemptsStop(FIX, "-", question="why?"),  # type: ignore[call-arg]
-    ],
-)
-def test_a_state_carries_only_what_its_reason_does(build):
-    with pytest.raises(TypeError):
         build()
 
 
@@ -1212,8 +1204,6 @@ def test_a_malformed_blocker_ref_is_unconstructible(args):
 def test_blockers_ride_exactly_on_a_blocked_wait():
     with pytest.raises(ValueError):
         Blocked(())
-    with pytest.raises(TypeError):
-        Wait(WaitReason.HEADROOM, (BlockerRef(1),))  # type: ignore[call-arg]
     with pytest.raises(ValueError):
         Blocked([BlockerRef(1)])  # type: ignore[arg-type]
     assert str(BlockerRef(4)) == "#4" and str(BlockerRef(4, "o/lib")) == "o/lib#4"

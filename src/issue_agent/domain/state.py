@@ -58,8 +58,8 @@ Precedence, the single place it is defined (first match wins, per item):
                open or merged harness PR, triaged -> RESOLVE.
 8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh/open are
                free): an issue act (no PR yet) whose issue GitHub marks
-               "blocked by" an open issue, in any repository -> Blocked (
-               the observation that shows every blocker closed lets it start;
+               "blocked by" an open issue, in any repository -> Blocked
+               (the observation that shows every blocker closed lets it start;
                an item with a PR is never gated, nor a base-fix issue, #402); bot review rounds >= cap
                (ADDRESS_REVIEW on a bot verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
                issue's lifetime cap cannot afford a leg -> NeedsHuman; machine
@@ -366,11 +366,9 @@ class Blocked:
             raise ValueError("a blocked wait names its open blockers")
 
 
-# A judgment stop, one variant per what it carries. `anchor` (the item's last
-# leg end, or "-") makes the comment's idempotency key unique per episode and stable within one.
-def _need_stop(anchor: object, carried: bool) -> None:
+def _need_stop(stop: object, anchor: object, carried: bool) -> None:
     if not isinstance(anchor, str) or not anchor or not carried:
-        raise ValueError("needs-human requires an anchor and what its reason carries")
+        raise ValueError(f"{type(stop).__name__} requires an anchor and what its reason carries")
 
 
 @dataclass(frozen=True)
@@ -379,7 +377,7 @@ class PlainStop:
     anchor: str
 
     def __post_init__(self) -> None:
-        _need_stop(self.anchor, isinstance(self.reason, StopReason) and self.reason in _PLAIN_STOPS)
+        _need_stop(self, self.anchor, isinstance(self.reason, StopReason) and self.reason in _PLAIN_STOPS)
 
 
 @dataclass(frozen=True)
@@ -389,7 +387,7 @@ class AttemptsStop:
     reason: ClassVar[StopReason] = StopReason.ATTEMPTS
 
     def __post_init__(self) -> None:
-        _need_stop(self.anchor, self.act in DISPATCHABLE)
+        _need_stop(self, self.anchor, self.act in DISPATCHABLE)
 
 
 @dataclass(frozen=True)
@@ -399,7 +397,7 @@ class QuestionStop:
     reason: ClassVar[StopReason] = StopReason.QUESTION
 
     def __post_init__(self) -> None:
-        _need_stop(self.anchor, isinstance(self.question, str) and bool(self.question))
+        _need_stop(self, self.anchor, isinstance(self.question, str) and bool(self.question))
 
 
 @dataclass(frozen=True)
@@ -410,10 +408,12 @@ class DuplicateStop:
     reason: ClassVar[StopReason] = StopReason.DUPLICATE
 
     def __post_init__(self) -> None:
-        _need_stop(self.anchor,
+        _need_stop(self, self.anchor,
                    type(self.duplicate_of) is int and self.duplicate_of > 0 and isinstance(self.detail, str))
 
 
+# A judgment stop, one variant per what it carries. `anchor` (the item's last
+# leg end, or "-") makes the comment's idempotency key unique per episode and stable within one.
 NeedsHuman = PlainStop | AttemptsStop | QuestionStop | DuplicateStop
 _PLAIN_STOPS = frozenset({StopReason.WORKFLOW_PATH, StopReason.LIFETIME_CAP, StopReason.REVIEW_ROUNDS})
 

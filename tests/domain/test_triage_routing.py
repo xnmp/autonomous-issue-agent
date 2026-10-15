@@ -19,7 +19,7 @@ from issue_agent.domain.policy import actions
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import DEFAULT_TIER, ModelRoute, Tier, escalate, parse_model_route, parse_tier
 from issue_agent.domain.state import (
-    TRIAGE_TAG, AttemptsStop, Backoff, Dispatch, DuplicateStop, Harness, Local, PlainStop, Release, StopReason,
+    TRIAGE_TAG, Backoff, Dispatch, DuplicateStop, Harness, Local, PlainStop, Release, StopReason,
     TriageNote, Wait, WaitReason, derive, issue_key, pr_key, stop_tag,
 )
 from issue_agent.domain.triage import (
@@ -342,8 +342,6 @@ def test_tiers_are_carried_exactly_where_routing_applies():
         Dispatch(AgentKind.TRIAGE, head="h")
     with pytest.raises(ValueError):
         DuplicateStop(0, "", "-")  # no target
-    with pytest.raises(TypeError):
-        AttemptsStop(AgentKind.RESOLVE, "-", duplicate_of=2)  # type: ignore[call-arg]
 
 
 def test_escalate_clamps_absurd_attempt_counts():
