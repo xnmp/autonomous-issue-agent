@@ -94,9 +94,13 @@ Xvfb `-nolisten local`.
   positives or truly untestable glue: justify in the PR description AND a site
   comment, and scope as narrowly as possible. Never suppress the point of the
   change or code your tests prove testable.
-- Never call `gh issue create`. If completion is prevented, return
-  `status=blocked` with a focused harness-issue title and reproduction in `needs`
-  for the operator to file.
+- Never call `gh issue create`. Report a defect in what the harness gives you
+  (sandbox, toolchain, credentials, these rules), never the repository's code,
+  in `harness_issue`: a one-line `title` and a `body` with the command you ran
+  and its output. The harness keeps it with this leg's record and files an
+  issue in its own repository that points at it. It is no
+  question: report it whatever your status, and block only if it stops you,
+  with `needs` saying what this item needs from a human.
 - After the push that follows your review (or your first push, if the review
   found nothing), end the leg: the harness watches CI and dispatches a new leg if
   it fails. Never wait for CI inside a leg (`gh run watch`, `gh pr checks
@@ -143,6 +147,7 @@ You are invoked with `--json-schema`. Your FINAL message must satisfy it:
   status  : "pushed" | "blocked" | "failed"
   summary : what you did; on a push, written as the PR description
   needs   : if blocked, EXACTLY what you need to proceed
+  harness_issue : optional {title, body}, a harness defect (Hard rules)
 Return `status=pushed` only once `git push` has actually succeeded. Messages to
 humans, `needs` and `summary` included, must not quote internal identifiers
 (command/run/invocation ids, hashes, worktree paths): describe the situation in

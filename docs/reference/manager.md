@@ -66,6 +66,25 @@ obligations follow (operator, 2026-08-08):
     failed this test. Each added state that produced the next gap (#271,
     #272); see `CLAUDE.md` "Fixes must not grow the surface".
 
+- **The harness files its own gaps** (2026-10-15). The fix role files a
+  harness defect into the harness's repository (its checkout's GitHub
+  origin) under `FIX_BOT_TOKEN`: a fix leg's `harness_issue` report, and an act
+  whose legs kept ending as machine ends until the backoff reached its
+  one-hour cap (`domain/gaps.py`, `policy.gap_actions`). The issue carries
+  harness facts only and points at the leg receipt on the harness host, where
+  the agent's own text is. One issue per gap kind and target, one report per
+  item, at most `GAP_REPORTS_PER_DAY` reports a day. This removes the
+  manager's job of reading `needs` and journals for harness defects and
+  filing them by hand; triage what it files from the receipt, and mark it
+  `ai-ready` only if a fix leg should take it (no automatic pickup will).
+  Judgment stops (question, `.github/`, duplicate, budget, review dispute,
+  human hold) are never filed. Still the manager's to notice, because they
+  are ambiguous or need cross-tick state the harness does not keep: ATTEMPTS
+  stops (a hard issue or a defect; an agent hitting a defect now reports it),
+  waits that never clear (HEAD/CI/mergeability unknown), and an act-layer
+  write that fails every tick. Off, with a boot log line, when the checkout
+  has no GitHub origin or `FIX_BOT_TOKEN` cannot file issues there.
+
 Accepted residuals live in [docs/open/residuals.md](../open/residuals.md) with
 named triggers — e.g. platform-invisible CI (a Windows-only failure cannot be
 reproduced by a Linux leg; the environment manifest keeps legs from burning

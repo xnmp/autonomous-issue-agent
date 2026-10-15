@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
+Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/domain/gaps.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
 
 ## Decision
 
@@ -98,3 +98,33 @@ fixer's tool deny list; what a sandboxed leg can still reach is listed in
 
 Screenshot-read receipts and visual-evidence bookkeeping were superseded by #327
 (2026-10-12): the reviewer judges screenshot evidence; the 700KB image limit remains.
+
+Harness gaps (2026-10-15) add the harness's one write outside the target
+repository: the fix role reports a harness defect into the harness's own
+repository (its checkout's GitHub origin) with `FIX_BOT_TOKEN`, through the
+same act layer (`ReportGap`). The key,
+`fix-report:gap:<harness repo>:<target>:<item>:<gap>`, is claimed in SQLite
+before the write and confirmed after a read-back of this token's own issues; a
+confirmed key reaches policy as a local fact and is never asked for again, and
+a new key is refused past `GAP_REPORTS_PER_DAY` claims in a UTC day. No
+agent-written text is published (owner, 2026-10-15): an agent's
+`harness_issue` is an untrusted claim that `domain/gaps.py` bounds and that
+stays on the harness host (the leg receipt and the journal). The issue and its
+comments hold harness facts only: the gap kind, the target and item, the leg
+id, kind and runtime, and a machine end's class from a fixed vocabulary
+(`outcome.MACHINE_ENDS`), never a raw error string. A non-public target is
+called only "a private target" (no name, digest or link; the repository stays
+in the local dedup key), so no visibility comparison is needed. A filed gap never queues itself: today only `ai-ready` queues an
+issue, and an automatic pickup mode must exclude FIX_BOT's issues titled
+`Harness gap:` (GitHub sets the author and the harness writes the title, so
+neither is forgeable; `tests/domain/test_gaps.py` pins it per mode), since a
+leg's output must not dispatch more legs; a human's `ai-ready` is a deliberate
+act and is honoured. Filing is off, read at each daemon start, when the
+checkout has no GitHub origin or the fix credential cannot file issues there
+(no push, issues off, archived: a clone of someone else's harness files
+nothing upstream); unreadable facts mean off. A report GitHub refuses (an
+answer without the write, or a write that does not read back, as on a locked
+issue) settles its key with one log line; no answer stays
+retryable. Crash points: `tests/adapters/test_act.py` (a claim that never
+landed files; a lost filing reply is found by its body; a lost comment reply
+is read back).

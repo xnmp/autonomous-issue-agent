@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ..domain.contracts import Money
+from ..domain.gaps import parse_harness_gap
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death, pre_admission_refusal
 from ..domain.run_usage import EstimatedRunUsage, MeasuredRunUsage
 from .runtime_plan import AgentRuntime, ContextualRuntime, RunIdentityRuntime, RuntimePlan
@@ -167,6 +168,10 @@ class JournalingRuntime:
                 "turns": result.num_turns,
                 "needs": _bounded(result.needs) if result.status == "blocked" else None,
             }
+            # A fix leg's harness defect report: on this host only, never published (`domain.gaps`).
+            gap = parse_harness_gap(result.structured.get("harness_issue")) if result.structured else None
+            if gap is not None:
+                fields["harness_issue"] = gap.record()
             if result.status == "blocked" or pre_admission_refusal(result):
                 fields["summary"] = _bounded(result.summary)
             if isinstance(result.run_usage, (MeasuredRunUsage, EstimatedRunUsage)):

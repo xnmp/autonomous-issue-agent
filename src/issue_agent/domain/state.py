@@ -109,7 +109,7 @@ from .labels import Label
 from .refs import harness_branch_issue
 from .routing import DEFAULT_TIER, Tier, escalate
 from .triage import Steward, Triage
-from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, BlockerRef, Branch, Comment, PRView, WorldState
+from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, BlockerRef, Branch, Comment, IssueView, PRView, WorldState
 
 ATTEMPT_CAP = 3
 REVIEW_ROUND_CAP = 3
@@ -190,6 +190,8 @@ class Local:
     leases: frozenset[ItemKey] = frozenset()
     headroom: bool = True
     lifetime_capped: frozenset[int] = frozenset()
+    # The keys of the harness-gap reports already made (`policy.gap_actions`).
+    reported: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.now, datetime) or self.now.utcoffset() is None:
@@ -208,6 +210,8 @@ class Local:
             type(n) is not int or n <= 0 for n in self.lifetime_capped
         ):
             raise ValueError("lifetime_capped must be a frozenset of issue numbers")
+        if not isinstance(self.reported, frozenset) or any(not isinstance(k, str) for k in self.reported):
+            raise ValueError("reported must be a frozenset of report keys")
 
 
 class WaitReason(str, Enum):
@@ -416,6 +420,12 @@ class _Item:
     labeled_at: str = ""
     base: tuple[Check, ...] | None = None  # the PR base's tip reports; None = unread
     blocked_by: tuple[BlockerRef, ...] = ()
+
+
+# The title of the harness's own gap report (`policy.gap_actions`). No pickup
+# takes an issue up without `ai-ready` today; an automatic mode must exclude
+# FIX_BOT's issues so titled (tests/domain/test_gaps.py pins it per mode).
+HARNESS_GAP_PREFIX = "Harness gap:"
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:

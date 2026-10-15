@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import takewhile
 from datetime import datetime, timedelta
 
 from .actions import AgentKind
+from .outcome import MACHINE_ENDS
 from .routing import Tier
 from .triage import Steward, Triage
 
@@ -24,6 +26,9 @@ BACKOFF_BASE = timedelta(seconds=60)
 BACKOFF_CAP = timedelta(hours=1)
 # 60s * 2^6 already exceeds the cap; a longer streak cannot lengthen the wait.
 _MAX_DOUBLINGS = 6
+# The streak whose wait is the cap: the harness has failed to run the act for
+# over an hour, a harness gap it files about itself (`domain.gaps`).
+STALL_STREAK = _MAX_DOUBLINGS + 1
 
 
 # A recorded kind that is no AgentKind (the deleted ROUTE leg's rows) belongs
@@ -71,6 +76,13 @@ class LegEnd:
     # The harness ended this agent end at a per-leg cap (`outcome.leg_cap`, minted
     # by the accounting runtime): it did not finish with the evidence it was handed.
     capped: bool = False
+    # The agent reported a harness defect (`domain.gaps`; its text stays in the receipt).
+    harness_gap: bool = False
+    # The leg's id and runtime, as recorded ("" when unknown): what a gap report names.
+    leg_id: str = ""
+    runtime: str = ""
+    # A machine end's recorded class (`outcome.MACHINE_ENDS`); "" when it left no receipt.
+    end: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -105,6 +117,12 @@ class LegEnd:
             self.evidence and (self.kind is not AgentKind.FIX_CI or self.machine)
         ):
             raise ValueError("only a FIX_CI agent end carries the failure keys it was handed")
+        if type(self.harness_gap) is not bool or (self.harness_gap and self.machine):
+            raise ValueError("only an agent end reports a harness gap")
+        if any(not isinstance(v, str) or len(v) > 64 for v in (self.leg_id, self.runtime)):
+            raise ValueError("a leg id and runtime are bounded strings")
+        if not isinstance(self.end, str) or (self.end and (not self.machine or self.end not in MACHINE_ENDS)):
+            raise ValueError("only a machine end carries an end class, from the fixed vocabulary")
 
 
 def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime | None:
@@ -113,19 +131,17 @@ def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime |
     None means no wait: the latest end of that kind was not a machine failure,
     or there is no end at all.
     """
-    streak = 0
-    latest: datetime | None = None
-    # Newest first; ends sharing a timestamp keep their recorded order, so the
-    # later-recorded one counts as newer (a refused submission can land in
-    # the same millisecond as the paid leg it follows).
-    for end in reversed(sorted((end for end in ends if end.kind is kind), key=lambda end: end.ended_at)):
-        if not end.machine:
-            break
-        streak += 1
-        latest = latest or end.ended_at
-    if latest is None:
-        return None
-    return latest + machine_backoff_wait(streak)
+    streak = machine_streak(ends, kind)
+    return streak[0].ended_at + machine_backoff_wait(len(streak)) if streak else None
+
+
+def machine_streak(ends: Iterable[LegEnd], kind: AgentKind) -> tuple[LegEnd, ...]:
+    """The consecutive machine ends of ``kind`` since its last agent end, newest first."""
+    # Ends sharing a timestamp keep their recorded order, so the later-recorded
+    # one counts as newer (a refused submission can land in the same
+    # millisecond as the paid leg it follows).
+    newest_first = reversed(sorted((end for end in ends if end.kind is kind), key=lambda end: end.ended_at))
+    return tuple(takewhile(lambda end: end.machine, newest_first))
 
 
 def machine_backoff_wait(streak: int) -> timedelta:

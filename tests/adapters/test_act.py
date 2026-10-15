@@ -10,7 +10,7 @@ import pytest
 from issue_agent.adapters.act import GitHubAct
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.github import BlockerLinkFacts, FixObservationIncomplete, GhUnavailable
-from issue_agent.domain.actions import LinkBlockedBy, OpenPullRequest, PostComment, Target
+from issue_agent.domain.actions import AgentKind, LinkBlockedBy, OpenPullRequest, PostComment, Target
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import blocker_comment
@@ -626,3 +626,231 @@ def test_a_stop_comment_left_by_a_previous_bot_login_is_posted_again_under_the_c
 
     assert gh.posted == [STOP.body, STOP.body]
     assert ("fixer", STOP.body) in gh.comments
+
+
+# ── harness gaps, reported into the harness's own repository ────────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from issue_agent.domain.actions import ReportGap  # noqa: E402
+from issue_agent.domain.gaps import GAP_REPORTS_PER_DAY  # noqa: E402
+
+HARNESS = "xnmp/autonomous-issue-agent"
+
+
+def _gap(item: int, title: str = "Harness gap: agent-reported harness defect in o/r") -> ReportGap:
+    return ReportGap(HARNESS, title, f"gap:{HARNESS}:o/r:issue:{item}:{title}", f"m\nfiled from o/r#{item}",
+                     f"m\nseen again on o/r#{item}")
+
+
+class HarnessRepo(IssueGateway):
+    """The harness repository, as the fix credential sees it; counts its reads."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.reads, self.hidden = 0, set()
+
+    def issue_index(self, limit=300, author=""):
+        self.reads += 1
+        return tuple(row for row in super().issue_index(limit, author) if row[0] not in self.hidden)
+
+    def comment(self, kind, number, body):
+        self.posted.append(body)
+        self.comments.append(("fixer", body))
+        if self.lose_reply:
+            self.lose_reply = False
+            raise GhUnavailable("timeout", "gh timed out", argv=["gh", "issue", "comment"])
+
+
+class TargetRepo(Gateway):
+    def __init__(self, harness: HarnessRepo):
+        super().__init__()
+        self.harness, self.repos = harness, []
+
+    def for_repo(self, repo):
+        self.repos.append(repo)
+        return self.harness
+
+
+def _gap_act(tmp_path, harness: HarnessRepo, logs: list[str] | None = None, now=None):
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=now)
+    store.initialize()
+    return GitHubAct(TargetRepo(harness), store, repository="o/r", base_branch="dev", merge_method="squash",
+                     marker="m", bot="fixer", dispatch=lambda _a: None, remove_worktree=lambda _i: None,
+                     log=(logs if logs is not None else []).append)
+
+
+def test_a_gap_is_filed_once_unlabelled_in_the_harness_repo_and_a_replay_reads_nothing(tmp_path):
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness)
+    for _ in range(3):  # derive would ask on every tick
+        act.execute(_gap(5))
+    assert [(i.title, i.body, i.labels) for i in harness.issues.values()] == [
+        (_gap(5).title, _gap(5).body, frozenset())]
+    assert act.gateway.repos == [HARNESS] and harness.reads == 1 and harness.posted == []
+
+
+def test_a_recurrence_on_another_item_comments_on_the_open_issue_once_rather_than_filing_again(tmp_path):
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness)
+    act.execute(_gap(5))
+    for _ in range(2):
+        act.execute(_gap(6))
+    assert len(harness.issues) == 1 and harness.posted == ["m\nseen again on o/r#6"]
+
+
+def test_a_gap_whose_issue_a_human_closed_files_a_fresh_one(tmp_path):
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness)
+    act.execute(_gap(5))
+    (number,) = harness.issues
+    harness.issues[number] = IssueView(number, _gap(5).title, state="closed", author="fix-bot")
+    harness.issues[7] = IssueView(7, _gap(5).title, author="alice")  # a human's open issue is not the harness's
+    act.execute(_gap(6))
+    assert [(i.author, i.state) for i in harness.issues.values()] == [
+        ("fix-bot", "closed"), ("alice", "open"), ("fix-bot", "open")]
+    assert harness.posted == [] and harness.writes == []  # nothing reopened or commented
+
+
+def test_a_gap_filing_whose_reply_was_lost_is_recognised_by_its_body_not_filed_or_commented_again(tmp_path):
+    harness = HarnessRepo(lose_reply=True)
+    act = _gap_act(tmp_path, harness)
+    with pytest.raises(GhUnavailable):
+        act.execute(_gap(5))
+    harness.lose_reply = False
+    act.execute(_gap(5))
+    act.execute(_gap(5))
+    assert len(harness.issues) == 1 and harness.posted == [] and harness.reads == 2
+
+
+def test_a_lost_filing_beside_another_items_open_issue_is_recognised_not_commented(tmp_path):
+    """Two items filed the same gap at once (the listing lagged the first),
+    and the second's reply was lost. Its retry finds its own issue by body."""
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness)
+    act.execute(_gap(5))
+    harness.hidden, harness.lose_reply = set(harness.issues), True
+    with pytest.raises(GhUnavailable):
+        act.execute(_gap(6))
+    harness.hidden, harness.lose_reply = set(), False
+    act.execute(_gap(6))
+    act.execute(_gap(6))
+    assert len(harness.issues) == 2 and harness.posted == []
+
+
+def test_a_recurrence_whose_comment_reply_was_lost_is_read_back_and_not_posted_twice(tmp_path):
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness)
+    act.execute(_gap(5))
+    harness.lose_reply = True
+    with pytest.raises(GhUnavailable):
+        act.execute(_gap(6))
+    act.execute(_gap(6))
+    assert harness.posted == ["m\nseen again on o/r#6"]
+
+
+def test_a_gap_claim_that_never_landed_is_filed(tmp_path):
+    harness = HarnessRepo(lose_reply=True)
+    act = _gap_act(tmp_path, harness)
+    with pytest.raises(GhUnavailable):
+        act.execute(_gap(5))
+    harness.issues.clear()  # the create never reached GitHub
+    harness.lose_reply = False
+    act.execute(_gap(5))
+    assert [i.title for i in harness.issues.values()] == [_gap(5).title]
+
+
+def test_a_report_github_refuses_is_settled_with_one_line_and_never_retried(tmp_path):
+    """No Issues write, an archived repository: GitHub answers without the
+    write, no retry changes it, so it costs one attempt, not one per poll."""
+    class Refusing(HarnessRepo):
+        attempts = 0
+
+        def create_issue(self, title, body):
+            self.attempts += 1
+            raise FixObservationIncomplete("issue creation answered no issue link")
+
+    harness, logs = Refusing(), []
+    act = _gap_act(tmp_path, harness, logs)
+    for _ in range(3):
+        act.execute(_gap(5))
+    assert harness.attempts == 1 and harness.issues == {}
+    assert [line for line in logs if "not retried" in line] == [
+        f"harness gap {_gap(5).title!r} not reported to {HARNESS}: GitHub refused it, not retried: "
+        "issue creation answered no issue link"]
+
+
+def test_a_recurrence_comment_github_refuses_is_settled_with_one_line_and_never_retried(tmp_path):
+    """A locked issue: `gh` answers, nothing is written, and only the read-back
+    sees it. Retrying would list the harness's issues on every tick forever."""
+    class Locked(HarnessRepo):
+        def comment(self, kind, number, body):
+            self.posted.append(body)  # attempted, never written
+
+    harness, logs = Locked(), []
+    act = _gap_act(tmp_path, harness, logs)
+    act.execute(_gap(5))
+    reads = harness.reads
+    for _ in range(3):
+        act.execute(_gap(6))
+    assert harness.posted == ["m\nseen again on o/r#6"] and harness.reads == reads + 1
+    assert len([line for line in logs if "not retried" in line and "did not read back" in line]) == 1
+
+
+def test_a_report_github_does_not_answer_is_retried_next_tick(tmp_path):
+    """A secondary rate limit or an outage is transient: the key stays open."""
+    class Throttled(HarnessRepo):
+        throttled = True
+
+        def create_issue(self, title, body):
+            if self.throttled:
+                raise GhUnavailable("rate-limit", "secondary rate limit", argv=["gh", "issue", "create"])
+            return super().create_issue(title, body)
+
+    harness = Throttled()
+    act = _gap_act(tmp_path, harness)
+    with pytest.raises(GhUnavailable):
+        act.execute(_gap(5))
+    harness.throttled = False
+    act.execute(_gap(5))
+    assert [i.title for i in harness.issues.values()] == [_gap(5).title]
+
+
+def test_the_daily_ceiling_bounds_gap_reports_and_resets_the_next_utc_day(tmp_path):
+    clock = [datetime(2026, 10, 15, 23, 0, tzinfo=timezone.utc)]
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness, now=lambda: clock[0])
+    flood = [_gap(n, f"Harness gap: RESOLVE: 7 consecutive machine ends in o/r{n}") for n in range(GAP_REPORTS_PER_DAY + 2)]
+    refused = []
+    for action in flood + flood:
+        try:
+            act.execute(action)
+        except RuntimeError as exc:  # refused, so not taken: the daemon logs it and does not re-tick
+            refused.append(str(exc))
+    assert len(harness.issues) == GAP_REPORTS_PER_DAY
+    assert len(refused) == 4 and all("daily ceiling" in r for r in refused)
+    clock[0] += timedelta(hours=2)
+    for action in flood:
+        act.execute(action)
+    assert len(harness.issues) == GAP_REPORTS_PER_DAY + 2
+
+
+def test_a_confirmed_gap_report_is_never_derived_again(tmp_path):
+    """Policy reads act's confirmed keys, so a done report is not re-asked
+    every tick (each asked action would cost a re-tick and a log line)."""
+    from issue_agent.adapters.act import reported_gaps
+    from issue_agent.domain.backoff import LegEnd
+    from issue_agent.domain.gaps import GapTarget
+    from issue_agent.domain.policy import gap_actions
+    from issue_agent.domain.state import issue_key
+
+    legs = {issue_key(5): (LegEnd(AgentKind.RESOLVE, datetime(2026, 10, 15, tzinfo=timezone.utc), False,
+                                  harness_gap=True, leg_id="leg-1"),)}
+    harness = HarnessRepo()
+    act = _gap_act(tmp_path, harness)
+    target = GapTarget("o/r", True)
+    (asked,) = gap_actions(legs, (), target, HARNESS, "m")
+    assert gap_actions(legs, (), target, HARNESS, "m", reported_gaps(act.control)) == (asked,)
+    act.execute(asked)
+    assert gap_actions(legs, (), target, HARNESS, "m", reported_gaps(act.control)) == ()
+    assert len(harness.issues) == 1

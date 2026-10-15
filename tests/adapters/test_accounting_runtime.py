@@ -661,3 +661,48 @@ def test_the_effort_a_plan_carried_is_recorded_and_absent_when_none_was_set(tmp_
                                 context=("fix", "RESOLVE", 3, 3))
     _work(wrapper2)
     assert "effort" not in _receipt(store2)
+
+
+# ── harness gap reports (domain.gaps): kept on this host ─────────────────────
+
+
+def test_a_fix_legs_harness_report_is_recorded_bounded_beside_its_question(tmp_path) -> None:
+    claim = {"status": "blocked", "summary": "", "needs": "Release once fixed",
+             "harness_issue": {"title": "Sandbox\nlacks  glib", "body": "$ ldd app\n"}}
+    wrapper, store = _light_wrapper(tmp_path, "RESOLVE", AgentResult(False, status="blocked", needs="Release once fixed",
+                                                                     structured=claim, session_id="s"))
+    _work(wrapper)
+    receipt = _receipt(store)
+    assert receipt["leg"] == "asked" and receipt["question"] == "Release once fixed"
+    assert receipt["harness_issue"] == {"title": "Sandbox lacks glib", "body": "$ ldd app"}
+
+
+@pytest.mark.parametrize("kind,result", [
+    ("RESOLVE", AgentResult(False, status="pushed", structured={"harness_issue": {"title": "t" * 10_000}})),
+    ("RESOLVE", AgentResult(False, status="pushed", structured={"harness_issue": "a string"})),
+    ("REVIEW", AgentResult(False, structured={"decision": "APPROVE", "body": "ok",
+                                               "harness_issue": {"title": "t", "body": "b"}})),
+    ("STEWARD", AgentResult(False, structured={"harness_issue": {"title": "t", "body": "b"}})),
+])
+def test_a_malformed_report_or_one_from_a_leg_that_is_no_fix_leg_is_not_recorded(tmp_path, kind, result) -> None:
+    wrapper, store = _light_wrapper(tmp_path, kind, result)
+    _work(wrapper)
+    assert "harness_issue" not in _receipt(store)
+
+
+@pytest.mark.parametrize("result,end", [
+    (AgentResult(True, exit_reason=ExitReason.TRANSPORT_DEATH, structured={"harness_issue": {"title": "t"}}),
+     "transport_death"),
+    (AgentResult(True, exit_reason=ExitReason.OPERATOR_CANCELLED), "operator_cancelled"),
+])
+def test_a_machine_end_records_its_class_and_no_report(tmp_path, result, end) -> None:
+    wrapper, store = _light_wrapper(tmp_path, "RESOLVE", result)
+    _work(wrapper)
+    receipt = _receipt(store)
+    assert receipt["leg"] == "machine" and receipt["end"] == end and "harness_issue" not in receipt
+
+
+def test_an_agent_end_records_no_end_class(tmp_path) -> None:
+    wrapper, store = _light_wrapper(tmp_path, "RESOLVE", AgentResult(False, status="pushed", session_id="s"))
+    _work(wrapper)
+    assert "end" not in _receipt(store)

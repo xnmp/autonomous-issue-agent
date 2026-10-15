@@ -39,6 +39,7 @@ from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
+from ..adapters.act import reported_gaps
 from ..adapters.atomic_file import atomic_write
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import ControlStoreError, LegRun, SQLiteControlStore
@@ -53,7 +54,8 @@ from ..domain.actions import ISSUE_ACTS, Action, AgentKind, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.evidence import recorded_keys
 from ..domain.leg import Leg
-from ..domain.outcome import AgentResult, LegClass, pre_admission_refusal
+from ..domain.outcome import MACHINE_ENDS, AgentResult, LegClass, pre_admission_refusal
+from ..domain.gaps import parse_harness_gap
 from ..domain.policy import question_text
 from ..domain.ports import SpendReconciler
 from ..domain.recovery import RecoveryTrigger
@@ -114,7 +116,14 @@ def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | N
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
                   triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")), evidence=evidence,
                   end_head=end_head if ran and isinstance(end_head, str) and len(end_head) <= 64 else "",
-                  capped=leg is LegClass.AGENT and receipt.get("capped") is True)
+                  capped=leg is LegClass.AGENT and receipt.get("capped") is True,
+                  harness_gap=ran and parse_harness_gap(receipt.get("harness_issue")) is not None,
+                  leg_id=run.leg_id[:64], runtime=runtime if isinstance(runtime := receipt.get("runtime"), str) and runtime in _RUNTIMES else "",
+                  end=end if not ran and isinstance(end := receipt.get("end"), str) and end in MACHINE_ENDS else "")
+
+
+# A receipt's runtime reaches a public gap issue: only a known name passes.
+_RUNTIMES = frozenset(r.value for r in RuntimeName)
 
 
 def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:
@@ -203,6 +212,7 @@ class Facts:
             leases=leased_items(active, self.held_issues()),
             headroom=capped is not None and self.headroom(),
             lifetime_capped=capped or frozenset(),
+            reported=reported_gaps(self.control),
         )
 
 

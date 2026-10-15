@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import subprocess
 import hashlib
+from urllib.parse import urlparse
 from collections.abc import Callable
 
 # Reserved exit status the point-at relaunch loop recognises as "same daemon,
@@ -51,6 +52,29 @@ def _head_commit(repo_root: str) -> str:
         return res.stdout.strip() if res.returncode == 0 else ""
     except Exception:  # noqa: BLE001 — a broken watch must not kill the daemon
         return ""
+
+
+def remote_repo(root: str) -> str:
+    """The GitHub origin as owner/name, or "": the dashboard's "is self"
+    badge, and where the fix role files harness gaps (`fix.harness_gap_repo`)."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if result.returncode:
+        return ""
+    url = result.stdout.strip().removesuffix(".git")
+    # Only a GitHub origin: the fix role files harness gaps into it.
+    if url.startswith("git@github.com:"):
+        return url.split(":", 1)[1]
+    parsed = urlparse(url)
+    return parsed.path.strip("/") if parsed.hostname == "github.com" and parsed.path.count("/") == 2 else ""
 
 
 class ReloadWatch:

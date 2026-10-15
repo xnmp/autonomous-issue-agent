@@ -102,6 +102,19 @@ ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset({"dispatch_claim_unavaila
 # final turn (capacity or quota): a machine failure whose session stays
 # resumable.
 PROVIDER_REFUSED_SUBTYPE = "provider_refused"
+# A machine end's class, as its receipt records it: a fixed vocabulary (an
+# ExitReason, or the provider's refusal), never a raw error string.
+MACHINE_ENDS = frozenset({reason.value for reason in ExitReason} | {PROVIDER_REFUSED_SUBTYPE})
+# Machine ends no harness fix removes: a teardown, or a provider's capacity or
+# quota window. They are no harness gap (`domain.gaps`).
+OUTSIDE_ENDS = frozenset({ExitReason.OPERATOR_CANCELLED.value, PROVIDER_REFUSED_SUBTYPE})
+
+
+def machine_end(result: "AgentResult") -> str:
+    """A machine end's class in MACHINE_ENDS."""
+    if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE:
+        return PROVIDER_REFUSED_SUBTYPE
+    return (result.exit_reason or ExitReason.NO_RESULT).value
 
 
 # Minted by the accounting runtime when a paid leg is refused BEFORE any run

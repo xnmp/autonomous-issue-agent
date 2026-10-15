@@ -22,12 +22,14 @@ from ..domain.actions import (
     OpenPullRequest,
     PostComment,
     Relabel,
+    ReportGap,
     RerunFailedJobs,
     RunAgent,
     SetIssueState,
     Target,
     UpdateBranch,
 )
+from ..domain.gaps import GAP_REPORTS_PER_DAY
 from ..domain.labels import Label
 from ..domain.policy import blocker_closed_comment, blocker_comment
 from ..domain.refs import harness_branch_issue
@@ -40,8 +42,15 @@ from .github import FixObservationIncomplete, GhUnavailable
 # whether to post.
 _COMMENT_NAMESPACE = "fix-comment"
 _ISSUE_NAMESPACE = "fix-issue"
+_REPORT_NAMESPACE = "fix-report"
 # Stable across retries: the comment's read-back matches its exact body.
 _GITHUB_REFUSED = "GitHub would not read or write the link"
+
+
+def reported_gaps(control) -> frozenset[str]:
+    """The keys of the harness-gap reports already confirmed: policy asks
+    for no other (`policy.gap_actions`), so a done report is never re-derived."""
+    return frozenset(key.removeprefix(f"{_REPORT_NAMESPACE}:") for key in control.done_keys(f"{_REPORT_NAMESPACE}:"))
 
 
 def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bool:
@@ -131,6 +140,8 @@ class GitHubAct:
             self.open_pr(action)
         elif isinstance(action, LinkBlockedBy):
             self.link_blocker(action)
+        elif isinstance(action, ReportGap):
+            self.report(action)
         elif isinstance(action, FileIssue):
             self.file_issue(action)
         elif isinstance(action, SetIssueState):
@@ -236,6 +247,50 @@ class GitHubAct:
             if not self.gateway.has_comment(kind, action.number, action.body, self.bot):
                 raise RuntimeError(f"{kind} #{action.number}: comment {action.key} not confirmed")
             self.control.confirm_key(key)
+
+    def report(self, action: ReportGap) -> None:
+        """A harness gap in `action.repo` under the fix role's credential (ADR
+        0001), once per key, ever; past GAP_REPORTS_PER_DAY new keys a UTC day
+        (every daemon on the store) it raises: not taken, so no re-tick. Filed
+        when this token has no open issue of the title there, else commented
+        on the oldest; a closed or retitled one is a human's answer, so a
+        recurrence files afresh. GitHub refusing (an answer without the write,
+        or a write that does not read back) settles the key with one log
+        line; no answer raises for the next tick.
+        Crash points: a claim that never landed writes; a lost filing reply is
+        found by its exact body; a lost comment reply is read back."""
+        key = f"{_REPORT_NAMESPACE}:{action.key}"
+        state = self.control.claim_key_within(key, f"{_REPORT_NAMESPACE}:", GAP_REPORTS_PER_DAY)
+        if state == "done":
+            return
+        if state == "full":
+            raise RuntimeError(f"harness gap {action.title!r} not reported: {GAP_REPORTS_PER_DAY} gap reports "
+                               "already today (the daily ceiling); it is retried tomorrow while it persists")
+        try:
+            self.log(f"harness gap {self._report(action, state)}: {action.title!r}")
+        except FixObservationIncomplete as exc:
+            self.log(f"harness gap {action.title!r} not reported to {action.repo}: GitHub refused it, not "
+                     f"retried: {str(exc)[:300]}")
+        self.control.confirm_key(key)
+
+    def _report(self, action: ReportGap, state: str) -> str:
+        """File or comment as `report` says; what it did."""
+        gateway = self.gateway if action.repo == self.repository else self.gateway.for_repo(action.repo)
+        found = sorted(n for n, status, title, _ in gateway.issue_index(1000, author="@me")
+                       if status == "open" and title.strip() == action.title)
+        if not found:
+            number = gateway.create_issue(action.title, action.body)
+            if gateway.get_issue(number).title.strip() != action.title:
+                raise FixObservationIncomplete(f"{action.repo}#{number}: the filed issue did not read back")
+            return f"filed as {action.repo}#{number}"
+        if state == "claimed" and any(gateway.get_issue(n).body.strip() == action.body.strip() for n in found):
+            return "filing confirmed after a lost reply"
+        if not gateway.has_comment("issue", found[0], action.recurrence, self.bot):
+            gateway.comment("issue", found[0], action.recurrence)
+            if not gateway.has_comment("issue", found[0], action.recurrence, self.bot):
+                # `gh` answers a refusal (a locked issue) with nothing: only the read-back sees it.
+                raise FixObservationIncomplete(f"{action.repo}#{found[0]}: the recurrence comment did not read back")
+        return f"seen again, commented on {action.repo}#{found[0]}"
 
     def file_issue(self, action: FileIssue) -> None:
         """Claimed before the write, confirmed once the issue reads back. As
@@ -348,4 +403,4 @@ class GitHubAct:
         return str(latest.receipt["summary"]) if latest is not None and latest.receipt is not None else ""
 
 
-__all__ = ["GitHubAct", "relabel", "submit_review"]
+__all__ = ["GitHubAct", "relabel", "reported_gaps", "submit_review"]
