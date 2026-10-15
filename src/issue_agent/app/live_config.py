@@ -19,6 +19,7 @@ import hashlib
 import os
 from collections.abc import Callable
 
+from ..adapters.env_file import source_env_file
 from .config import LIVE_KNOBS, HarnessConfig, from_env, with_live
 
 
@@ -35,9 +36,13 @@ def _unlogged(_message: str) -> None:
 
 
 def read_candidate(path: str) -> HarnessConfig:
-    """The config the env file at `path` describes, the daemons' way (the
-    file is the authority, `config._authoritative_env`)."""
-    return from_env({**os.environ, "AGENT_ENV": path})
+    """The config the env file at `path` describes, the file the authority.
+    Strict: a file that cannot be sourced raises. `from_env`'s AGENT_ENV path
+    falls back to the inherited environment, which under point-at.sh still
+    holds every launch-time knob, so a sourcing timeout on a loaded host would
+    silently revert a lowered cap."""
+    inherited = {key: value for key, value in os.environ.items() if key != "AGENT_ENV"}
+    return from_env(source_env_file(path, {**inherited, "AGENT_ENV": path}, assigned_only=True))
 
 
 class LiveConfig:
@@ -60,6 +65,7 @@ class LiveConfig:
         self._role = role
         self._bound = boot.runtimes(role)
         self._seen = _digest(path) if path else ""
+        self._unreadable = ""  # the digest last logged unreadable: retried each tick, logged once
 
     @property
     def current(self) -> HarnessConfig:
@@ -72,13 +78,18 @@ class LiveConfig:
         digest = _digest(self._path)
         if digest == self._seen:
             return self._current
-        self._seen = digest
         try:
             raw = self._read(self._path)
             candidate = with_live(self._boot, raw)
         except Exception as exc:  # noqa: BLE001 - a bad file keeps the running settings
-            self._log(f"live settings: {self._path} unreadable, keeping the current ones: {exc}")
+            # Not marked seen: a transient failure (a bash timeout under load)
+            # is retried next tick instead of pinning the old values until
+            # the file changes again.
+            if self._unreadable != digest:
+                self._unreadable = digest
+                self._log(f"live settings: {self._path} unreadable, keeping the current ones (retrying): {exc}")
             return self._current
+        self._seen = digest
         errors = list(dict.fromkeys((*raw.validation_errors(), *candidate.validation_errors())))
         if unbound := sorted(r.value for r in candidate.runtimes(self._role) - self._bound):
             errors.append(f"needs runtime(s) {', '.join(unbound)} this process did not bind "

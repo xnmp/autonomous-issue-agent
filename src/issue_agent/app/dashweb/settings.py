@@ -213,18 +213,22 @@ def write_setting(
         config_files.write_text(target, after)
     except OSError as exc:
         return WriteResult(False, f"{target} not written: {exc}")
+    def apply(deployment: str) -> tuple[str, list[str]]:
+        """Compose `deployment` and publish it to its service snapshots."""
+        if problem := config_files.compose(harness_root, deployment, environ):
+            return problem, []
+        return "", config_files.publish(Files(harness_root, deployment).active,
+                                        config_files.service_snapshots(deployment, home), environ)
+
     composed: list[str] = []
     for deployment in affected:
         if not os.path.isfile(Files(harness_root, deployment).active):
             continue  # never launched: nothing running reads a composed file
-        if problem := config_files.compose(harness_root, deployment, environ):
-            config_files.write_text(target, before)
-            for done in composed:
-                config_files.compose(harness_root, done, environ)
-            return WriteResult(False, f"{deployment}: {problem}; {target} restored")
+        problem, published = apply(deployment)
+        if problem:
+            return WriteResult(False, f"{deployment}: {problem}; " + _roll_back(target, before, composed, apply))
         composed.append(deployment)
-        warnings += config_files.publish(Files(harness_root, deployment).active,
-                                         config_files.service_snapshots(deployment, home), environ)
+        warnings += published
     who = operator or _operator()
     for deployment in affected:
         config_files.journal_change(load(deployment).state_dir, {
@@ -234,6 +238,20 @@ def write_setting(
     return WriteResult(True, f"{key}={shown} in {os.path.relpath(target, harness_root)}; "
                              f"{'applies at the next tick' if composed else 'applies at the next launch'}",
                        tuple(warnings))
+
+
+def _roll_back(target: str, before: str, composed: list[str],
+               apply: Callable[[str], tuple[str, list[str]]]) -> str:
+    """Restore the source file, then recompose AND republish every deployment
+    already composed: an installed service reads its snapshot, so a
+    recomposed `.active` alone would leave it running the refused value."""
+    try:
+        config_files.write_text(target, before)
+    except OSError as exc:
+        return f"{target} NOT restored ({exc}); fix it by hand"
+    stuck = [f"{done}: {problem or '; '.join(published)}" for done in composed
+             for problem, published in [apply(done)] if problem or published]
+    return f"{target} restored" + (f"; not re-applied: {', '.join(stuck)}" if stuck else "")
 
 
 def _operator() -> str:

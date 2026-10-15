@@ -11,7 +11,7 @@ import pytest
 
 from issue_agent.adapters.reload import ReloadWatch
 from issue_agent.app.config import LIVE_ENV_NAMES, from_env, reload_fingerprint
-from issue_agent.app.live_config import LiveConfig
+from issue_agent.app.live_config import LiveConfig, read_candidate
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import Tier
@@ -115,6 +115,36 @@ def test_an_unreadable_or_vanished_file_keeps_the_running_settings(tmp_path):
     assert live.refresh() is boot
     env.unlink()
     assert live.refresh() is boot
+
+
+def test_a_file_that_fails_to_source_never_falls_back_to_the_launch_environment(tmp_path, monkeypatch):
+    """point-at.sh exports every launch-time knob; a sourcing failure must not
+    read them back as the file's values (a lowered cap would silently revert)."""
+    monkeypatch.setenv("DAILY_SPEND_CAP_USD", "999")
+    env = tmp_path / "active.env"
+    _write(env, {**BASE, "DAILY_SPEND_CAP_USD": "10"})
+    assert read_candidate(str(env)).daily_spend_cap_usd == 10.0
+    env.write_text(env.read_text() + "exit 3\n")
+    with pytest.raises(ValueError):
+        read_candidate(str(env))
+
+
+def test_a_transient_read_failure_is_retried_without_the_file_changing(tmp_path):
+    logs: list[str] = []
+    env, boot, _ = _live(tmp_path, logs)
+    outcomes = [OSError("bash timed out"), OSError("bash timed out")]
+
+    def flaky(path):
+        if outcomes:
+            raise outcomes.pop()
+        return read_candidate(path)
+
+    live = LiveConfig(boot, str(env), read=flaky, log=logs.append)
+    _write(env, {**BASE, "DAILY_SPEND_CAP_USD": "5"})
+
+    assert live.refresh() is boot and live.refresh() is boot
+    assert live.refresh().daily_spend_cap_usd == 5.0
+    assert sum("unreadable" in line for line in logs) == 1
 
 
 def test_a_static_config_never_reads(tmp_path):

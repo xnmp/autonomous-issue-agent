@@ -173,3 +173,24 @@ def test_a_failed_compose_restores_the_source_file(harness):
     body = client.post("/api/repos/demo/settings", json={"key": "ISSUE_PICKUP", "value": "open"}).json()
     assert body["ok"] is False and "restored" in body["detail"]
     assert _files(root) == before and snapshot.read_text() == published
+
+
+def test_a_shared_write_that_fails_for_one_deployment_republishes_the_ones_already_applied(harness):
+    """An installed service reads its snapshot, not `.active`: a rollback that
+    only recomposed would leave it running the refused value."""
+    root, snapshot, tmp_path, client = harness
+    environ = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home")}
+    later = root / "config" / "repos" / "zz-later.env"
+    later.write_text(f"REPO=o/later\nTARGET_DIR={tmp_path}/later\nSTATE_DIR={tmp_path / 'later-state'}\n"
+                     f"REVIEW_STATE_DIR={tmp_path / 'later-review'}\n")
+    subprocess.run(["bash", str(root / "bin" / "compose-env.sh"), "zz-later"], env=environ, check=True,
+                   capture_output=True)
+    later.write_text(later.read_text() + "TARGET_ENV__X=1\n")  # compose refuses it; the parser ignores it
+    before, published = _files(root), snapshot.read_text()
+
+    body = client.post("/api/repos/demo/settings",
+                       json={"key": "DAILY_SPEND_CAP_USD", "value": "7", "scope": "shared"}).json()
+
+    assert body["ok"] is False and "restored" in body["detail"], body
+    assert _files(root) == before
+    assert snapshot.read_text() == published
