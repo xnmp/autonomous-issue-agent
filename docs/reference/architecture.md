@@ -278,8 +278,8 @@ that matters is not "wrong answer" but "loop that bills forever":
   agent end (its receipt records the failure keys, which name when each
   failure's CI run began: an Actions run attempt's start; for another app's
   check or a status, which have no run start, its own start or post, which
-  over-counts); an agent end at a per-leg cap (receipt `capped`) did not
-  finish, so it was handed nothing. A FIX_CI try is started by a leg on a new head, or handed a
+  over-counts); an attempt that was cut off (a per-leg cap or the provider,
+  `domain/attempt.py`) did not finish, so it was handed nothing. A FIX_CI try is started by a leg on a new head, or handed a
   failure from a CI run that began after the head's first leg began and
   that no earlier leg was handed (a push, re-run or dispatch it or anyone
   caused), or with no readable keys, or after a capped leg on the head; a failure of a run that existed
@@ -310,10 +310,14 @@ that matters is not "wrong answer" but "loop that bills forever":
   harness prices the root rollout counters with the captured rate card and
   kills the process group on crossing
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
-- the two per-leg caps share one rule (`outcome.leg_cap`): a first hit on a
-  fresh session is a machine end, and the next leg resumes that session at
-  the same tier; a hit on the resumed leg is an attempt, and the next leg
-  runs one tier up on the same evidence. A resume is bought
+- the two per-leg caps and a provider-ended turn share one rule
+  (`domain/attempt.py`, #441): the receipt records the cut-off end as a
+  machine end with its session; read in order with the item's earlier legs,
+  a first cut-off is a machine end and the next leg resumes that session at
+  the same tier; a cut-off of that resume is an attempt, and the next leg
+  runs one tier up on the same evidence. STEWARD, TRIAGE and REVIEW never
+  resume, so their cut-off is an attempt at once. Derive, the fix role's
+  resume choice and the dashboard all read this rule through `tick.leg_end`. A resume is bought
   only while the issue cap still affords a leg at the dearer role's budget
   (`ISSUE_SPEND_CAP_USD` ≥ committed + max(`MAX_BUDGET_USD`,
   `REVIEW_BUDGET_USD`)); a budget hit spends at least `MAX_BUDGET_USD`
@@ -505,6 +509,7 @@ legs),
 bounded `harness_issue` report, kept on the host, and how a report names its
 target),
 `domain/labels.py`, `domain/leg.py`,
+`domain/attempt.py` (whether a cut-off leg is an attempt, and how the next leg starts),
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,

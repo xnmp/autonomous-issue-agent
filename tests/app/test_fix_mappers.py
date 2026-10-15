@@ -52,7 +52,8 @@ def test_each_run_belongs_to_its_issue_or_pr_item(recorded, item):
 
 def test_a_returned_agent_leg_is_one_attempt_with_its_window():
     end = leg_end(run("FIX_CI", number=100, head="h1", leg="agent", started=0, minute=3))
-    assert end == LegEnd(AgentKind.FIX_CI, T0 + timedelta(minutes=3), False, "h1", started_at=T0, runtime="claude")
+    assert end == LegEnd(AgentKind.FIX_CI, T0 + timedelta(minutes=3), False, "h1", started_at=T0, runtime="claude",
+                         session="s1")
 
 
 @pytest.mark.parametrize("kind,leg,raw,keys", [
@@ -138,7 +139,7 @@ def test_a_recorded_steward_claim_on_the_issue_itself_is_dropped_and_logged():
     claim = {"acceptance_criteria": ["A"], "duplicate_of": None, "duplicate_reason": "",
              "blocked_by": 5, "blocked_by_reason": "Needs #5"}
     lines: list[str] = []
-    end = leg_end(run("STEWARD", receipt={"leg": "agent", "steward": claim}), lines.append)
+    end = leg_end(run("STEWARD", receipt={"leg": "agent", "steward": claim}), log=lines.append)
     assert end is not None and end.steward is not None and end.steward.blocked_by is None
     assert end.steward.acceptance_criteria == ("A",) and len(lines) == 1 and "#5" in lines[0]
 

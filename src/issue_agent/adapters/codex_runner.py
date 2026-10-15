@@ -46,9 +46,7 @@ from ..domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
-    Outcome,
     PROVIDER_REFUSED_SUBTYPE,
-    classify_outcome,
     declared_status,
     no_session_evidence,
 )
@@ -1050,9 +1048,9 @@ def _stderr_tail(stderr: str, lines: int = _CLASSIFY_TAIL_LINES) -> str:
 
 def _is_transport_drop(exit_code: int, stderr: str, result: AgentResult) -> bool:
     """A non-zero exit with a drop or 429 signature in the tail and no captured
-    envelope. `classify_outcome` decides "real output" so a completed turn
+    envelope. A result that is no error is real output, so a completed turn
     (any terminal status) is never re-run."""
-    if exit_code == 0 or classify_outcome(result) is not Outcome.ERROR:
+    if exit_code == 0 or not result.is_error:
         return False
     tail = _stderr_tail(stderr).lower()
     return any(sig in tail for sig in _TRANSPORT_DROP_SIGNATURES) or _is_rate_limited(tail)

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from issue_agent.adapters.agent_runner import AgentRunner
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.outcome import ExitReason, Outcome, classify_outcome, infra_class_failure
+from issue_agent.domain.outcome import ExitReason, LegClass, classify_leg, infra_class_failure
 
 
 @dataclass
@@ -77,7 +77,7 @@ def _run(monkeypatch, messages, log=None):
 def test_blocked_over_pending_background_child_is_a_typed_attempt_outcome(monkeypatch):
     logged: list[str] = []
     result = _run(monkeypatch, [_started("t1"), _ResultMessage(structured_output=_BLOCKED)], log=logged.append)
-    assert classify_outcome(result) is Outcome.ERROR
+    assert result.is_error and classify_leg(result) is LegClass.AGENT
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
     assert not infra_class_failure(result)
     # The agent's own claim survives as a claim for the operator's log line.
@@ -100,7 +100,7 @@ def test_malformed_task_events_are_ignored(monkeypatch):
             _ResultMessage(structured_output=_BLOCKED),
         ],
     )
-    assert classify_outcome(result) is Outcome.BLOCKED
+    assert classify_leg(result) is LegClass.ASKED
 
 
 def test_delegated_workflow_task_counts_as_a_pending_child(monkeypatch):
@@ -113,4 +113,4 @@ def test_thousands_of_settled_children_leave_no_pending_child(monkeypatch):
     for i in range(5_000):
         events += [_started(f"t{i}"), _notified(f"t{i}")]
     result = _run(monkeypatch, [*events, _ResultMessage(structured_output=_BLOCKED)])
-    assert classify_outcome(result) is Outcome.BLOCKED
+    assert classify_leg(result) is LegClass.ASKED

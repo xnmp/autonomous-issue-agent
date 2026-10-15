@@ -13,7 +13,6 @@ from types import SimpleNamespace
 
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
-from issue_agent.domain.outcome import Outcome, classify_outcome
 
 
 def _claude_result(*, structured, is_error=False, result="", session_id="s1"):
@@ -40,7 +39,6 @@ def test_structured_error_status_is_error_for_all_runtimes():
         assert result.is_error is True
         assert result.status == "error"
         assert result.summary == "tool crashed"
-        assert classify_outcome(result) is Outcome.ERROR
 
 
 def test_transport_failure_without_envelope_is_error():
@@ -61,7 +59,6 @@ def test_transport_failure_without_envelope_is_error():
     for result in (claude, codex):
         assert result.is_error is True
         assert result.session_id == "s2"
-        assert classify_outcome(result) is Outcome.ERROR
 
     assert claude.status == "error_during_execution"
     assert "stream disconnected" in codex.summary

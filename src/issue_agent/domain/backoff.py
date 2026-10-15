@@ -29,6 +29,8 @@ _MAX_DOUBLINGS = 6
 # The streak whose wait is the cap: the harness has failed to run the act for
 # over an hour, a harness gap it files about itself (`domain.gaps`).
 STALL_STREAK = _MAX_DOUBLINGS + 1
+# Runtime session ids are UUIDs; a longer one in a receipt is not one.
+SESSION_LIMIT = 128
 
 
 # A recorded kind that is no AgentKind (the deleted ROUTE leg's rows) belongs
@@ -73,8 +75,8 @@ class LegEnd:
     # The commit the leg's PR branch was at on the remote when it ended, as the
     # harness read it ("" when unread): not `head` means the leg pushed.
     end_head: str = ""
-    # The harness ended this agent end at a per-leg cap (`outcome.leg_cap`, minted
-    # by the accounting runtime): it did not finish with the evidence it was handed.
+    # This agent end was cut off (a per-leg cap or the provider, `domain.attempt`):
+    # it did not finish with the evidence it was handed.
     capped: bool = False
     # The agent reported a harness defect (`domain.gaps`; its text stays in the receipt).
     harness_gap: bool = False
@@ -83,6 +85,8 @@ class LegEnd:
     runtime: str = ""
     # A machine end's recorded class (`outcome.MACHINE_ENDS`); "" when it left no receipt.
     end: str = ""
+    # The resumable session the leg left on `runtime` ("" when none): what a later leg resumes.
+    session: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -120,6 +124,8 @@ class LegEnd:
             raise ValueError("only an agent end reports a harness gap")
         if any(not isinstance(v, str) or len(v) > 64 for v in (self.leg_id, self.runtime)):
             raise ValueError("a leg id and runtime are bounded strings")
+        if not isinstance(self.session, str) or len(self.session) > SESSION_LIMIT:
+            raise ValueError("a leg's session is a bounded string")
         if not isinstance(self.end, str) or (self.end and (not self.machine or self.end not in MACHINE_ENDS)):
             raise ValueError("only a machine end carries an end class, from the fixed vocabulary")
 

@@ -29,7 +29,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -51,10 +51,11 @@ from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
 from ..domain.actions import ISSUE_ACTS, Action, AgentKind, RunAgent
-from ..domain.backoff import LegEnd, dispatched_kind
+from ..domain.attempt import cut_off_counts
+from ..domain.backoff import SESSION_LIMIT, LegEnd, dispatched_kind
 from ..domain.evidence import recorded_keys
 from ..domain.leg import Leg
-from ..domain.outcome import MACHINE_ENDS, AgentResult, LegClass, pre_admission_refusal
+from ..domain.outcome import CUT_OFF_ENDS, MACHINE_ENDS, AgentResult, LegClass, pre_admission_refusal
 from ..domain.gaps import parse_harness_gap
 from ..domain.policy import question_text
 from ..domain.ports import SpendReconciler
@@ -86,24 +87,26 @@ def run_item(run: LegRun) -> ItemKey | None:
     return None
 
 
-def leg_class(run: LegRun) -> LegClass:
-    """A leg's recorded class; no readable receipt is a machine end."""
-    raw = run.receipt.get("leg") if run.receipt is not None else None
-    return next((c for c in (LegClass.AGENT, LegClass.ASKED) if raw == c.value), LegClass.MACHINE)
-
-
-def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | None:
-    """A recorded leg as derive's `LegEnd`. A run without a `leg` receipt
-    never returned (died, reclaimed, refused before launch): a machine end."""
+def leg_end(run: LegRun, earlier: Sequence[LegEnd] = (), log: Callable[[str], None] | None = None) -> LegEnd | None:
+    """A recorded leg as derive's `LegEnd`; its item's `earlier` ends (oldest
+    first) decide whether a cut-off end is an attempt (`domain.attempt`). A run
+    without a readable `leg` receipt never returned (died, reclaimed, refused
+    before launch): a machine end."""
     kind = dispatched_kind(run.kind)
     if kind not in DISPATCHABLE or run.completed_at.utcoffset() is None:
         return None
-    leg = leg_class(run)
+    receipt = run.receipt or {}
+    runtime = runtime if isinstance(runtime := receipt.get("runtime"), str) and runtime in _RUNTIMES else ""
+    # Receipts before #441 marked a cap `capped` (on a free resume's machine end, and on an
+    # agent end); `end` names every cut-off since. Read until no open item holds such a receipt.
+    cut_off = isinstance(end := receipt.get("end"), str) and end in CUT_OFF_ENDS or receipt.get("capped") is True
+    leg = next((c for c in (LegClass.AGENT, LegClass.ASKED) if receipt.get("leg") == c.value), LegClass.MACHINE)
+    if leg is LegClass.MACHINE and cut_off and cut_off_counts(kind, runtime, earlier):
+        leg = LegClass.AGENT
     started = run.started_at
     if started is not None and (started.utcoffset() is None or started > run.completed_at):
         started = None
-    question = question_text((run.receipt or {}).get("question")) if leg is LegClass.ASKED else None
-    receipt = run.receipt or {}
+    question = question_text(receipt.get("question")) if leg is LegClass.ASKED else None
     ran = leg is not LegClass.MACHINE
     triage = parse_triage(receipt.get("triage")) if kind is AgentKind.TRIAGE and ran else None
     raw = receipt.get("steward")
@@ -112,13 +115,28 @@ def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | N
         log(f"issue #{run.issue}: a recorded steward claim names the issue itself; dropped")
     evidence = recorded_keys(receipt.get("evidence")) if kind is AgentKind.FIX_CI and ran else frozenset()
     end_head = receipt.get("end_head")
+    session = receipt.get("session")
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
                   triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")), evidence=evidence,
                   end_head=end_head if ran and isinstance(end_head, str) and len(end_head) <= 64 else "",
-                  capped=leg is LegClass.AGENT and receipt.get("capped") is True,
+                  capped=leg is LegClass.AGENT and cut_off,
                   harness_gap=ran and parse_harness_gap(receipt.get("harness_issue")) is not None,
-                  leg_id=run.leg_id[:64], runtime=runtime if isinstance(runtime := receipt.get("runtime"), str) and runtime in _RUNTIMES else "",
-                  end=end if not ran and isinstance(end := receipt.get("end"), str) and end in MACHINE_ENDS else "")
+                  leg_id=run.leg_id[:64], runtime=runtime,
+                  end=end if not ran and isinstance(end, str) and end in MACHINE_ENDS else "",
+                  session=session if isinstance(session, str) and len(session) <= SESSION_LIMIT else "")
+
+
+def leg_ends(runs: Iterable[LegRun], log: Callable[[str], None] | None = None) -> tuple[tuple[LegRun, LegEnd], ...]:
+    """Each run of an item's act with its `LegEnd`, in end order (ties keep
+    the recorded order): every item's legs classified by the one rule."""
+    out: list[tuple[LegRun, LegEnd]] = []
+    earlier: dict[ItemKey, list[LegEnd]] = {}
+    for run in sorted(runs, key=lambda r: r.completed_at):
+        key = run_item(run)
+        if key is not None and (end := leg_end(run, earlier.get(key, ()), log)) is not None:
+            earlier.setdefault(key, []).append(end)
+            out.append((run, end))
+    return tuple(out)
 
 
 # A receipt's runtime reaches a public gap issue: only a known name passes.
@@ -129,8 +147,7 @@ def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:
     """The acceptance criteria of the issue's latest agent-ended STEWARD leg
     as derive reads it, as a prompt list:
     agent text the steward's parser laundered, so still untrusted."""
-    ends = tuple(end for r in runs if r.kind == AgentKind.STEWARD.name
-                 and (end := leg_end(r)) is not None)
+    ends = tuple(end for _, end in leg_ends(runs) if end.kind is AgentKind.STEWARD)
     found = latest_steward(ends)
     criteria = found.steward.acceptance_criteria if found is not None and found.steward is not None else ()
     return as_untrusted("\n".join(f"- {c}" for c in criteria)) if criteria else None
@@ -138,11 +155,10 @@ def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:
 
 def local_legs(runs: Iterable[LegRun], log: Callable[[str], None] | None = None) -> dict[ItemKey, tuple[LegEnd, ...]]:
     out: dict[ItemKey, list[LegEnd]] = {}
-    for run in runs:
-        key, end = run_item(run), leg_end(run, log)
-        if key is not None and end is not None:
+    for run, end in leg_ends(runs, log):
+        if (key := run_item(run)) is not None:
             out.setdefault(key, []).append(end)
-    return {key: tuple(sorted(ends, key=lambda e: e.ended_at)) for key, ends in out.items()}
+    return {key: tuple(ends) for key, ends in out.items()}
 
 
 def dispatch_item(action: RunAgent) -> ItemKey:

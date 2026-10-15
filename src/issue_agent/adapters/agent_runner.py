@@ -168,7 +168,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     exit_reason = exit_reason_from_envelope(subtype, is_error)
     if is_error and getattr(msg, "terminal_reason", None) == "api_error":
         # The provider ended the leg (auth failure, 5xx, overload, or a
-        # permanent 400; #418): codex's shape, so classify_leg bounds it.
+        # permanent 400; #418): codex's shape, so `domain.attempt` bounds it.
         exit_reason, subtype = ExitReason.TRANSPORT_DEATH, PROVIDER_REFUSED_SUBTYPE
     return AgentResult(
         is_error=is_error, status=status, envelope_subtype=subtype, summary=summary, needs=needs,

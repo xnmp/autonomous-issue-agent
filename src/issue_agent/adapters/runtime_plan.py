@@ -68,7 +68,6 @@ class ContextualRuntime(AgentRuntime, Protocol):
         claim_target: int | None = None,
         *,
         head: str = "",
-        resumed: bool = False,
         tier: str = "",
     ) -> None: ...
 

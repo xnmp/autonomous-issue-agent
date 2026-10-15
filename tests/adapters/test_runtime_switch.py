@@ -12,7 +12,7 @@ class Chain:
     def __init__(self, name):
         self.name, self.ran, self.contexts = name, [], []
 
-    def set_context(self, role, kind, number, issue, claim_target=None, *, head="", resumed=False, tier=""):
+    def set_context(self, role, kind, number, issue, claim_target=None, *, head="", tier=""):
         self.contexts.append((kind, number, tier))
 
     async def run(self, task):

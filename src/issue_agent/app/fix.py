@@ -19,14 +19,14 @@ from datetime import datetime
 from types import MappingProxyType
 
 from ..adapters.control_store import LegRun
-from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
+from ..domain.actions import ISSUE_ACTS, ROUTED_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
 from ..domain.agent_task import RuntimeName
-from ..domain.backoff import LegEnd, dispatched_kind
+from ..domain.attempt import AnswerResume, Continue, NextLeg, latest_session, next_leg
+from ..domain.backoff import LegEnd
 from ..domain.ci import base_fix
 from ..domain.evidence import ChangeRequest, CiFailures
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
-from ..domain.outcome import LegClass
 from ..domain.gaps import GapTarget
 from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order, gap_actions
 from ..domain.refs import harness_branch_issue, slugify
@@ -39,10 +39,9 @@ from ..adapters.act import GitHubAct
 from ..adapters.reload import remote_repo
 from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, steward_criteria, stderr_log
+from .tick import Choose, Role, Slots, compose_role, dispatch_item, local_legs, run_leg, steward_criteria, stderr_log
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
-_LIGHT_ACTS = frozenset(kind for kind in AgentKind if not kind.holds_dispatch_slot)
 
 
 def fix_actions(
@@ -176,22 +175,14 @@ class FixLegs:
         recorded = self.control.leg_runs(self.settings.repository, (issue,))
         route = self.settings.route(action.tier)
         runtime, model, effort = route.runtime, route.model, route.effort
-        # The review role's legs and the light acts' are not this role's sessions to continue.
-        runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS - _LIGHT_ACTS),
-                      key=lambda r: r.completed_at)
-        mine = [r for r in runs if run_item(r) == item]
-        # The newest agent leg, the rule derive uses: machine and transport
-        # deaths after it neither drop its question nor reset resume-once.
-        last = next((i for i in range(len(mine) - 1, -1, -1) if leg_class(mine[i]) is not LegClass.MACHINE), -1)
-        asked = mine[last] if last >= 0 and leg_class(mine[last]) is LegClass.ASKED else None
-        # Resume once (classify_leg): continue the newest machine end since that
-        # leg that left a session; a cap hit on the continuation is an attempt.
-        cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r], runtime)), None)
+        # Every leg of the item, either role's, as derive sees them (#342).
+        legs = local_legs(recorded)
+        mine = legs.get(item, ())
+        plan = next_leg(mine, runtime.value)
         self.log(f"{action.kind.name} #{action.number}: tier {getattr(action.tier, 'value', '?')} -> "
                  f"{runtime.value}:{model or '(default model)'}{':' + effort.value if effort else ''}")
         self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue,
-                                 head=action.head, resumed=cut_off is not None,
-                                 tier=action.tier.value if action.tier is not None else "")
+                                 head=action.head, tier=action.tier.value if action.tier is not None else "")
         if isinstance(action.evidence, CiFailures):
             self.log(f"FIX_CI #{action.number}: handed on {action.head[:12]}: "
                      f"{', '.join(f.name for f in action.evidence.failures)[:300]}")
@@ -204,11 +195,10 @@ class FixLegs:
                 cwd = self.worktrees.sync(issue, branch, action.head)
             if self.prepare_cwd is not None:
                 self.prepare_cwd(cwd, runtime)
-            # Every leg of the item, either role's, as derive sees them (#342).
-            reply = human_reply(subject.comments, asked.completed_at, self.settings.harness,
-                                local_legs(recorded).get(item, ())) if asked else None
+            asked = plan.answering
+            reply = human_reply(subject.comments, asked.ended_at, self.settings.harness, mine) if asked else None
             cfg = replace(self.task_config, runtime=runtime, model=model, effort=effort)
-            task = self._task(action, subject, cwd, runs, cut_off, asked, cfg, runtime, recorded)
+            task = self._task(action, subject, cwd, legs, plan, cfg, runtime, recorded)
             if asked is not None:
                 target = "issue" if action.kind is AgentKind.RESOLVE else "pr"
                 task = tasks.with_human_reply(task, self.settings.repository, target, action.number, reply)
@@ -247,11 +237,7 @@ class FixLegs:
         route = (self.settings.steward_route or self.settings.triage_route) if steward else self.settings.triage_route
         route = route or self.settings.route(Tier.LOW)
         runtime, model, effort = route.runtime, route.model, route.effort
-        # resumed: the light acts never resume, so a leg cap is their one
-        # attempt (STEWARD: no criteria; TRIAGE: DEFAULT_TIER), not a machine
-        # end retried forever.
-        self.runtime.set_context("fix", name, action.number, action.number, claim_target=action.number,
-                                 resumed=True)
+        self.runtime.set_context("fix", name, action.number, action.number, claim_target=action.number)
         try:
             # Per issue: concurrent light legs never share a cwd (or a CODEX_HOME).
             cwd = os.path.join(self.settings.triage_cwd, str(action.number))
@@ -294,34 +280,24 @@ class FixLegs:
         await run_leg(self.runtime, self.log, Leg(name, LegTarget.ISSUE, action.number, True,
                                                   ("global", "repository", "issue")), task)
 
-    def _session(self, runs: list[LegRun], runtime: RuntimeName) -> str:
-        """The newest resumable session of `runtime`: a leg routed to another
-        runtime starts fresh rather than resume a transcript it cannot read."""
-        for run in reversed(runs):
-            receipt = run.receipt or {}
-            session = receipt.get("session")
-            if receipt.get("runtime") == runtime.value and isinstance(session, str) and session:
-                return session
-        return ""
-
     def _task(
-        self, action: RunAgent, subject, cwd: str, runs: list[LegRun], cut_off: LegRun | None, asked: LegRun | None,
+        self, action: RunAgent, subject, cwd: str, legs: Mapping[ItemKey, tuple[LegEnd, ...]], plan: NextLeg,
         cfg: tasks.FixTaskConfig, runtime: RuntimeName, recorded: Iterable[LegRun],
     ):
-        """`cut_off` is the machine end this leg continues; `asked` the agent
-        leg whose question a human has since answered (the caller points at
-        the answer). A fresh session is briefed like a first RESOLVE."""
+        """A RESOLVE starts as `plan` says; a fresh session is briefed like a first RESOLVE."""
         if action.kind is AgentKind.RESOLVE:
-            if cut_off is not None:
-                return tasks.build_continue_task(cwd, self._session([cut_off], runtime), cfg)
-            if asked is not None and (session := self._session([asked], runtime)):
-                return tasks.build_resume_task(cwd, session, cfg)
+            match plan.start:
+                case Continue(session):
+                    return tasks.build_continue_task(cwd, session, cfg)
+                case AnswerResume(session):
+                    return tasks.build_resume_task(cwd, session, cfg)
             return tasks.build_resolve_task(
                 action.number, cwd, cfg, self._resolve_branch(action.number, subject.title),
                 steward_criteria(recorded),
             )
         # PR-stage legs continue the issue's latest session on their runtime: it wrote the code.
-        session = self._session(runs, runtime)
+        session = latest_session(sorted((end for ends in legs.values() for end in ends if end.kind in ROUTED_ACTS),
+                                        key=lambda end: end.ended_at), runtime.value)
         if isinstance(action.evidence, CiFailures):
             task = tasks.build_fix_ci_task(action.number, action.evidence, cwd, session, cfg)
         elif isinstance(action.evidence, ChangeRequest):
