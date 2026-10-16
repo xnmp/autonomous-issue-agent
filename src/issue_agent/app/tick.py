@@ -892,16 +892,13 @@ def spend_reconciler(cfg: HarnessConfig, control: SQLiteControlStore) -> CodexSp
     return CodexSpendReconciler(control, tuple(spend_evidence_dir(path) for path in dirs))
 
 
-def headroom(cfg: HarnessConfig, control, budget_usd: float) -> Callable[[], bool]:
-    """Daily repository/global headroom for one more leg of `budget_usd`
-    (public: the dashboard derives with it too), over the authority
-    reservation uses. A cap below one leg makes paid work wait here instead of
-    being refused at admission (decision #7); an unreadable ledger is no
-    headroom: free work goes on, paid work waits (Q7)."""
+def headroom(cfg: HarnessConfig, control) -> Callable[[], bool]:
+    """Positive daily repository/global headroom over reservation authority.
+    Admission atomically sizes the leg to that headroom; an unreadable ledger
+    leaves paid work waiting while free work continues."""
     caps = tuple((repository, dimension, Money.from_major("USD", cap)) for repository, dimension, cap in (
         (cfg.repo, "repository", cfg.daily_spend_cap_usd), ("*", "global", cfg.global_daily_spend_cap_usd))
         if cap > 0)
-    leg = Money.from_major("USD", budget_usd)
 
     def fits() -> bool:
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -911,7 +908,7 @@ def headroom(cfg: HarnessConfig, control, budget_usd: float) -> Callable[[], boo
                     repository, dimension, "USD", start.date().isoformat(), start,
                     start + timedelta(days=1), ZoneInfo("UTC")))
                 if (snapshot.disposition.value != "available"
-                        or snapshot.committed.micros + leg.micros > cap.micros):
+                        or snapshot.committed.micros >= cap.micros):
                     return False
         except Exception:  # noqa: BLE001 - see docstring
             return False
@@ -921,20 +918,18 @@ def headroom(cfg: HarnessConfig, control, budget_usd: float) -> Callable[[], boo
 
 
 def lifetime_capped(cfg: HarnessConfig, control) -> Callable[[int], bool]:
-    """Whether an issue can no longer afford one more leg under its lifetime
-    cap, priced at the dearer role's leg: fix alone writes the stop, so both
-    roles must agree or a review nobody can afford is stopped by nobody."""
+    """Whether an issue exhausted its lifetime cap. Admission sizes each
+    role's reservation to the remaining headroom in the same transaction."""
     if cfg.issue_spend_cap_usd <= 0:
         return lambda _issue: False
     cap = Money.from_major("USD", cfg.issue_spend_cap_usd)
-    leg = Money.from_major("USD", max(cfg.fix_budget_usd, cfg.review_budget_usd))
 
     def capped(issue: int) -> bool:
         snapshot = control.snapshot(issue_budget_scope(cfg.repo, issue, "USD"))
         if snapshot.disposition.value != "available":
             # `Facts` reads a failed read as no headroom: paid legs wait, free work goes on.
             raise ControlStoreError(f"issue #{issue} spend is unreadable: {snapshot.detail}")
-        return snapshot.committed.micros + leg.micros > cap.micros
+        return snapshot.committed.micros >= cap.micros
 
     return capped
 
@@ -1134,12 +1129,10 @@ def compose_role(
         prepare_shutdown=prepare_shutdown,
         terminalize=terminalize,
     )
-    leg_usd = cfg.fix_budget_usd if role == "fix" else cfg.review_budget_usd
-
     def facts(world: WorldState) -> Local:
         current = live.current
         return Facts(control, cfg.repo, active=lambda: daemon.active_dispatches,
-                     headroom=headroom(current, control, leg_usd), lifetime_capped=lifetime_capped(current, control),
+                     headroom=headroom(current, control), lifetime_capped=lifetime_capped(current, control),
                      log=log)(world)
 
     harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)

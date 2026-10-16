@@ -327,9 +327,9 @@ that matters is not "wrong answer" but "loop that bills forever":
   runs one tier up on the same evidence. STEWARD, TRIAGE and REVIEW never
   resume, so their cut-off is an attempt at once. Derive, the fix role's
   resume choice and the dashboard all read this rule through `tick.leg_end`. A resume is bought
-  only while the issue cap still affords a leg at the dearer role's budget
-  (`ISSUE_SPEND_CAP_USD` ≥ committed + max(`MAX_BUDGET_USD`,
-  `REVIEW_BUDGET_USD`)); a budget hit spends at least `MAX_BUDGET_USD`
+  while the issue cap has positive headroom. Admission reserves and enforces
+  the lesser of the leg maximum and each armed cap's remaining headroom; a
+  budget hit spends at least that reserved maximum.
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
 

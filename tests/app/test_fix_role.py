@@ -932,16 +932,19 @@ def test_a_repair_capped_on_its_resume_hands_the_same_failure_to_a_leg_one_tier_
 def test_a_budget_hit_never_buys_past_the_issues_lifetime_cap(role, later):
     # The lifetime cap is the human's grant: a machine end does not route around it.
     gh = FakeGitHub(issues={5: ready()})
-    agent = Agent(_cap_hit("budget", "s-1", cost=0.6))
+    agent = Agent(_cap_hit("budget", "s-1", cost=0.6), _cap_hit("budget", "s-1", cost=0.4))
     composed, _ = role(gh, agent, ISSUE_SPEND_CAP_USD="1", MAX_BUDGET_USD="0.6", REVIEW_BUDGET_USD="0.6",
                        FIX_MODEL="claude-sonnet-5-5")
     assert dispatched(tick(composed), AgentKind.RESOLVE)
+    later()
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    assert agent.tasks[-1].max_budget_usd == 0.4
     later()
     tick(composed)
 
     assert Label.NEEDS_HUMAN in gh.issues[5].labels
     assert len(gh.comments_with("issue", 5, stop_tag(StopReason.LIFETIME_CAP))) == 1
-    assert len(agent.tasks) == 1 and _resolve_legs(composed) == ["machine"]
+    assert len(agent.tasks) == 2 and _resolve_legs(composed) == ["machine", "agent"]
 
 
 def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session(role, later, monkeypatch):
@@ -1819,7 +1822,7 @@ def test_a_settings_change_applies_at_the_next_tick_without_a_restart(role, tmp_
 
 
 @pytest.mark.parametrize("knob", ["DAILY_SPEND_CAP_USD", "ISSUE_SPEND_CAP_USD"])
-def test_a_lowered_live_cap_holds_the_next_leg_at_the_tick(role, tmp_path, knob):
+def test_a_lowered_live_cap_sizes_the_next_leg_at_the_tick(role, tmp_path, knob):
     """The money path's tick facts (headroom, lifetime cap) read the live
     snapshot, not the boot one."""
     env = tmp_path / "live.env"
@@ -1830,14 +1833,14 @@ def test_a_lowered_live_cap_holds_the_next_leg_at_the_tick(role, tmp_path, knob)
 
     env.write_text(f"{knob}=1\n")  # below one leg's $3
 
-    assert dispatched(tick(composed), AgentKind.RESOLVE) == []
-    assert agent.tasks == []
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    assert [t.max_budget_usd for t in agent.tasks] == [1.0]
 
 
 @pytest.mark.parametrize("knob", ["DAILY_SPEND_CAP_USD", "ISSUE_SPEND_CAP_USD"])
-def test_a_cap_lowered_after_dispatch_refuses_the_legs_admission(role, tmp_path, knob):
+def test_a_cap_lowered_after_dispatch_sizes_the_legs_admission(role, tmp_path, knob):
     """Admission reads the live caps as the leg starts: a cap lowered between
-    the tick that dispatched a leg and its reservation refuses the leg."""
+    the tick that dispatched a leg and its reservation sizes the leg."""
     env = tmp_path / "live.env"
     env.write_text(f"{knob}=100\n")
     gh = FakeGitHub(issues={5: ready()})
@@ -1859,7 +1862,7 @@ def test_a_cap_lowered_after_dispatch_refuses_the_legs_admission(role, tmp_path,
     release.set()
     composed.daemon.wait_for_dispatches()
 
-    assert agent.tasks == []
+    assert [t.max_budget_usd for t in agent.tasks] == [1.0]
 
 
 def test_an_invalid_settings_change_keeps_the_daemon_on_its_previous_settings(role, tmp_path):

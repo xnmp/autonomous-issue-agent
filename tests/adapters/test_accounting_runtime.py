@@ -292,7 +292,7 @@ def test_resumed_session_uses_distinct_per_leg_settlement_receipts(tmp_path) -> 
 
 def test_exhausted_cap_blocks_before_runtime(tmp_path) -> None:
     runtime = Runtime(AgentResult(False, status="ok"))
-    wrapper, _store = _wrapper(tmp_path, runtime, cap=1_000_000)
+    wrapper, _store = _wrapper(tmp_path, runtime, cap=0)
 
     result = _work(wrapper)
 
@@ -504,7 +504,7 @@ def _codex_rollout(tmp_path, session: str, info: str, tail: str) -> CodexRunner:
 def test_a_launch_that_drops_mid_run_is_settled_at_its_real_cost_and_the_caps_see_it(tmp_path) -> None:
     """A leg is one launch (slice 9 review P0): a codex run that spends and
     then loses its stream settles what its rollout measured, so the daily
-    cap refuses the next leg instead of seeing only a cheap last attempt."""
+    cap sees the complete charge instead of only a cheap last attempt."""
     usage = "{'input_tokens':300000,'cached_input_tokens':0,'cache_write_input_tokens':0,'output_tokens':10000}"
     runner = _codex_rollout(
         tmp_path,
@@ -515,19 +515,17 @@ def test_a_launch_that_drops_mid_run_is_settled_at_its_real_cost_and_the_caps_se
     wrapper, store = _wrapper(tmp_path, runner, cap=3_000_000)
 
     dropped = _work(wrapper, model="gpt-test")
-    refused = _work(wrapper, "again", model="gpt-test")
 
     assert dropped.exit_reason is ExitReason.TRANSPORT_DEATH
     # 300k input at $5/M + 10k output at $30/M.
     assert _ended(store, "charged_micros") == [(1_800_000,)]
-    assert refused.exit_reason is ExitReason.BUDGET_EXHAUSTED
 
 
 def test_a_leg_whose_counters_are_malformed_settles_its_reserved_maximum_and_the_caps_see_it(tmp_path) -> None:
     """Unknown spend is charged at the reservation's bound, never at zero:
     the daily cap then refuses the next leg."""
     runner = _codex_rollout(tmp_path, "sess-bad", "{'total_token_usage':{'input_tokens':'x'}}", "exit 0\n")
-    wrapper, store = _wrapper(tmp_path, runner, cap=3_000_000)
+    wrapper, store = _wrapper(tmp_path, runner, cap=2_000_000)
 
     malformed = _work(wrapper, model="gpt-test")
     refused = _work(wrapper, "again", model="gpt-test")
@@ -727,7 +725,7 @@ def test_each_leg_is_admitted_under_the_caps_current_when_it_starts_and_records_
         return result
 
     assert leg().status == "ok"
-    current[0] = AdmissionCaps(Money("USD", 1_000_000), None, None, "snap-2")  # below one leg's $2 reservation
+    current[0] = AdmissionCaps(Money("USD", 0), None, None, "snap-2")  # no headroom at all
     assert leg().exit_reason is ExitReason.BUDGET_EXHAUSTED
     current[0] = AdmissionCaps(Money("USD", 10_000_000), None, None, "snap-3")
     assert leg().status == "ok"
@@ -735,3 +733,36 @@ def test_each_leg_is_admitted_under_the_caps_current_when_it_starts_and_records_
 
     configs = [run.receipt.get("config") for run in store.leg_runs("o/r", (1,)) if run.receipt]
     assert configs == ["snap-1", "snap-3"]
+
+
+@pytest.mark.parametrize("headroom", [1, 1_000_000, 1_999_999, 2_000_000, 9_000_000_000_000_000])
+def test_partial_headroom_is_the_reservation_and_the_budget_enforced_by_the_runtime(tmp_path, headroom):
+    from issue_agent.domain.contracts import daily_budget_scope
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    seen=[]
+    class Metered(Runtime):
+        async def run(self, task):
+            scope = daily_budget_scope("o/r", "repository", "USD", datetime.now(timezone.utc), ZoneInfo("UTC"))
+            reserved = store.snapshot(scope).reserved.micros
+            seen.append((reserved, task.max_budget_usd))
+            return AgentResult(False, status="pushed", session_id="tail")
+    runtime=Metered(None)
+    wrapper,store=_wrapper(tmp_path, runtime, cap=headroom)
+    assert _work(wrapper, model="gpt-test").status == "pushed"
+    budget=min(2_000_000,headroom)
+    assert seen == [(budget,budget/1_000_000)]
+
+
+
+def test_a_huge_partial_reservation_never_rounds_the_live_budget_above_its_ceiling(tmp_path):
+    seen=[]
+    class Metered(Runtime):
+        async def run(self, task):
+            seen.append(Money.from_major("USD",task.max_budget_usd).micros)
+            return AgentResult(False,status="pushed")
+    headroom=9_000_000_000_000_001
+    wrapper,_store=_wrapper(tmp_path,Metered(None),cap=headroom,
+                            budget_policy=_policy(9_000_000_001_000_000))
+    assert _run(wrapper,RuntimePlan("work",model="gpt-test",max_budget_usd=9_000_000_001)).status == "pushed"
+    assert seen and headroom-2 <= seen[0] <= headroom
