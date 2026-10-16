@@ -87,7 +87,11 @@ exception carries that:
   running `.active`: a pending hand edit, or a route onto an unbound runtime,
   would otherwise ship with the save and drain and restart the daemons while
   the dashboard said "next tick". `.active` stays recomposed only by the
-  operator's launch for such changes. `ISSUE_PICKUP=open` is refused when the
+  operator's launch for such changes. That refusal applies to the deployment
+  being edited; another deployment with such a difference (a pending edit, or
+  a stopped run's stale `.active`) is held back instead: its composed files
+  are left as they are, the save names it, and it takes the change at its
+  next launch (#466). `ISSUE_PICKUP=open` is refused when the
   repository has `FIX_MAX_ITEMS` open issues or more, or they cannot be
   counted. The write is atomic, keeps the file's mode, and is refused if the
   file changed since it was read (a concurrent hand edit is never
