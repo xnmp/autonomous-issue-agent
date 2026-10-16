@@ -56,8 +56,8 @@ import {
   GhUnavailableChip,
   SkeletonRows,
   StoreUnavailable,
-  ReadingGitHub,
   WarningList,
+  awaitingGitHub,
 } from "./ui/Feedback";
 import { IssuesBoard } from "./IssuesBoard";
 
@@ -150,6 +150,7 @@ export function IssuesTab({
   const setPage = (which: TableSub) => (page: number) => setPages((current) => ({ ...current, [which]: page }));
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
+  const loading = issues.loading || awaitingGitHub(data);
   const ghOk = data?.gh_ok ?? true;
   const table: TableSub | null = sub === "inflight" ? null : sub;
   const query = queries[sub];
@@ -218,7 +219,6 @@ export function IssuesTab({
         {{ inflight: "In-flight issues", done: "Done issues", backlog: "Backlog" }[sub]}
       </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
-      <ReadingGitHub loaded={!!data} observedAt={data?.observed_at} />
       {table !== null ? (
         <ColumnMenu
           columns={COLUMN_CHOICES[table]}
@@ -253,7 +253,7 @@ export function IssuesTab({
           repo={repo}
           items={filteredBoard}
           slots={data?.slots}
-          loading={issues.loading}
+          loading={loading}
           onRefresh={issues.refresh}
           onOpenIssue={onOpenIssue}
         />
@@ -269,7 +269,7 @@ export function IssuesTab({
             cards={filteredDone}
             page={pages.done}
             onPage={setPage("done")}
-            loading={issues.loading}
+            loading={loading}
             visible={visible}
             onOpen={onOpenIssue}
             unread={unreadDone}
@@ -283,7 +283,7 @@ export function IssuesTab({
           cards={filteredBacklog}
           page={pages.backlog}
           onPage={setPage("backlog")}
-          loading={issues.loading}
+          loading={loading}
           ghOk={ghOk}
           visible={visible}
           onRefresh={issues.refresh}

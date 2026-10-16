@@ -39,9 +39,10 @@ export function StoreUnavailable({ detail }: { detail: string | null | undefined
   return <ErrorBanner message={`Board unavailable — ${detail}`} />;
 }
 
-/** First GitHub observation not landed yet: loading, not a warning. */
-export function ReadingGitHub({ loaded, observedAt }: { loaded: boolean; observedAt: string | null | undefined }) {
-  return loaded && !observedAt ? <div className="row faint">Reading GitHub…</div> : null;
+/** First GitHub observation not landed yet: what derives from it is still
+ * loading (a skeleton), never an empty list or a "clear" backlog. */
+export function awaitingGitHub(data: { observed_at?: string | null } | null | undefined): boolean {
+  return !!data && !data.observed_at;
 }
 
 /** Backend `warnings[]` — degraded collectors, not failures. */
