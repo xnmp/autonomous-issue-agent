@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
-from .identity import is_bot_login
+from .identity import Account, is_bot_login
 from .architecture import ArchitectureObservation
 from .labels import Label
 from .checks import BaseHealth, Check, CIObservation, Observed, Unavailable
@@ -54,10 +54,7 @@ class Comment:
 
     @property
     def is_bot(self) -> bool:
-        # Routed through identity.is_bot_login (review R2-11) rather than a
-        # raw `.endswith("[bot]")`: the one other login-shaped comparison in
-        # the codebase, now case/whitespace-tolerant like everything else
-        # identity.py owns.
+        # Adapters retain [bot] when canonicalizing typed Bot authors.
         return is_bot_login(self.author)
 
 
@@ -120,7 +117,7 @@ class IssueView:
     labels: frozenset[Label] = field(default_factory=frozenset)
     comments: tuple[Comment, ...] = ()
     updated_at: str = ""
-    author: str = ""
+    author: Account | None = None
     state: str = "open"  # open | closed
     # When `needs-human` was last applied ("" = not observed). A reply older
     # than that never releases: the operator parked the item after it.

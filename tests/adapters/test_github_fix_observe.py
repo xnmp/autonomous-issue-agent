@@ -35,7 +35,7 @@ def issue_node(number=5, **kw) -> dict:
         "number": number,
         "title": "Null token",
         "state": "OPEN",
-        "author": {"login": "alice"},
+        "author": {"__typename": "User", "login": "alice"},
         "labels": labels("ai-ready"),
         "comments": {"totalCount": 0, "pageInfo": {"hasPreviousPage": False}, "nodes": []},
         "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": []},
@@ -55,7 +55,7 @@ def pr_node(number=100, head="h1", **kw) -> dict:
         "baseRefOid": "b1",
         "isDraft": False,
         "title": "Fix",
-        "author": {"login": "fix-bot"},
+        "author": {"__typename": "User", "login": "fix-bot"},
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
         "labels": labels(),
@@ -65,7 +65,7 @@ def pr_node(number=100, head="h1", **kw) -> dict:
                     "commit": {
                         "oid": head,
                         "committedDate": "2026-10-01T00:00:00Z",
-                        "author": {"user": {"login": "fix-bot"}},
+                        "author": {"user": {"__typename": "User", "login": "fix-bot"}},
                     }
                 }
             ]
@@ -612,7 +612,7 @@ class PagedGitHub:
                 name: _back(
                     [
                         {
-                            "author": {"login": "review-bot"},
+                            "author": {"__typename": "User", "login": "review-bot"},
                             "state": "APPROVED",
                             "submittedAt": "2026-10-01T00:00:00Z",
                             "body": "",
@@ -621,7 +621,7 @@ class PagedGitHub:
                     ]
                 )
             }
-        return {name: _back([{"author": {"login": "alice"}, "body": "older", "createdAt": "2026-09-01T00:00:00Z"}])}
+        return {name: _back([{"author": {"__typename": "User", "login": "alice"}, "body": "older", "createdAt": "2026-09-01T00:00:00Z"}])}
 
     def __call__(self, argv, _token):
         if argv[:3] != ["gh", "api", "graphql"]:

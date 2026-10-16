@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from issue_agent.domain.actions import AgentKind
+from issue_agent.domain.identity import configured_account
 from issue_agent.domain.labels import Label
 from issue_agent.domain.state import Dispatch, Harness, Local, Wait, WaitReason, derive, harness_gap, issue_key, picked_up
 from issue_agent.domain.world import IssueView, Pickup, PRView, WorldState
@@ -20,7 +21,7 @@ def _derive(pickup: Pickup, *issues: IssueView, prs: tuple[PRView, ...] = ()):
 
 
 def _open(number: int = 3, *labels: Label, **kw) -> IssueView:
-    return IssueView(number=number, labels=frozenset(labels), author=kw.pop("author", "alice"), **kw)
+    return IssueView(number=number, labels=frozenset(labels), author=configured_account(kw.pop("author", "alice")), **kw)
 
 
 def test_an_unlabelled_open_issue_is_picked_up_only_when_every_open_issue_is():

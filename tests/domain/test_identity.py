@@ -1,81 +1,39 @@
-"""GitHub login comparison — the one place the `[bot]` suffix asymmetry is
-absorbed (review C1). These pin the contract every call site relies on."""
-
+"""GitHub account identity never collapses a User into an app Bot (#481)."""
 import pytest
 
-from issue_agent.domain.identity import is_bot_login, login_eq, normalize_login
+from issue_agent.domain.identity import Account, account_eq, configured_account, is_bot_login
 
 
-@pytest.mark.parametrize(
-    "a,b,equal",
-    [
-        # C1: an App configured as `a[bot]` surfaces bare as `a` in author fields.
-        ("a[bot]", "a", True),
-        ("a", "a[bot]", True),
-        ("a", "a", True),
-        ("a[bot]", "a[bot]", True),
-        ("fix-bot", "review-bot", False),
-        ("fix-bot[bot]", "review-bot", False),
-        ("fix-bot[bot]", "review-bot[bot]", False),
-        ("a[bot]", "ab", False),
-        ("a", "a-bot", False),  # stripping is not a prefix match
-        # GitHub logins are case-insensitive, without collapsing distinct ones.
-        ("A[bot]", "a", True),
-        ("Fix-Bot", "fix-bot", True),
-        ("MY-Reviewer-Bot[bot]", "my-reviewer-bot", True),
-        ("Fix-Bot", "review-bot", False),
-        # Exactly one trailing suffix of tolerance.
-        ("x[bot][bot]", "x", False),
-        ("x[bot][bot]", "x[bot][bot]", True),
-        ("a[bot]b", "a", False),
-        # P1R-7: an unknown login never matches anything, including another unknown
-        # (an unresolved PR author vs an unset FIX_BOT once read as OURS).
-        ("", "fix-bot", False),
-        (None, "fix-bot", False),
-        ("", "fix-bot[bot]", False),
-        ("", "", False),
-        ("", "[bot]", False),
-        ("fix-bot", "", False),
-        # P1R-6: FIX_BOT='fix-bot ' (a shell round-trip) must still match `fix-bot`.
-        ("fix-bot ", "fix-bot", True),
-        ("fix-bot", " fix-bot ", True),
-        ("fix-bot ", "review-bot", False),
-    ],
-)
-def test_login_eq(a, b, equal):
-    assert login_eq(a, b) is equal
+@pytest.mark.parametrize("left,right,equal", [
+    ("steward", "steward[bot]", False), ("steward[bot]", "steward", False),
+    ("STEWARD[bot] ", "steward[bot]", True), (" XNMP-Fixer ", "xnmp-fixer", True),
+    ("fixer_acme", "FIXER_ACME", True), ("", "", False), (None, "steward", False),
+    ("steward[bot][bot]", "steward[bot][bot]", False), ("x" * 100_000, "steward", False),
+])
+def test_account_comparison_preserves_type(left, right, equal):
+    assert account_eq(left, right) is equal
 
 
-@pytest.mark.parametrize(
-    "raw,normal",
-    [
-        ("x[bot][bot]", "x[bot]"),
-        ("a[bot]b", "a[bot]b"),
-        ("", ""),
-        (None, ""),
-        ("[bot]", ""),
-        ("fix-bot ", "fix-bot"),
-        (" fix-bot", "fix-bot"),
-        ("\tfix-bot\n", "fix-bot"),
-        # The strip must precede the suffix check, or removesuffix never matches.
-        ("fix-bot[bot] ", "fix-bot"),
-    ],
-)
-def test_normalize_login(raw, normal):
-    assert normalize_login(raw) == normal
+def test_typed_bot_authorship_matches_only_bot_configuration():
+    bot = Account("Bot", "STEWARD")
+    assert account_eq(bot, "steward[bot]")
+    assert not account_eq(bot, "steward")
+    assert str(bot) == "steward[bot]"
 
 
-@pytest.mark.parametrize(
-    "login,bot",
-    [
-        # R2-11: world.Comment.is_bot routes through here.
-        ("dependabot[bot]", True),
-        ("DEPENDABOT[BOT]", True),
-        (" dependabot[bot] ", True),
-        ("a-human", False),
-        ("", False),
-        (None, False),
-    ],
-)
-def test_is_bot_login(login, bot):
+@pytest.mark.parametrize("login", [None, "", "-leading", "a b", "a" * 40, "a" * 100_000, "a[bot][bot]"])
+def test_malformed_configuration_never_names_an_account(login):
+    assert configured_account(login) is None
+
+
+@pytest.mark.parametrize("kind,login", [("Organization", "x"), (None, "x"), ("Bot", ""),
+                                        ("User", "x[bot]"), ("Bot", "x" * 100_000)])
+def test_an_account_cannot_hold_an_invalid_type_or_login(kind, login):
+    with pytest.raises(ValueError):
+        Account(kind, login)
+
+
+@pytest.mark.parametrize("login,bot", [("ci[bot]", True), (" CI[BOT] ", True), ("ci", False),
+                                        ("", False), (None, False)])
+def test_bot_comment_classification_retains_the_account_type(login, bot):
     assert is_bot_login(login) is bot

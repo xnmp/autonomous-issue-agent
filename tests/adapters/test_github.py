@@ -30,6 +30,7 @@ from issue_agent.adapters.github import (
 from issue_agent.domain.checks import Unavailable
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Comment
+from tests.adapters.test_github_fix_observe import issue_node, pr_node, labels
 
 
 def test_parse_pr_maps_the_graphql_shape():
@@ -45,16 +46,16 @@ def test_parse_pr_maps_the_graphql_shape():
             "labels": [{"name": "needs-human"}, {"name": "ai-review"}],
             "reviews": [
                 {
-                    "author": {"login": "review-bot"},
+                    "author": {"__typename": "User", "login": "review-bot"},
                     "state": "APPROVED",
                     "submittedAt": "t2",
                     "commit": {"oid": "sha-graphql"},
                 }
             ],
             "comments": [
-                {"author": {"login": "alice"}, "body": "Use A.", "createdAt": "t2",
+                {"author": {"__typename": "User", "login": "alice"}, "body": "Use A.", "createdAt": "t2",
                  "url": "https://github.com/o/r/pull/100#issuecomment-1"},
-                {"author": {"login": "bob"}, "body": "B.", "createdAt": "t3", "url": 7},  # malformed: no link
+                {"author": {"__typename": "User", "login": "bob"}, "body": "B.", "createdAt": "t3", "url": 7},  # malformed: no link
             ],
             "files": [{"path": "backend/app/__init__.py"}, {"path": "backend/x.py"}],
         }
@@ -84,7 +85,7 @@ def test_parse_pr_review_shapes_and_malformed_commits():
     rest = parse_pr(
         {
             "number": 1,
-            "reviews": [{"user": {"login": "x"}, "state": "APPROVED", "submitted_at": "t1", "commit_id": "sha-rest"}],
+            "reviews": [{"user": {"__typename": "User", "login": "x"}, "state": "APPROVED", "submitted_at": "t1", "commit_id": "sha-rest"}],
         }
     )
     assert (rest.reviews[0].author, rest.reviews[0].submitted_at, rest.reviews[0].commit_id) == ("x", "t1", "sha-rest")
@@ -94,8 +95,8 @@ def test_parse_pr_review_shapes_and_malformed_commits():
         {
             "number": 1,
             "reviews": [
-                {"author": {"login": "x"}, "state": "APPROVED", "commit": "not-a-dict"},
-                {"author": {"login": "y"}, "state": "APPROVED", "commit": {}},
+                {"author": {"__typename": "User", "login": "x"}, "state": "APPROVED", "commit": "not-a-dict"},
+                {"author": {"__typename": "User", "login": "y"}, "state": "APPROVED", "commit": {}},
             ],
         }
     )
@@ -276,8 +277,8 @@ def test_a_refused_review_is_githubs_refusal_and_an_unanswered_one_raises():
 
 
 def test_get_issue_parses_response():
-    resp = {"number": 5, "title": "x", "labels": [{"name": "ai-ready"}], "state": "OPEN", "author": {"login": "a"}}
-    iss = GitHubGateway("o/r", runner=FakeRunner({"issue view 5": resp})).get_issue(5)
+    resp = {"data": {"repository": {"issue": issue_node(title="x")}}}
+    iss = GitHubGateway("o/r", runner=FakeRunner({"api graphql": resp})).get_issue(5)
     assert iss.number == 5 and iss.has(Label.AI_READY)
 
 
@@ -484,7 +485,10 @@ def test_unread_checks_are_unknown_not_an_empty_world(checks):
     policy treats as mergeable. get_pr(checks=False) never asked: a PR that
     flips OPEN between the list and the view must not arrive as honest-NONE
     mergeable either (review F3)."""
-    fr = FakeRunner({"pr view 100": {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}})
+    node = pr_node(comments={"nodes": [], "totalCount": 0, "pageInfo": {"hasPreviousPage": False}},
+                   reviews={"nodes": [], "totalCount": 0, "pageInfo": {"hasPreviousPage": False}},
+                   files={"nodes": [], "totalCount": 0, "pageInfo": {"hasNextPage": False}})
+    fr = FakeRunner({"api graphql": {"data": {"repository": {"pullRequest": node}}}})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=checks)  # the policy read is unmatched → unavailable
     assert pr.checks == () and isinstance(pr.ci, Unavailable)
 
@@ -511,7 +515,7 @@ def test_a_rerun_posts_the_failed_jobs_rerun_and_returns_githubs_answer():
 
 # ── #440: a write's answer, read from GitHub's status and headers ─────────────
 @pytest.mark.parametrize("out,answer", [
-    (_http(201, {"id": 77, "user": {"login": "fixer"}}), Accepted(77)),
+    (_http(201, {"id": 77, "user": {"__typename": "User", "login": "fixer"}}), Accepted(77)),
     (_http(202, {}), Accepted()),  # a cancel: nothing created
     (_http(204), Accepted()),  # no body at all
     (_http(201, {"id": "77"}), Accepted()),  # a malformed id is no receipt id, still accepted

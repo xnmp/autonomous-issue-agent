@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .identity import login_eq
+from .identity import account_eq
 
 if TYPE_CHECKING:
     from .world import IssueView
@@ -38,7 +38,7 @@ ArchitectureObservation = NoPass | PassInFlight | PassEnded
 
 
 def architecture_pass(issue: IssueView, fix_bot: str) -> bool:
-    return (isinstance(issue.author, str) and login_eq(issue.author, fix_bot)
+    return (account_eq(issue.author, fix_bot)
             and isinstance(issue.title, str) and len(issue.title) <= 256
             and issue.title.startswith(PASS_PREFIX))
 

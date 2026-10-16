@@ -23,7 +23,8 @@ from urllib.parse import quote
 from ..domain.checks import BaseHealth, Unavailable
 from ..domain.architecture import ArchitectureObservation, NoPass, PassEnded, PassInFlight, architecture_pass
 from ..domain.ci import parse_timestamp
-from ..domain.identity import login_eq
+from ..domain.identity import account_eq, configured_account
+from .github_identity import parse_account
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
 from ..domain.world import BlockerRef, Branch, Comment, IssueView, Pickup, PRView, Push, Review, WorldState
@@ -216,7 +217,7 @@ def _labels(raw: list | None) -> frozenset[Label]:
 
 def _comments(raw: list | None) -> tuple[Comment, ...]:
     return tuple(
-        Comment(author=_login(c.get("author")) if isinstance(c.get("author"), dict) else c.get("author", "") or "",
+        Comment(author=_login(c.get("author")),
                 body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "",
                 url=c.get("url", "") if isinstance(c.get("url"), str) else "")
         for c in raw or [])
@@ -243,7 +244,7 @@ def parse_issue(d: dict) -> IssueView:
     return IssueView(
         number=int(d["number"]), title=d.get("title", "") or "", body=d.get("body", "") or "",
         labels=_labels(d.get("labels")), comments=_comments(d.get("comments")),
-        updated_at=d.get("updatedAt", "") or "", author=_login(d.get("author")),
+        updated_at=d.get("updatedAt", "") or "", author=parse_account(d.get("author")),
         state=(d.get("state", "open") or "open").lower(),
     )
 
@@ -302,7 +303,7 @@ FIX_MAX_ITEMS = 1000
 _FIX_MAX_PAGES = {name: -(-FIX_MAX_ITEMS // size) for name, size in _FIX_PAGE_SIZE.items()}
 _FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500, "contexts": 1000}
 _HARNESS_BRANCH_PREFIX = "fix/"
-_COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt url}}}}"
+_COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{__typename login}} body createdAt url}}}}"
 _LABELS = "labels(first:100){totalCount nodes{name}}"
 # Cross-references, paged in full like any nested connection: a merged harness
 # PR past one page must read as "unknown" (the issue is skipped), never as
@@ -318,17 +319,17 @@ _LABELED = ("labeled:timelineItems(itemTypes:[LABELED_EVENT],last:100){pageInfo{
 # per-issue round-trip). One page: GitHub caps a relationship well below 100.
 _BLOCKED_BY = "blockedBy(first:100){totalCount nodes{number state repository{nameWithOwner}}}"
 _FIX_ISSUE = (
-    "id number title state author{login} " + _LABELS + " " + _LABELED + " "
+    "id number title state author{__typename login} " + _LABELS + " " + _LABELED + " "
     + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="") + " " + _BLOCKED_BY
 )
 _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
-            "nodes{{databaseId author{{login}} state submittedAt body commit{{oid}}}}}}")
+            "nodes{{databaseId author{{__typename login}} state submittedAt body commit{{oid}}}}}}")
 _FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
 _FIX_PR = (
-    "id number state headRefName headRefOid baseRefName baseRefOid title author{login} lastEditedAt "
+    "id number state headRefName headRefOid baseRefName baseRefOid title author{__typename login} lastEditedAt "
     "mergeable mergeStateStatus " + _LABELS + " " + _LABELED + " " + _COMMENTS.format(before="") + " "
     + _REVIEWS.format(before="") + " " + _FILES.format(after="")
-    + " commits(last:1){nodes{commit{oid committedDate author{user{login}}}}}"
+    + " commits(last:1){nodes{commit{oid committedDate author{user{__typename login}}}}}"
 )
 # Per branch: its newest PR (any state), its head commit's date, and how many
 # commits it has that the base lacks (`compare` reads the ref as the base, so
@@ -354,13 +355,13 @@ _BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid sta
              + _BASE_CONTEXTS.format(after="") + "}}}}")
 
 _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount "
-                "nodes{... on Issue{number title state closedAt author{login} "
+                "nodes{... on Issue{number title state closedAt author{__typename login} "
                 "timelineItems(itemTypes:[ISSUE_COMMENT,CLOSED_EVENT,REOPENED_EVENT],last:2){nodes{__typename "
-                "... on IssueComment{author{login} body} "
+                "... on IssueComment{author{__typename login} body} "
                 "... on ClosedEvent{closer{... on PullRequest{mergeCommit{oid}} ... on Commit{oid}}}}}}}}}")
 
 _PASS_ISSUES = ('query($q:String!){search(query:$q,type:ISSUE,first:20){issueCount nodes{... on Issue{'
-                'number title state closedAt author{login} ' + _LABELS + ' '
+                'number title state closedAt author{__typename login} ' + _LABELS + ' '
                 + _TIMELINE.format(before="") + '}}}}')
 _MERGED_COUNT = 'query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}'
 
@@ -407,8 +408,8 @@ def _connection(parent: object, name: str, more: str = "") -> tuple[list, dict]:
 
 
 def _login(raw: object) -> str:
-    login = raw.get("login") if isinstance(raw, dict) else None
-    return login if isinstance(login, str) else ""
+    account = parse_account(raw)
+    return str(account) if account is not None else ""
 
 
 def _complete_labels(node: dict) -> frozenset[Label]:
@@ -541,7 +542,7 @@ def parse_fix_issue(node: object, comments: list, blocked_by: tuple[BlockerRef, 
     labels = _complete_labels(node)
     return IssueView(
         number=node["number"], title=node.get("title") or "", labels=labels,
-        comments=_comments(comments), author=_login(node.get("author")), state=state.lower(),
+        comments=_comments(comments), author=parse_account(node.get("author")), state=state.lower(),
         needs_human_labeled_at=_needs_human_labeled_at(node, labels), blocked_by=blocked_by,
         ai_ready_labeled_at=_ai_ready_labeled_at(node, labels),
     )
@@ -587,7 +588,10 @@ def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PR
         if not isinstance(commit, dict) or commit.get("oid") != head:
             raise FixObservationIncomplete("PR head commit disagrees with its head")
         author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
-        pushes = (Push(_login(author.get("user")), commit.get("committedDate") or ""),)
+        # CommitAuthor.user is concrete User, even for an app's suffixed login.
+        user = author.get("user")
+        account = configured_account(user.get("login")) if isinstance(user, dict) else None
+        pushes = (Push(str(account) if account is not None else "", commit.get("committedDate") or ""),)
     return PRView(
         number=node["number"], head_ref_name=node["headRefName"], head_ref_oid=head,
         base_ref_name=node.get("baseRefName") or "", base_ref_oid=node.get("baseRefOid") or "",
@@ -752,7 +756,29 @@ class GitHubGateway:
         return json.loads(out) if out.strip() else None
 
     def _view(self, kind: str, number: int, fields: str) -> object:
-        return self._gh_json([kind, "view", str(number), "--repo", self.repo, "--json", fields])
+        requested = fields.split(",")
+        if not {"author", "comments", "reviews"} & set(requested):
+            return self._gh_json([kind, "view", str(number), "--repo", self.repo, "--json", fields])
+        # gh view drops author type from reviews; bare Bot and User logins collide.
+        connections = {"comments": _COMMENTS, "reviews": _REVIEWS, "files": _FILES}
+        selections = {name: template.format(before="", after="") for name, template in connections.items()}
+        selections |= {"author": "author{__typename login}", "labels": _LABELS}
+        selection = "id " + " ".join(selections.get(f, f) for f in requested)
+        field, on = ("issue", "Issue") if kind == "issue" else ("pullRequest", "PullRequest")
+        node = self._repository_page(f"{field}(number:{int(number)}){{{selection}}}").get(field)
+        if not isinstance(node, dict):
+            raise FixObservationIncomplete(f"{kind} #{number} was not answered")
+        result = dict(node)
+        for name, template in connections.items():
+            if name in requested:
+                rows = self._nested(node, name, template, on=on, backward=name != "files")
+                if rows is None:
+                    raise FixObservationIncomplete(f"{kind} #{number} {name} exceeded its bound")
+                result[name] = rows
+        if "labels" in requested:
+            _complete_labels(node)
+            result["labels"] = node["labels"]["nodes"]
+        return result
 
     def get_issue(self, number: int) -> IssueView:
         return parse_issue(self._view("issue", number, "number,title,body,labels,comments,updatedAt,author,state"))  # type: ignore[arg-type]
@@ -894,9 +920,9 @@ class GitHubGateway:
             for node in search["nodes"]:
                 if (not isinstance(node, dict) or not isinstance(node.get("title"), str) or len(node["title"]) > 256
                         or type(node.get("number")) is not int or not 0 < node["number"] <= 2**63 - 1
-                        or not 0 < len(_login(node.get("author"))) <= 256):
+                        or parse_account(node.get("author")) is None):
                     return None
-                issue = IssueView(node["number"], title=node["title"], author=_login(node.get("author")))
+                issue = IssueView(node["number"], title=node["title"], author=parse_account(node.get("author")))
                 if architecture_pass(issue, filer):
                     break
             else:
@@ -1081,7 +1107,7 @@ class GitHubGateway:
         if not isinstance(data, dict) or not isinstance(data.get("comments"), list):
             raise FixObservationIncomplete(f"{kind} #{number}: comments were not answered")
         return any(isinstance(item, dict) and item.get("body") == body
-                   and login_eq(_login(item.get("author")), author) for item in data["comments"])
+                   and account_eq(_login(item.get("author")), author) for item in data["comments"])
 
     def is_issue_closed(self, issue: int) -> bool:
         data = self._view("issue", issue, "state")
@@ -1103,7 +1129,7 @@ class GitHubGateway:
             raise RuntimeError(f"pull request {pr} reviews were not answered completely")
         return any(
             isinstance(item, dict) and isinstance(item.get("user"), dict)
-            and login_eq(str(item["user"].get("login") or ""), login) and item.get("commit_id") == head
+            and account_eq(_login(item.get("user")), login) and item.get("commit_id") == head
             and str(item.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED")
             and current(item.get("submitted_at"))
             for page in data for item in page)

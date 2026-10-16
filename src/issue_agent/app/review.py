@@ -29,7 +29,7 @@ from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.agent_task import RuntimeName
 from ..domain.ci import parse_timestamp
-from ..domain.identity import login_eq
+from ..domain.identity import account_eq
 from ..domain.leg import Leg, LegTarget
 from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
@@ -171,7 +171,7 @@ class ReviewLegs:
         edited = parse_timestamp(pr.body_edited_at)
         # The bot's reviews of this head and description: one older than a body
         # edit was answered by it (a standing approval skipped above).
-        on_head = [r for r in pr.reviews if login_eq(r.author, bot) and r.commit_id == action.head
+        on_head = [r for r in pr.reviews if account_eq(r.author, bot) and r.commit_id == action.head
                    and not (edited is not None and (at := parse_timestamp(r.submitted_at)) is not None and at < edited)]
         runs = self.control.leg_runs(self.settings.repository, (issue,))
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
@@ -229,7 +229,7 @@ class ReviewLegs:
             return "", ""
         legs = tuple(end for ends in local_legs(runs).values() for end in ends)
         human = tuple(c for _, c in human_comments(subject.comments, self.settings.harness, legs))
-        return _bounded(subject.author or "author", subject.body or ""), format_pr_discussion(human)
+        return _bounded(str(subject.author) if subject.author is not None else "author", subject.body or ""), format_pr_discussion(human)
 
     def _task(self, action: RunAgent, issue: int, pr: PRView, runs: Iterable[LegRun]):
         route = self.route(action.tier)
@@ -263,7 +263,7 @@ def _prior_review(pr: PRView, bot: str) -> str:
     """The review bot's latest review body on this PR, bounded and marked like
     the discussion: what the reviewer asked for last round, so it can judge
     whether the new commits answer it rather than re-judge from scratch."""
-    mine = [r for r in pr.reviews if login_eq(r.author, bot) and r.body.strip()]
+    mine = [r for r in pr.reviews if account_eq(r.author, bot) and r.body.strip()]
     latest = max(mine, key=lambda r: r.submitted_at, default=None)
     return _bounded(latest.author, latest.body) if latest is not None else ""
 

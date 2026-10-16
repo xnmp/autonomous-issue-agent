@@ -25,7 +25,7 @@ def run_row(name="macOS Smoke", run=1, conclusion="failure", *, branch="dev", ev
 
 
 def found(number, title, state="OPEN", author="fix-bot", closed=None) -> dict:
-    return {"number": number, "title": title, "state": state, "closedAt": closed, "author": {"login": author}}
+    return {"number": number, "title": title, "state": state, "closedAt": closed, "author": {"__typename": "User", "login": author}}
 
 
 def job(name, workflow, *, event="push", run="FAILURE", status="COMPLETED", conclusion="FAILURE") -> dict:
@@ -286,7 +286,7 @@ def test_the_comment_the_fixer_closed_an_issue_with_is_read_and_any_other_is_not
         return {**found(1, "t", "CLOSED", closed="2026-10-15T11:55:46Z"), "timelineItems": {"nodes": list(events)}}
 
     def said(login, body="m"):
-        return {"__typename": "IssueComment", "author": {"login": login}, "body": body}
+        return {"__typename": "IssueComment", "author": {"__typename": "User", "login": login}, "body": body}
     close, merged = {"__typename": "ClosedEvent", "closer": None}, {"__typename": "ClosedEvent", "closer": {"oid": "abc"}}
     nodes = [closed(said("Fix-Bot"), close),  # `gh issue close --comment` by the fixer
              closed(said("fix-bot"), merged),  # a commit closed it: the commit rules

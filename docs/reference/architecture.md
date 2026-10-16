@@ -558,6 +558,7 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/env_file.py`,
 `adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
+`adapters/github_identity.py` (validates account type and login before authorship grants trust; ADR 0001),
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/leg_sandbox.py` (renders the mount plan as a `bwrap` launch, carries
 a fix leg's one GitHub token in its environment),

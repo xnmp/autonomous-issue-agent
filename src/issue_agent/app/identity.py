@@ -13,19 +13,15 @@ config. The role then uses GitHub's spelling of its own login.
 from __future__ import annotations
 
 import os
-import re
 import time
 from collections.abc import Callable, Mapping
 
 from ..adapters.app_token import AppCredentials, AppTokenMinter, default_mint_fn
 from ..adapters.github import Identity
-from ..domain.identity import login_eq
+from ..domain.identity import account_eq, configured_account
 
 _TOKEN = {"fix": "FIX_BOT_TOKEN", "review": "REVIEW_BOT_TOKEN"}
 _BOT = {"fix": "FIX_BOT", "review": "REVIEW_BOT"}
-# A user login (alphanumerics and hyphens; `_` in an Enterprise Managed User's
-# `name_shortcode`) or an App's `slug[bot]`.
-LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,38}(?:\[bot\])?")
 
 
 def _app_identity(env: Mapping[str, str]) -> Identity | None:
@@ -70,8 +66,8 @@ def resolve_role_identity(
     configured FIX_BOT or REVIEW_BOT."""
     identity, source = role_credential(role, env)
     answer = (viewer(identity) or "").strip()
-    login = answer if LOGIN.fullmatch(answer) else ""
-    if not login_eq(login, expected):
+    login = answer if configured_account(answer) is not None else ""
+    if not account_eq(login, expected):
         named = repr(login) if login else f"nobody GitHub would name (answer {answer[:80]!r})"
         raise ValueError(f"{_BOT[role]} is {expected!r} but {source} acts as {named}: set {_BOT[role]} "
                          f"to the credential's login, or give the {role} role {_BOT[role]}'s credential")

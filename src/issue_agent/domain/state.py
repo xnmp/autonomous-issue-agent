@@ -106,7 +106,7 @@ from .backoff import LegEnd, machine_backoff_until
 from .checks import Check, Observed
 from .ci import BaseRed, Clear, Failed, Waiting, base_fix, base_held, charge, is_pending, parse_timestamp, reduce_ci
 from .evidence import ChangeRequest, CiFailures, began, new_failures
-from .identity import login_eq
+from .identity import account_eq
 from .labels import Label
 from .refs import harness_branch_issue
 from .architecture import architecture_pass
@@ -177,7 +177,7 @@ class Harness:
             raise ValueError("harness marker must be a bounded hidden HTML comment")
 
     def owns_login(self, login: str) -> bool:
-        return login_eq(login, self.fix_bot) or login_eq(login, self.review_bot)
+        return account_eq(login, self.fix_bot) or account_eq(login, self.review_bot)
 
     def wrote(self, comment: Comment) -> bool:
         return self.marker in comment.body and self.owns_login(comment.author)
@@ -476,7 +476,7 @@ def harness_gap(issue: IssueView, harness: Harness) -> bool:
     leg (which holds FIX_BOT_TOKEN) opening an issue under another title,
     which open pickup takes up: ADR 0007's amendment accepts that, bounded by
     the spend caps."""
-    return (isinstance(issue.author, str) and login_eq(issue.author, harness.fix_bot)
+    return (account_eq(issue.author, harness.fix_bot)
             and isinstance(issue.title, str) and issue.title.startswith(HARNESS_GAP_PREFIX))
 
 
@@ -757,7 +757,7 @@ def _pr_step(
         return Dispatch(AgentKind.REVIEW, head)
     if verdict == REVIEW_CHANGES_REQUESTED:
         return Dispatch(AgentKind.ADDRESS_REVIEW, head,
-                        evidence=_change_request(pr, lambda login: login_eq(login, harness.review_bot)))
+                        evidence=_change_request(pr, lambda login: account_eq(login, harness.review_bot)))
     if human_heads:
         return Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
     # BLOCKED with green CI and the bot's approval: branch protection waits on
@@ -789,7 +789,7 @@ def bot_verdict_on_head(pr: PRView, harness: Harness) -> str | None:
     verdicts = [
         (parse_timestamp(r.submitted_at) is not None, r.submitted_at, i, r.state.upper())
         for i, r in enumerate(pr.reviews)
-        if login_eq(r.author, harness.review_bot) and r.commit_id == pr.head_ref_oid
+        if account_eq(r.author, harness.review_bot) and r.commit_id == pr.head_ref_oid
         and r.state.upper() in (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
     ]
     if not verdicts:
@@ -868,7 +868,7 @@ def human_comments(
     windows = [(leg.started_at, leg.ended_at) for leg in legs if leg.started_at is not None]
     picked = [(at, c) for c in comments
               if (at := parse_timestamp(c.created_at)) is not None and not harness.wrote(c) and not c.is_bot
-              and not (login_eq(c.author, harness.fix_bot) and any(start < at <= end for start, end in windows))]
+              and not (account_eq(c.author, harness.fix_bot) and any(start < at <= end for start, end in windows))]
     return tuple(sorted(picked, key=lambda p: p[0]))
 
 
@@ -894,7 +894,7 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
     def counts(raw: str) -> bool:
         at = parse_timestamp(raw)
         return floor is None or at is None or at > floor
-    return sum(1 for r in pr.reviews if login_eq(r.author, harness.review_bot)
+    return sum(1 for r in pr.reviews if account_eq(r.author, harness.review_bot)
                and r.state.upper() == REVIEW_CHANGES_REQUESTED and counts(r.submitted_at))
 
 

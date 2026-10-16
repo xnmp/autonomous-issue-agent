@@ -6,7 +6,8 @@ from dataclasses import replace
 from ..domain.ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, parse_timestamp
 
 from ..domain.checks import BaseIssue, BaseRun, Check, CIObservation, Observed, RequiredCheck, Unavailable
-from ..domain.identity import login_eq
+from ..domain.identity import account_eq
+from .github_identity import parse_account
 
 _METADATA = """query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){
  pullRequest(number:$number){id headRefOid baseRefName
@@ -151,7 +152,7 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
         raise ValueError("issue search is absent, malformed or short")
     return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
                            *_closer(n, filer) if n["state"] == "CLOSED" else ())
-                 for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
+                 for n in nodes if account_eq(parse_account(n.get("author")), filer))
 
 
 def _closer(node: dict, filer: str) -> tuple[str, str]:
@@ -168,8 +169,8 @@ def _closer(node: dict, filer: str) -> tuple[str, str]:
         return oid, ""
     comment = before[-1] if before and before[-1].get("__typename") == "IssueComment" else {}
     author = comment.get("author")
-    login, body = author.get("login") if isinstance(author, dict) else None, comment.get("body")
-    return "", body if isinstance(login, str) and login_eq(login, filer) and isinstance(body, str) else ""
+    body = comment.get("body")
+    return "", body if account_eq(parse_account(author), filer) and isinstance(body, str) else ""
 
 
 def active_workflows(payload, listing) -> frozenset[str] | None:

@@ -12,24 +12,13 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { WARN=$((WARN+1)); printf '  \033[33m⚠\033[0m %s\n' "$1"; }
 bad()  { ERR=$((ERR+1));  printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-# review C1/P1R-6: the ONE place doctor compares GitHub logins. Mirrors
-# domain/identity.py's normalize_login (strip whitespace, casefold, then
-# strip ONE trailing `[bot]` suffix) — a raw `!=` lets `fix-bot` vs
-# `fix-bot[bot]` pass doctor even though they're the SAME GitHub identity in
-# two API surface forms, and GitHub then 422s the self-approval on every PR,
-# forever. The whitespace strip MUST run first: `FIX_BOT='fix-bot '` (a
-# trailing space, e.g. round-tripped through a shell env file) has to lose
-# the space BEFORE the `[bot]`-suffix check, or the two never normalize to
-# the same string and doctor prints "two distinct identities" over a pair
-# that GitHub-side is really the SAME bot with padding (review P1R-6 — this
-# used to defeat the check entirely, reproducing the original C1 symptom).
+# Config and concrete User endpoints retain [bot]; bare names are User accounts (ADR 0001, #481).
 _normalize_login() {
   local l="$1"
-  # trim leading/trailing whitespace (standard bash idiom — no external tools)
   l="${l#"${l%%[![:space:]]*}"}"
   l="${l%"${l##*[![:space:]]}"}"
   l="${l,,}"
-  printf '%s\n' "${l%\[bot\]}"
+  printf '%s\n' "$l"
 }
 
 echo "== tooling =="
@@ -243,9 +232,6 @@ elif [ -n "$(_normalize_login "$FIX_BOT")" ]; then ok "FIX_BOT=$FIX_BOT"
 else bad "FIX_BOT unset"; fi
 
 : "${REVIEW_BOT:=}"
-# FIX must differ from REVIEW (GitHub 422 self-approval). Compared NORMALIZED
-# (review C1) — a raw `!=` would let fix-bot vs fix-bot[bot] (the SAME
-# identity) through.
 _nfix="$(_normalize_login "$FIX_BOT")"
 _nreview="$(_normalize_login "$REVIEW_BOT")"
 # Distinctness is meaningless if the logins are unedited examples — two
@@ -256,7 +242,7 @@ if _is_bad_var FIX_BOT || _is_bad_var REVIEW_BOT; then
 elif [ -n "$REVIEW_BOT" ] && [ "$_nfix" != "$_nreview" ]; then
   ok "two distinct identities (fix=$FIX_BOT, review=$REVIEW_BOT)"
 else
-  bad "REVIEW_BOT must be set and FIX_BOT distinct from it after normalizing ([bot]-suffix-insensitive, case-insensitive)"
+  bad "REVIEW_BOT must be set and FIX_BOT distinct from it after normalizing (case-insensitive)"
 fi
 
 echo "== github access =="

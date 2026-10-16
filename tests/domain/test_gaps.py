@@ -13,6 +13,7 @@ from issue_agent.domain import world as world_module
 from issue_agent.domain.actions import AgentKind, ReportGap
 from issue_agent.domain.backoff import STALL_STREAK, LegEnd
 from issue_agent.domain.gaps import MAX_GAP_BODY, MAX_GAP_TITLE, GapTarget, HarnessGap, parse_harness_gap
+from issue_agent.domain.identity import Account
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import gap_actions
 from issue_agent.domain.state import (
@@ -174,10 +175,10 @@ def _modes():
 def test_a_filed_gap_is_never_picked_up_automatically_in_any_mode_but_a_humans_ai_ready_is_honoured():
     (filed,) = gaps({issue_key(5): (reported(1),)})
     assert filed.title.startswith(HARNESS_GAP_PREFIX)
-    gap = IssueView(41, filed.title, filed.body, author="fix-bot")
+    gap = IssueView(41, filed.title, filed.body, author=Account("User", "fix-bot"))
     for mode in _modes():
         assert derive(WorldState(issues=(gap,), **mode), Local(now=at(10)), H) == {}, mode
-    readied = IssueView(41, filed.title, filed.body, labels=frozenset({Label.AI_READY}), author="fix-bot")
+    readied = IssueView(41, filed.title, filed.body, labels=frozenset({Label.AI_READY}), author=Account("User", "fix-bot"))
     for mode in _modes():
         assert set(derive(WorldState(issues=(readied,), **mode), Local(now=at(10)), H)) == {issue_key(41)}, mode
 
