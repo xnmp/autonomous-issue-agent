@@ -31,6 +31,7 @@ TimeoutStopSec=90
 KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 MemoryMax=4G
+OOMPolicy=continue
 TasksMax=512
 StandardOutput=journal
 StandardError=journal

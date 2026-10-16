@@ -608,16 +608,19 @@ def test_a_hung_run_whose_tail_reads_like_a_drop_keeps_its_timeout_class(tmp_pat
     assert r.exit_reason is ExitReason.IDLE_TIMEOUT
 
 
-def test_run_process_killed_by_signal_is_infra_death_not_an_attempt(tmp_path):
+@pytest.mark.parametrize("supervised", [False, True])
+def test_run_process_killed_by_signal_is_infra_death_not_an_attempt(tmp_path, supervised):
     """FAILURE-MODES #58: codex died `exit -9` six times on one PR (suspected macOS
     jetsam during the Playwright RSS burst) and each death marched the breaker to
     needs-human-review. A NEGATIVE returncode means killed-by-signal and we didn't
     do it, so it is infra, not a failed attempt."""
-    r = _run(tmp_path, "kill -9 $$\n")  # self-SIGKILL → returncode -9
+    supervisor = ProcessSupervisor(str(tmp_path / "sup")) if supervised else None
+    r = _run(tmp_path, "kill -9 $$\n", process_supervisor=supervisor)  # self-SIGKILL → returncode -9
 
     assert r.is_error is True
     assert r.exit_reason is ExitReason.KILLED_EXTERNALLY
     assert infra_death(r.exit_reason) is True
+    assert classify_leg(r) is LegClass.MACHINE
 
 
 # ── total-runtime (wall) cap ─────────────────────────────────────────────────

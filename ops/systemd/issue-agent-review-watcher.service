@@ -50,6 +50,7 @@ KillSignal=SIGTERM
 KillMode=mixed
 FinalKillSignal=SIGKILL
 MemoryMax=4G
+OOMPolicy=continue
 # Every thread counts as a task. Tauri legs (cargo/rustc plus Chromium or
 # WebKit acceptance runs) exceeded 1024 twice on 2026-10-14 with concurrent
 # legs, so the cap is 4096. MemoryMax stays the hard resource bound; this

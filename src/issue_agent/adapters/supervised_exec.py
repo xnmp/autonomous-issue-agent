@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -106,6 +107,12 @@ def _carry_authority_and_exec(
     command: list[str], environment: Mapping[str, str], run_id: str
 ) -> None:
     """Apply ADR 0005: retain ancestor authority and scrub the provider."""
+
+    # Linux-only /proc adjustment is inherited: legs, not the daemon, are OOM
+    # victims (ADR 0005). Absent or restricted /proc leaves launches unchanged.
+    with contextlib.suppress(OSError):
+        with open("/proc/self/oom_score_adj", "w", encoding="utf-8") as stream:
+            stream.write("1000")
 
     prior_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK,
