@@ -609,18 +609,30 @@ def test_a_hung_run_whose_tail_reads_like_a_drop_keeps_its_timeout_class(tmp_pat
 
 
 @pytest.mark.parametrize("supervised", [False, True])
-def test_run_process_killed_by_signal_is_infra_death_not_an_attempt(tmp_path, supervised):
+@pytest.mark.parametrize("body", ["kill -9 $$\n", "kill -15 $$\n", "exit 137\n"])
+def test_run_process_killed_by_signal_is_infra_death_not_an_attempt(tmp_path, supervised, body):
     """FAILURE-MODES #58: codex died `exit -9` six times on one PR (suspected macOS
     jetsam during the Playwright RSS burst) and each death marched the breaker to
-    needs-human-review. A NEGATIVE returncode means killed-by-signal and we didn't
-    do it, so it is infra, not a failed attempt."""
+    needs-human-review. Bubblewrap reports a runtime SIGKILL as exit 137 (#470);
+    both encodings must remain machine deaths through supervision."""
     supervisor = ProcessSupervisor(str(tmp_path / "sup")) if supervised else None
-    r = _run(tmp_path, "kill -9 $$\n", process_supervisor=supervisor)  # self-SIGKILL → returncode -9
+    r = _run(tmp_path, body, process_supervisor=supervisor)
 
     assert r.is_error is True
     assert r.exit_reason is ExitReason.KILLED_EXTERNALLY
     assert infra_death(r.exit_reason) is True
     assert classify_leg(r) is LegClass.MACHINE
+
+
+@pytest.mark.parametrize("supervised", [False, True])
+@pytest.mark.parametrize("exit_code", [1, 136, 138, 143, 255])
+def test_ordinary_nonzero_exit_stays_an_agent_end(tmp_path, supervised, exit_code):
+    supervisor = ProcessSupervisor(str(tmp_path / "sup")) if supervised else None
+    r = _run(tmp_path, f"exit {exit_code}\n", process_supervisor=supervisor)
+
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+    assert classify_leg(r) is LegClass.AGENT
 
 
 # ── total-runtime (wall) cap ─────────────────────────────────────────────────

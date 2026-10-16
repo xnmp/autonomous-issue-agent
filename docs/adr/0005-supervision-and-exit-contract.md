@@ -32,6 +32,14 @@ the aggregate bound, with all leg processes inside the service. On hosts
 without writable `/proc/self/oom_score_adj` (including macOS/launchd and
 restricted containers), launch behaviour is unchanged.
 
+At the Codex classification boundary, exit 137 (`128 + SIGKILL`, as reported
+by bubblewrap for a killed runtime) is the same external machine death as a
+direct SIGKILL, never an agent attempt. Watchdog and budget stops retain their
+own classification; harness drain retains cancellation. Other positive exit
+statuses, including 143, keep their existing classification. The Claude SDK
+already treats pre-result process errors as transport deaths regardless of
+exit status and honours a captured result after a trailing process error.
+
 ## Consequences
 
 After earlyoom SIGTERMed the daemons on 2026-10-16 and their clean exit 0 left

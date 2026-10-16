@@ -674,7 +674,11 @@ def test_a_resumed_leg_that_hangs_before_any_message_keeps_the_resumed_session(m
     assert (r.exit_reason, r.session_id) == (ExitReason.IDLE_TIMEOUT, "s-prior")
 
 
-def test_a_transport_death_after_init_journals_the_session(monkeypatch):
+@pytest.mark.parametrize("exit_code", [-9, 137, 1, 143])
+@pytest.mark.parametrize("with_result", [False, True])
+def test_sdk_process_exit_preserves_transport_or_captured_agent_end(monkeypatch, exit_code, with_result):
+    from claude_agent_sdk import ProcessError
+
     from issue_agent.adapters.journal import JournalingRuntime
 
     class Sink:
@@ -686,16 +690,28 @@ def test_a_transport_death_after_init_journals_the_session(monkeypatch):
         def emit(self, event, fields):
             self.events.append((event, dict(fields)))
 
-    _install_fake_sdk(monkeypatch, [_init({"session_id": "s-died"})], raise_after=True)
+    async def fake_query(prompt, options):
+        yield _init({"session_id": "s-died"})
+        if with_result:
+            yield _ResultMessage(is_error=True, subtype="error_during_execution", session_id="s-died")
+        raise ProcessError("CLI exited", exit_code=exit_code)
+
+    _install_sdk(monkeypatch, fake_query)
     sink = Sink()
     runtime = JournalingRuntime(AgentRunner(), sink, repo="o/r", role="fix")
     runtime.set_context("fix", "RESOLVE", 5, 5)
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(runtime.run(RuntimePlan(prompt="x")))
+    if with_result:
+        result = asyncio.run(runtime.run(RuntimePlan(prompt="x")))
+        assert result.is_error is True
+        assert classify_leg(result) is LegClass.AGENT
+    else:
+        with pytest.raises(ProcessError):
+            asyncio.run(runtime.run(RuntimePlan(prompt="x")))
 
     settled = [f for e, f in sink.events if e == "agent_run"]
-    assert [(f["exit_reason"], f["session_id"]) for f in settled] == [("transport_death", "s-died")]
+    reason = "agent_error" if with_result else "transport_death"
+    assert [(f["exit_reason"], f["session_id"]) for f in settled] == [(reason, "s-died")]
 
 
 # ── #413: every leg launches inside the leg sandbox ─────────────────────────

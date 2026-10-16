@@ -1021,10 +1021,10 @@ class CodexRunner(AgentRuntime):
             result = replace(result, exit_reason=ExitReason.TRANSPORT_DEATH,
                              envelope_subtype=PROVIDER_REFUSED_SUBTYPE,
                              summary=f"provider ended the turn: {provider_failure}")
-        if exit_code < 0:
+        if exit_code < 0 or exit_code == 128 + signal.SIGKILL:
             # A signal we did not send (our kills set `hung`/`budget_stop`):
-            # OOM, an operator kill, a Ctrl-C to the group. Not an attempt.
-            self._log(f"codex: killed by signal {-exit_code} (not by our watchdog) — infra death")
+            # bubblewrap encodes a runtime SIGKILL as exit 137 (ADR 0005).
+            self._log(f"codex: killed externally (exit {exit_code}, not by our watchdog) — infra death")
             result = replace(result, exit_reason=ExitReason.KILLED_EXTERNALLY)
         return result
 
