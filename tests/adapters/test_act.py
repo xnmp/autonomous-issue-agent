@@ -512,12 +512,13 @@ class IssueGateway(Gateway):
         self.writes.append((verb, number, comment))
         if not self.ignore:
             self.issues[number] = IssueView(number, self.issues[number].title, state=state)
+        return Refused(403, "not allowed") if self.ignore else Accepted()
 
-    def close_issue(self, number, reason, comment):
-        self._set("close", number, comment, "closed")
+    def close_issue(self, number, reason, comment=""):
+        return self._set("close", number, comment, "closed")
 
-    def reopen_issue(self, number, comment):
-        self._set("reopen", number, comment, "open")
+    def reopen_issue(self, number, comment=""):
+        return self._set("reopen", number, comment, "open")
 
 
 def test_a_filed_issue_is_confirmed_once_and_a_lagging_search_never_files_it_again(tmp_path):
@@ -605,15 +606,15 @@ def test_close_then_reopen_each_write_once_and_a_replay_in_the_same_state_writes
     for action in (SetIssueState(40, False, "m\ngreen"), SetIssueState(40, False, "m\ngreen"),
                    SetIssueState(40, True, "m\nred again"), SetIssueState(40, True, "m\nred again")):
         act.execute(action)
-    assert gh.writes == [("close", 40, "m\ngreen"), ("reopen", 40, "m\nred again")]
+    assert gh.writes == [("close", 40, ""), ("reopen", 40, "")]
 
 
 @pytest.mark.parametrize("action", [SetIssueState(40, False, "m\ngreen"), SetIssueState(41, True, "m\nred")])
-def test_a_state_change_that_does_not_read_back_raises(tmp_path, action):
+def test_a_refused_state_change_raises(tmp_path, action):
     gh = IssueGateway(ignore=True)
     gh.issues[40] = IssueView(40, "CI: x failing on dev")
     gh.issues[41] = IssueView(41, "CI: y failing on dev", state="closed")
-    with pytest.raises(RuntimeError, match="not confirmed"):
+    with pytest.raises(RuntimeError, match="state refused"):
         _act(tmp_path, gh).execute(action)
 
 

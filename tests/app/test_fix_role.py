@@ -225,14 +225,14 @@ class FakeGitHub:
         self.cancelled.append(run_id)
         return Accepted()
 
-    def close_issue(self, number: int, reason: str, comment: str, *, author: str = FIX_BOT) -> None:
+    def close_issue(self, number: int, reason: str, comment: str = "", *, author: str = FIX_BOT) -> None:
         self.closed.append(number)
         self.closed_times[number] = _now()
         current = self.issues[number]
         comments = (*current.comments, Comment(author, comment, _now())) if comment else current.comments
         self.issues[number] = replace(current, state="closed", comments=comments)
 
-    def reopen_issue(self, number: int, comment: str) -> None:
+    def reopen_issue(self, number: int, comment: str = "") -> None:
         current = self.issues[number]
         comments = (*current.comments, Comment(FIX_BOT, comment, _now()))
         self.issues[number] = replace(current, state="open", comments=comments)

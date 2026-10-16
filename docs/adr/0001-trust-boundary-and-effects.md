@@ -210,3 +210,20 @@ exact account rule. No state, gate, knob or retry mechanism is added. The
 regressions exercise these boundaries offline in `tests/adapters/test_github_identity.py`
 and the existing identity, observation and role tests; live GitHub verification
 is outside this offline change.
+
+
+Amended by #462: close/reopen, relabel, merge and legacy auto-merge revocation
+use the same typed HTTP answer as the other writes; their post-write reads are
+removed. Close/reopen explanations use the existing keyed comment path. Reads
+whose gh diagnostics carry an HTTP status use the write classifier; diagnostic
+matching remains only when gh emitted no status. A merge is REST PUT with the
+decided SHA, never a persistent auto-merge arm. The remote branch deletion formerly
+performed by `gh pr merge --delete-branch` remains best-effort after an answered
+merge; local worktree cleanup and obsolete CI cancellation remain.
+Crash points: the existing pre-reads prevent replay of landed labels and state
+changes; merge is head-bound, and the next world observes a lost merge answer.
+Keyed state comments reuse the comment crash map above. Answered writes need
+no post-write verification, so lagging reads cannot invalidate their receipts
+(`test_github_status.py`, `test_act.py`, `test_operator_effects.py`). Untyped
+GraphQL errors remain NoAnswer: a retry ceiling would add a mechanism and is
+outside this change.

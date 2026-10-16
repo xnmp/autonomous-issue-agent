@@ -70,26 +70,21 @@ def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str, since
 def relabel(
     gateway, kind: str, number: int, *, add: Iterable[str] = (), remove: Iterable[str] = (),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Set labels on one issue or PR, each read back: the one label operation
-    both the fix role and operator writes use. Idempotent by read: a label
-    already present is not re-added, an absent one not removed. Adds go first,
-    so a failure strands "both labels", never an unlabelled item. Returns the
-    labels it actually added and removed; a write that does not read back
-    raises."""
+    """The one label operation for fix and operator writes. A pre-read makes
+    replay idempotent, and GitHub's answer is the receipt. Adds go first, so
+    a refusal strands "both labels", never an unlabelled item."""
     added: list[str] = []
     removed: list[str] = []
     for label in dict.fromkeys(add):
         if not gateway.has_label(kind, number, label):
-            gateway.relabel(kind, number, None, label)
+            if isinstance(answer := gateway.relabel(kind, number, None, label), Refused):
+                raise RuntimeError(f"{kind} #{number}: relabel +{label} refused: {answer.message}")
             added.append(label)
-        if not gateway.has_label(kind, number, label):
-            raise RuntimeError(f"{kind} #{number}: relabel +{label} did not land")
     for label in dict.fromkeys(remove):
         if gateway.has_label(kind, number, label):
-            gateway.relabel(kind, number, label, None)
+            if isinstance(answer := gateway.relabel(kind, number, label, None), Refused):
+                raise RuntimeError(f"{kind} #{number}: relabel -{label} refused: {answer.message}")
             removed.append(label)
-        if gateway.has_label(kind, number, label):
-            raise RuntimeError(f"{kind} #{number}: relabel -{label} did not land")
     return tuple(added), tuple(removed)
 
 
@@ -164,7 +159,7 @@ class GitHubAct:
         self.cancel_runs(f"PR #{action.pr} ({pr.head_ref_name})", pr.head_ref_name, merged_after)
         if not self.gateway.is_issue_closed(issue):
             # A non-default base does not close the issue through `Fixes #N`.
-            self.gateway.close_issue(issue, "completed", f"{self.marker}\nResolved by #{action.pr}.")
+            self.set_issue_state(SetIssueState(issue, False, f"{self.marker}\nResolved by #{action.pr}."))
         try:
             self.remove_worktree(issue)
         except Exception as exc:  # noqa: BLE001 - a stale worktree is disk, not state
@@ -299,12 +294,13 @@ class GitHubAct:
     def set_issue_state(self, action: SetIssueState) -> None:
         if self.gateway.is_issue_closed(action.number) != action.open:
             return
-        if action.open:
-            self.gateway.reopen_issue(action.number, action.comment)
-        else:
-            self.gateway.close_issue(action.number, "completed", action.comment)
-        if self.gateway.is_issue_closed(action.number) == action.open:
-            raise RuntimeError(f"issue #{action.number}: {'reopen' if action.open else 'close'} not confirmed")
+        if action.comment:
+            self.post(PostComment(Target.ISSUE, action.number, action.comment,
+                                  key=f"issue-state:{action.number}:{action.open}"))
+        answer = (self.gateway.reopen_issue(action.number) if action.open else
+                  self.gateway.close_issue(action.number, "completed"))
+        if isinstance(answer, Refused):
+            raise RuntimeError(f"issue #{action.number}: state refused: {answer.message}")
         self.log(f"issue #{action.number}: {'reopened' if action.open else 'closed'}: "
                  f"{' '.join(action.comment.split())[:300]}")
 
