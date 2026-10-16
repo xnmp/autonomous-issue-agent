@@ -39,6 +39,7 @@ from ..domain.run_usage import (
 )
 from ..domain.outcome import (
     AgentResult,
+    SESSION_LIMIT,
     ExitReason,
     PROVIDER_REFUSED_SUBTYPE,
     declared_status,
@@ -131,7 +132,6 @@ def reported_model(msg: Any) -> str:
 
 # A session id is a UUID; anything longer is malformed (ModelUsage's bound in
 # domain/run_usage.py).
-_MAX_SESSION_ID = 256
 
 
 def reported_session(msg: Any) -> str:
@@ -141,7 +141,7 @@ def reported_session(msg: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         data = getattr(msg, "data", None)
         value = data.get("session_id") if isinstance(data, dict) else None
-    if not isinstance(value, str) or not value.strip() or len(value.strip()) > _MAX_SESSION_ID:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > SESSION_LIMIT:
         return ""
     return value.strip()
 

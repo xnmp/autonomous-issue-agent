@@ -58,3 +58,21 @@ Never roll an old copy over charges created after the backup. A retired
 pre-cutover file is never read again, but keep it: if `control.db` is lost with
 no backup, renaming the retired file back (any `-wal`/`-shm` moved aside) cuts
 it over again with its pre-cutover spend, which the refusal message says.
+
+
+Amended by #112: a routed leg returning cleanly without pushed, blocked or
+failed is the existing NO_RESULT cut-off. Its first resumable end follows
+Continue at the same tier; a second cut-off on that continuation counts under
+cut_off_counts unchanged. A nonterminal return with no usable session remains a counted agent end;
+existing wall/budget cut-off receipts retain their interrupted-evidence provenance.
+Session validity uses the same receipt bound at every boundary. Light and review schemas keep their own verdict contracts.
+No counter, receipt field, continuation state or retry path is added.
+Measurement before the change (2026-10-16, journal since 2026-10-13): 64 tauri
+RESOLVE ends, including 48 pushed and 5 blocked; zero clean nonterminal ends.
+The regression still reproduces the old shape on current dev: the next task
+started fresh with resume=None. The end-to-end regression verifies continuation,
+its counted second cut-off, and a published branch taking precedence. Existing
+lease/reserve/result/settle crash handling is unchanged.
+Metric: fresh RESOLVE starts after a clean nonterminal end, adjudicated by the
+next comparable journal sample. Guardrails: attempts remain bounded by the
+existing rule, publication precedence and legitimate human blocks stay intact.

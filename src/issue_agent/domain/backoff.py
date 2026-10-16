@@ -18,7 +18,7 @@ from itertools import takewhile
 from datetime import datetime, timedelta
 
 from .actions import AgentKind
-from .outcome import MACHINE_ENDS
+from .outcome import MACHINE_ENDS, SESSION_LIMIT
 from .routing import Tier
 from .triage import Steward, Triage
 
@@ -29,8 +29,6 @@ _MAX_DOUBLINGS = 6
 # The streak whose wait is the cap: the harness has failed to run the act for
 # over an hour, a harness gap it files about itself (`domain.gaps`).
 STALL_STREAK = _MAX_DOUBLINGS + 1
-# Runtime session ids are UUIDs; a longer one in a receipt is not one.
-SESSION_LIMIT = 128
 
 
 # A recorded kind that is no AgentKind (the deleted ROUTE leg's rows) belongs

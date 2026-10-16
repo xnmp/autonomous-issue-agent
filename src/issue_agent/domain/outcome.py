@@ -21,11 +21,15 @@ import re
 from dataclasses import dataclass, replace
 from enum import Enum
 
+# Runtime session ids share the receipt contract; oversized ids cannot be resumed.
+SESSION_LIMIT = 128
+
 MAX_BUDGET_STATUS = "error_max_budget_usd"
 # Harness-minted by the accounting runtime when a daily repository or global
 # cap has no headroom for the leg's reservation; never read from agent output.
 DAILY_HEADROOM_STATUS = "daily_headroom_exhausted"
 
+from .actions import ROUTED_ACTS
 from .contracts import PricingBasis
 from .run_usage import ModelUsage, RunUsage
 
@@ -96,14 +100,20 @@ MACHINE_ENDS = frozenset({reason.value for reason in ExitReason} | {PROVIDER_REF
 OUTSIDE_ENDS = frozenset({ExitReason.OPERATOR_CANCELLED.value, PROVIDER_REFUSED_SUBTYPE})
 # The cut-off ends: a per-leg cap or the provider ended a live session, which
 # stays resumable. Whether one is an attempt is `domain.attempt.cut_off_counts`.
-CUT_OFF_ENDS = frozenset({ExitReason.WALL_TIMEOUT.value, ExitReason.BUDGET_EXHAUSTED.value, PROVIDER_REFUSED_SUBTYPE})
+CUT_OFF_ENDS = frozenset({ExitReason.WALL_TIMEOUT.value, ExitReason.BUDGET_EXHAUSTED.value,
+                          ExitReason.NO_RESULT.value, PROVIDER_REFUSED_SUBTYPE})
 
 
-def machine_end(result: "AgentResult") -> str:
-    """A machine end's class in MACHINE_ENDS."""
+def machine_end(result: "AgentResult", kind: str = "") -> str:
+    """A machine end's class in MACHINE_ENDS. A routed leg's clean return
+    without a terminal claim did not finish: the existing no-result cut-off.
+    STEWARD, TRIAGE and REVIEW have their own verdict schemas."""
+    if (kind in {act.name for act in ROUTED_ACTS} and result.exit_reason is ExitReason.OK and not result.is_error
+            and result.status not in ("pushed", "blocked", "failed") and resumable_session(result)):
+        return ExitReason.NO_RESULT.value
     if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE:
         return PROVIDER_REFUSED_SUBTYPE
-    return (result.exit_reason or ExitReason.NO_RESULT).value
+    return (result.exit_reason or ExitReason.OK).value
 
 
 # Minted by the accounting runtime when a paid leg is refused BEFORE any run
@@ -179,15 +189,17 @@ class LegClass(str, Enum):
     MACHINE = "machine"
 
 
-def classify_leg(result: "AgentResult") -> LegClass:
+def classify_leg(result: "AgentResult", kind: str = "") -> LegClass:
     """A returned leg's class, as its receipt records it. A cut-off end
     (`CUT_OFF_ENDS`, `machine_end`), an infra failure and an orderly teardown
     are MACHINE; `domain.attempt` counts a cut-off end that was the item's free
     resume, or of a kind that never resumes, as an attempt when the receipt is
     read (#441). The per-issue lifetime cap is not a leg cap: it refuses
     admission and stops for a human."""
-    if (machine_end(result) in CUT_OFF_ENDS or infra_class_failure(result)
-            or result.exit_reason is ExitReason.OPERATOR_CANCELLED):
+    if (machine_end(result, kind) in CUT_OFF_ENDS
+            and (result.exit_reason is not ExitReason.NO_RESULT or resumable_session(result))):
+        return LegClass.MACHINE
+    if infra_class_failure(result) or result.exit_reason is ExitReason.OPERATOR_CANCELLED:
         return LegClass.MACHINE
     if not result.is_error and result.status == "blocked":
         return LegClass.ASKED
@@ -198,7 +210,8 @@ def resumable_session(result: AgentResult) -> str:
     """The session a later leg may resume, or "" when this end left none usable."""
     if infra_class_failure(result) and result.envelope_subtype != PROVIDER_REFUSED_SUBTYPE:
         return ""
-    return result.session_id or ""
+    session = result.session_id
+    return session.strip() if isinstance(session, str) and len(session.strip()) <= SESSION_LIMIT else ""
 
 
 # ── deterministic transport deaths (#13) ──────────────────────────────────────
