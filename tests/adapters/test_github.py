@@ -18,8 +18,6 @@ from issue_agent.adapters.github import (
     GitHubGateway,
     Identity,
     _subprocess_runner,
-    build_close_issue_args,
-    build_enable_auto_merge_args,
     build_relabel_args,
     build_submit_review_args,
     classify_gh_failure,
@@ -147,74 +145,32 @@ def test_write_command_builders_are_pure_contracts():
     # Add BEFORE remove: a permanently failing second call must strand "both
     # labels" (visible to the world build), never a label-less target.
     assert build_relabel_args("o/r", "issue", 5, "ai-ready", "ai-working") == [
-        ["api", "--method", "POST", "repos/o/r/issues/5/labels", "-f", "labels[]=ai-working"],
-        ["api", "--method", "DELETE", "repos/o/r/issues/5/labels/ai-ready"],
+        ["--method", "POST", "repos/o/r/issues/5/labels", "-f", "labels[]=ai-working"],
+        ["--method", "DELETE", "repos/o/r/issues/5/labels/ai-ready"],
     ]
     assert build_relabel_args("o/r", "pr", 171, None, "ai-pr-open") == [
-        ["api", "--method", "POST", "repos/o/r/issues/171/labels", "-f", "labels[]=ai-pr-open"]
+        ["--method", "POST", "repos/o/r/issues/171/labels", "-f", "labels[]=ai-pr-open"]
     ]
     assert build_relabel_args("o/r", "pr", 7, "needs human review?", None) == [
-        ["api", "--method", "DELETE", "repos/o/r/issues/7/labels/needs%20human%20review%3F"]
+        ["--method", "DELETE", "repos/o/r/issues/7/labels/needs%20human%20review%3F"]
     ]
     assert build_relabel_args("o/r", "issue", 5, None, None) is None
-    assert build_close_issue_args("o/r", 5, "completed", "done") == [
-        "issue",
-        "close",
-        "5",
-        "--repo",
-        "o/r",
-        "--reason",
-        "completed",
-        "--comment",
-        "done",
-    ]
-    # gh's CLI vocabulary, not the GraphQL enum: "not_planned" exits 1 (keifu #193).
-    assert build_close_issue_args("o/r", 5, "not_planned", "") == [
-        "issue",
-        "close",
-        "5",
-        "--repo",
-        "o/r",
-        "--reason",
-        "not planned",
-    ]
-    assert build_enable_auto_merge_args("o/r", 100, "squash", "head") == [
-        "pr",
-        "merge",
-        "100",
-        "--repo",
-        "o/r",
-        "--squash",
-        "--delete-branch",
-        "--match-head-commit",
-        "head",
-    ]
 
 
-def test_relabel_runs_the_built_argv_with_the_identity_token_and_skips_a_noop():
-    fr = FakeRunner()
-    GitHubGateway("o/r", Identity(static_token="t"), runner=fr).relabel("issue", 5, "ai-ready", "ai-working")
-    assert fr.calls == [
-        (["gh", "api", "--method", "POST", "repos/o/r/issues/5/labels", "-f", "labels[]=ai-working"], "t"),
-        (["gh", "api", "--method", "DELETE", "repos/o/r/issues/5/labels/ai-ready"], "t"),
+def test_relabel_runs_with_the_identity_token_and_skips_a_noop():
+    calls = []
+    def runner(argv, token):
+        calls.append((argv, token))
+        return _http(200)
+    gateway = GitHubGateway("o/r", Identity(static_token="t"), runner=runner)
+    assert gateway.relabel("issue", 5, "ai-ready", "ai-working") == Accepted()
+    assert calls == [
+        (["gh", "api", "--include", "--method", "POST", "repos/o/r/issues/5/labels", "-f", "labels[]=ai-working"], "t"),
+        (["gh", "api", "--include", "--method", "DELETE", "repos/o/r/issues/5/labels/ai-ready"], "t"),
     ]
-    noop = FakeRunner()
-    GitHubGateway("o/r", runner=noop).relabel("issue", 5, None, None)
-    assert noop.calls == []  # no gh call when there's nothing to add/remove
-
-
-@pytest.mark.parametrize(
-    "probe,merged",
-    [
-        ({"state": "MERGED", "headRefOid": "head"}, True),
-        ({"state": "OPEN", "headRefOid": "head"}, False),
-        (None, False),  # probe returns "" → not armed, never a crash
-        ({"state": "MERGED", "headRefOid": "different-head"}, False),
-    ],
-)
-def test_enable_auto_merge_verifies_exact_head_was_merged(probe, merged):
-    runner = FakeRunner({"pr view 100": probe} if probe else {})
-    assert GitHubGateway("o/r", runner=runner).enable_auto_merge(100, "squash", "head") is merged
+    calls.clear()
+    assert gateway.relabel("issue", 5, None, None) == Accepted()
+    assert calls == []
 
 
 def _http(status: int, body: object = None, **headers: str) -> str:
@@ -253,12 +209,13 @@ def test_update_branch_no_longer_swallows_github_not_answering():
 
 
 def test_update_branch_refuses_to_advance_when_legacy_arm_cannot_be_revoked():
-    fr = FakeRunner({"pr view 100": {"autoMergeRequest": {"enabledAt": "now"}, "headRefOid": "head"}})
+    fr = FakeRunner({"pr view 100": {"id": "PR_node", "autoMergeRequest": {"enabledAt": "now"}, "headRefOid": "head"},
+                     "api --include graphql": _http(200, {"errors": [{"type": "FORBIDDEN", "message": "refused"}]})})
 
     assert GitHubGateway("o/r", runner=fr).update_branch(100, "head") is False
 
-    assert any("--disable-auto" in argv for argv, _ in fr.calls)
-    assert not any(argv[1] == "api" for argv, _ in fr.calls)
+    assert any("pr=PR_node" in argv for argv, _ in fr.calls)
+    assert not any("repos/o/r/pulls/100/update-branch" in argv for argv, _ in fr.calls)
 
 
 def test_viewer_login_names_the_identity_the_credential_acts_as():

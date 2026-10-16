@@ -125,7 +125,7 @@ def parse_write_answer(out: str, receipt: str = "", argv: list[str] | None = Non
     if status == 401:
         raise GhUnavailable("auth", message, argv)
     retry_after = _retry_after(head)
-    if (status >= 400 or errors) and (status == 429 or "rate limit" in message.lower()
+    if (status >= 400 or errors) and (status == 429 or any(p in message.lower().replace("-", " ") for p in ("rate limit", "ratelimit remaining: 0", "abuse detection"))
                                       or status == 403 and retry_after is not None):
         raise GhUnavailable("rate-limit", message, argv, retry_after_s=retry_after)
     # GitHub types a GraphQL refusal (NOT_FOUND, FORBIDDEN, ...); an untyped
@@ -143,42 +143,32 @@ def _one_line(text: str, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
-# Lower-cased substrings that mark a failed `gh` call as INFRA. A non-zero exit
-# is ALSO how gh reports "PR not found", "label does not exist" and a 422
-# self-approval, and those must keep degrading to "". A bare HTTP 403 is not
-# infra ("Resource not accessible by integration" is a permanent answer).
-_AUTH_PATTERNS = ("http 401", "requires authentication", "bad credentials")
-_RATE_LIMIT_PATTERNS = ("rate limit", "rate-limit", "ratelimit", "secondary rate", "abuse detection",
-                        "http 429", "too many requests", "retry-after")
-# "could not resolve HOST": gh's GraphQL "Could not resolve to a PullRequest"
-# is an answer, not an outage.
-_NETWORK_PATTERNS = ("error connecting", "could not resolve host", "could not resolve hostname", "no such host",
-                     "temporary failure in name resolution", "connection refused", "connection reset",
-                     "network is unreachable", "dial tcp", "tls handshake", "proxyconnect", "i/o timeout",
-                     "timed out", "timeout")
-_SERVER_PATTERNS = ("bad gateway", "service unavailable", "gateway timeout", "gateway time-out",
-                    "internal server error")
-_LOCAL_RESOURCE_PATTERNS = ("pthread_create failed", "resource temporarily unavailable",
-                            "failed to create new os thread", "fatal error: newosproc", "cannot allocate memory",
-                            "out of memory")
-# Only next to "HTTP": a bare "502" may be an issue number.
-_SERVER_RE = re.compile(r"http[/ ]?\s*5\d\d")
-
-
 def classify_gh_failure(detail: str) -> str | None:
-    """The infra kind of a failed `gh` call's output, or None for an ordinary
-    API answer. Server before network: "504 Gateway Timeout" contains "timeout"."""
+    """Fallback for gh commands without HTTP headers; an HTTP answer uses
+    the same classifier as typed writes, ahead of diagnostic text."""
+    if status := re.search(r"\bHTTP(?:/\S+)? (\d{3})\b", detail):
+        try:
+            headers = f"Retry-After: {delay}\n" if (delay := _retry_after(detail)) is not None else ""
+            parse_write_answer(f"HTTP/2.0 {status[1]}\n{headers}\n" + json.dumps({"message": detail}))
+        except GhUnavailable as exc:
+            return exc.kind
+        return None
     text = (detail or "").lower()
-    if any(p in text for p in _AUTH_PATTERNS):
+    if any(p in text for p in ("bad credentials", "requires authentication")):
         return "auth"
-    if any(p in text for p in _RATE_LIMIT_PATTERNS):
+    if any(p in text for p in ("rate limit", "rate-limit", "ratelimit", "secondary rate", "abuse detection",
+                               "too many requests", "retry-after")):
         return "rate-limit"
-    if _SERVER_RE.search(text) or any(p in text for p in _SERVER_PATTERNS):
-        return "server"
-    if any(p in text for p in _NETWORK_PATTERNS):
-        return "network"
-    if any(p in text for p in _LOCAL_RESOURCE_PATTERNS):
+    if any(p in text for p in ("pthread_create failed", "resource temporarily unavailable", "newosproc",
+                               "failed to create new os thread", "cannot allocate memory", "out of memory")):
         return "local-resource"
+    if any(p in text for p in ("bad gateway", "service unavailable", "gateway timeout", "gateway time-out",
+                               "internal server error")):
+        return "server"
+    if any(p in text for p in ("error connecting", "could not resolve host", "no such host", "connection refused",
+                               "connection reset", "network is unreachable", "dial tcp", "tls handshake",
+                               "proxyconnect", "timeout", "timed out", "temporary failure in name resolution")):
+        return "network"
     return None
 
 
@@ -675,27 +665,15 @@ def build_relabel_args(
     ADD BEFORE REMOVE: if the second call fails permanently, "both labels"
     stays visible to the world build, while "no label" would be invisible
     forever. A DELETE of an absent label 404s; membership verification treats
-    that end state as success."""
+    the pre-read avoids that write."""
     if not remove and not add:
         return None
     commands: list[list[str]] = []
     if add:
-        commands.append(["api", "--method", "POST", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={add}"])
+        commands.append(["--method", "POST", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={add}"])
     if remove:
-        commands.append(["api", "--method", "DELETE", f"repos/{repo}/issues/{number}/labels/{quote(remove, safe='')}"])
+        commands.append(["--method", "DELETE", f"repos/{repo}/issues/{number}/labels/{quote(remove, safe='')}"])
     return commands
-
-
-def build_close_issue_args(repo: str, number: int, reason: str, comment: str) -> list[str]:
-    # `gh issue close --reason` wants "not planned", not the GraphQL enum
-    # "not_planned" (keifu #193 sat labelled ai-closed but open for it).
-    args = ["issue", "close", str(number), "--repo", repo, "--reason", reason.replace("_", " ")]
-    return args + ["--comment", comment] if comment else args
-
-
-def build_enable_auto_merge_args(repo: str, pr: int, method: str, expected_head: str) -> list[str]:
-    return ["pr", "merge", str(pr), "--repo", repo, f"--{method}", "--delete-branch",
-            "--match-head-commit", expected_head]
 
 
 @dataclass(frozen=True)
@@ -1029,8 +1007,8 @@ class GitHubGateway:
         return self._write(["--method", "POST", f"repos/{self.repo}/issues", "-f", f"title={title}",
                             "-f", f"body={body}"], "number")
 
-    def reopen_issue(self, number: int, comment: str) -> None:
-        self._gh(["issue", "reopen", str(number), "--repo", self.repo, "--comment", comment])
+    def reopen_issue(self, number: int) -> Accepted | Refused:
+        return self._write(["--method", "PATCH", f"repos/{self.repo}/issues/{number}", "-f", "state=open"])
 
     def issue_index(self, limit: int = 300, author: str = "") -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
         """(number, state, title, harness labels) of the repository's most
@@ -1089,9 +1067,13 @@ class GitHubGateway:
         return self._write(build_submit_review_args(self.repo, pr, event, body, head), "id")
 
     # ── writes ──
-    def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> None:
+    def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> Accepted | Refused:
+        answer: Accepted | Refused = Accepted()
         for args in build_relabel_args(self.repo, kind, number, remove, add) or []:
-            self._gh(args)
+            answer = self._write(args)
+            if isinstance(answer, Refused):
+                break
+        return answer
 
     def has_label(self, kind: str, number: int, label: str) -> bool:
         data = self._view(kind, number, "labels")
@@ -1139,35 +1121,41 @@ class GitHubGateway:
         return self._write(["--method", "POST", f"repos/{self.repo}/issues/{number}/comments", "-f", f"body={body}"],
                            "id")
 
-    def close_issue(self, number: int, reason: str, comment: str) -> None:
-        self._gh(build_close_issue_args(self.repo, number, reason, comment))
+    def close_issue(self, number: int, reason: str) -> Accepted | Refused:
+        return self._write(["--method", "PATCH", f"repos/{self.repo}/issues/{number}",
+                            "-f", "state=closed", "-f", f"state_reason={reason.replace(' ', '_')}"])
 
-    def _without_auto_merge(self, pr: int, expected_head: str) -> bool:
+    def _without_auto_merge(self, pr: int, expected_head: str) -> dict | None:
         """Revoke any legacy GitHub auto-merge arm before a write that can
         advance the head: an armed approval survives later pushes."""
-        data = self._view("pr", pr, "autoMergeRequest,headRefOid")
+        data = self._view("pr", pr, "id,autoMergeRequest,headRefOid,headRefName,isCrossRepository")
         if not isinstance(data, dict) or data.get("headRefOid") != expected_head:
-            return False
-        if data.get("autoMergeRequest") is None:
-            return True
-        self._gh(["pr", "merge", str(pr), "--repo", self.repo, "--disable-auto"])
-        verified = self._view("pr", pr, "autoMergeRequest,headRefOid")
-        return (isinstance(verified, dict) and verified.get("headRefOid") == expected_head
-                and verified.get("autoMergeRequest") is None)
+            return None
+        if data.get("autoMergeRequest") is not None and isinstance(self._write(["graphql", "-f",
+            "query=mutation($pr:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$pr}){pullRequest{id}}}",
+            "-f", f"pr={data.get('id', '')}"]), Refused):
+            return None
+        return data
 
     def enable_auto_merge(self, pr: int, method: str, expected_head: str) -> bool:
         """Merge only the observed, review-and-CI-qualified head, now (the name
-        is historical; persistent auto-merge is never armed). True iff the
-        expected head is read back as merged."""
-        if not self._without_auto_merge(pr, expected_head):
+        is historical; persistent auto-merge is never armed). GitHub's answer
+        is the receipt; an unknown outcome is observed on the next tick."""
+        if not (target := self._without_auto_merge(pr, expected_head)):
             return False
-        self._gh(build_enable_auto_merge_args(self.repo, pr, method, expected_head))
-        try:
-            data = self._view("pr", pr, "state,headRefOid")
-        except Exception:  # noqa: BLE001 — unreadable is not confirmed
+        if isinstance(self._write(["--method", "PUT", f"repos/{self.repo}/pulls/{pr}/merge",
+                                   "-f", f"sha={expected_head}", "-f", f"merge_method={method}"]), Refused):
             return False
-        return (isinstance(data, dict) and data.get("headRefOid") == expected_head
-                and str(data.get("state") or "").upper() == "MERGED")
+        # As with gh pr merge --delete-branch, cleanup failure cannot undo a
+        # merge. Leaving every fix ref eventually exhausts the observation bound.
+        if target.get("isCrossRepository") is False and (branch := target.get("headRefName")):
+            try:
+                answer = self._write(["--method", "DELETE", f"repos/{self.repo}/git/refs/heads/{quote(branch, safe='')}"])
+                if isinstance(answer, Refused):
+                    sys.stderr.write(f"PR #{pr}: merged; branch deletion refused: {answer.message}\n")
+            except GhUnavailable as exc:
+                sys.stderr.write(f"PR #{pr}: merged; branch deletion unavailable: {exc}\n")
+        return True
 
     def branch_runs(self, branch: str) -> tuple[tuple[int, str, str], ...]:
         """(id, status, created-at) of the newest workflow runs on
