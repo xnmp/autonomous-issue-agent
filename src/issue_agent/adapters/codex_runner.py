@@ -427,8 +427,12 @@ def read_rollout_usage(
             if info is None:
                 continue
             total = info.get("total_token_usage") if isinstance(info, dict) else None
-            if not (isinstance(total, dict) and type(total.get("input_tokens")) is int
-                    and type(total.get("output_tokens")) is int):
+            if not (isinstance(total, dict)
+                    and all(type(v) is int and 0 <= v <= 10**12 for v in (
+                        total.get("input_tokens"), total.get("output_tokens"),
+                        total.get("cached_input_tokens", 0), total.get("cache_write_input_tokens", 0)))
+                    and total.get("cached_input_tokens", 0) + total.get("cache_write_input_tokens", 0)
+                    <= total["input_tokens"]):
                 raise MalformedRolloutCounters("token_count record without parseable totals")
             found = total
         if found is None:
@@ -813,10 +817,10 @@ class CodexRunner(AgentRuntime):
             sid = _session()
             try:
                 usage = read_rollout_usage(sid, codex_home) if sid else None
+                return usage_delta(usage, baseline[1]) if baseline is not None and sid == baseline[0] else usage
             except MalformedRolloutCounters as exc:
                 malformed = str(exc)
                 return None
-            return usage_delta(usage, baseline[1]) if baseline is not None and sid == baseline[0] else usage
 
         def _over_budget(now: float) -> bool:
             """Sampled once per slice: each sample globs and reads the rollout,

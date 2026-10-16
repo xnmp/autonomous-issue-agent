@@ -956,6 +956,35 @@ def test_a_parsed_counter_record_with_invalid_totals_fails_closed(tmp_path, reco
         read_rollout_usage("bad", codex_home=str(tmp_path))
 
 
+@pytest.mark.parametrize("key", ["input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens"])
+@pytest.mark.parametrize("value", [-1, 10**12 + 1, "x", None, True, 1.5])
+def test_invalid_counter_cannot_erase_earlier_rollout_spend(tmp_path, key, value):
+    totals = {"input_tokens": 100, "output_tokens": 20, key: value}
+    _rollout_with(tmp_path, "bad", _totals(100, 0, 0, 20), _token_count({"total_token_usage": totals}))
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("bad", codex_home=str(tmp_path))
+
+
+@pytest.mark.parametrize("cached,written", [(101, 0), (0, 101), (60, 41)])
+def test_cache_totals_exceeding_inclusive_input_fail_closed(tmp_path, cached, written):
+    _rollout_with(tmp_path, "bad", _totals(100, cached, written, 20))
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("bad", codex_home=str(tmp_path))
+
+
+@pytest.mark.parametrize("inputs,cached,written,outputs", [(0, 0, 0, 0), (10**12, 10**12, 0, 10**12),
+                                                        (10**12, 0, 10**12, 0)])
+def test_rollout_counter_bounds_are_inclusive(tmp_path, inputs, cached, written, outputs):
+    _rollout_with(tmp_path, "bounds", _totals(inputs, cached, written, outputs))
+    assert read_rollout_usage("bounds", codex_home=str(tmp_path)) == {
+        "input_tokens": inputs,
+        "output_tokens": outputs,
+        "cache_read_input_tokens": cached,
+        "cache_creation_input_tokens": written,
+        "source": "rollout",
+    }
+
+
 def test_a_counter_record_without_counters_yet_is_skipped(tmp_path):
     """codex emits `info: null` token_count records (rate-limit snapshots)."""
     _rollout_with(
@@ -991,6 +1020,45 @@ def test_a_run_whose_counters_are_malformed_ends_as_an_agent_attempt(tmp_path):
     assert classify_leg(r) is LegClass.AGENT
     assert "malformed" in r.summary
     assert r.cost_usd == 3.0  # the reservation's maximum, never zero
+
+
+@pytest.mark.parametrize("resume", [False, True], ids=["fresh", "resumed"])
+@pytest.mark.parametrize("invalid", [
+    {"cached_input_tokens": -1},
+    {"output_tokens": 10**12 + 1},
+    {"cached_input_tokens": "x"},
+    {"cached_input_tokens": 101},
+    {"cache_write_input_tokens": 101},
+    {"cached_input_tokens": 60, "cache_write_input_tokens": 41},
+])
+def test_invalid_rollout_counters_charge_the_maximum(tmp_path, resume, invalid):
+    if resume:
+        _rollout_with(tmp_path, "sess-bad", _totals(50, 0, 0, 10))
+    bad = _token_count({"total_token_usage": {"input_tokens": 100, "output_tokens": 20, **invalid}})
+    result = _run(
+        tmp_path,
+        _meta("sess-bad") + _rollout_append("sess-bad", _totals(100, 0, 0, 20))
+        + _rollout_append("sess-bad", bad) + _OPENED,
+        rate_table=CARD,
+        plan=RuntimePlan(prompt="x", resume="sess-bad" if resume else None, max_budget_usd=3),
+    )
+    assert result.exit_reason is ExitReason.AGENT_ERROR
+    assert "malformed" in result.summary
+    assert result.cost_usd == 3.0
+
+
+@pytest.mark.parametrize("resume,expected", [(False, 0.0011), (True, 0.0007)])
+def test_valid_rollout_counters_still_price_normally(tmp_path, resume, expected):
+    if resume:
+        _rollout_with(tmp_path, "sess-valid", _totals(20, 0, 0, 10))
+    result = _run(
+        tmp_path,
+        _meta("sess-valid") + _rollout_append("sess-valid", _totals(100, 0, 0, 20)) + _OPENED,
+        rate_table=CARD,
+        plan=RuntimePlan(prompt="x", resume="sess-valid" if resume else None, max_budget_usd=3),
+    )
+    assert result.status == "pr_opened"
+    assert result.cost_usd == pytest.approx(expected)
 
 
 def test_usage_delta_subtracts_the_already_ledgered_baseline():
