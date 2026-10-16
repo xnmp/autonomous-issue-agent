@@ -731,12 +731,17 @@ def test_a_machine_death_after_the_answer_keeps_the_answer(role, later):
     assert retried.resume == "s-q" and gh.issues[5].comments[-1].url in retried.prompt
 
 
-def test_342_the_agents_own_mid_leg_comment_is_not_the_reply_and_a_later_one_is(role, later):
-    # tauri #1102: FIX_BOT is the operator's login. A PR-stage leg posts
-    # progress unmarked, then wall-caps; its continuation must not be handed
-    # that comment as the human's answer. A comment after the leg ends is.
+@pytest.mark.parametrize("operator", [FIX_BOT, "xnmp"], ids=["shared-login", "separate-login"])
+@pytest.mark.parametrize("target", ["issue", "pr"])
+def test_342_the_agents_own_mid_leg_comment_is_not_the_reply_and_a_later_one_is(role, later, operator, target):
+    # tauri #1102: unmarked progress before a wall cap cannot answer the
+    # resulting block, even when FIX_BOT and the operator share a User login.
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, ci="fail")
+    if target == "pr":
+        open_pr(gh, ci="fail")
+    number = 100 if target == "pr" else 5
+    subjects = gh.prs if target == "pr" else gh.issues
+    kind = AgentKind.FIX_CI if target == "pr" else AgentKind.RESOLVE
 
     def posts_then_caps(task):
         # What supervised_exec does once the provider process exists: the leg
@@ -746,25 +751,40 @@ def test_342_the_agents_own_mid_leg_comment_is_not_the_reply_and_a_later_one_is(
             RunId(env["ISSUE_AGENT_RUN_ID"]), expected_owner_id=env["ISSUE_AGENT_OWNER_ID"],
             pid=999_999, pgid=999_999, process_start_ticks=1,
         )
-        gh.comment("pr", 100, "Progress report: still red after the retry.", author=FIX_BOT)
+        gh.comment(target, number, "Progress report: still red after the retry.", author=FIX_BOT)
         time.sleep(0.01)  # the leg's end is stamped in whole milliseconds
         return _capped(task)
 
-    agent = Agent(asked("Mock the clock or the network?", session="s-q"), posts_then_caps, did_nothing("s-wall"))
+    agent = Agent(asked("Mock the clock or the network?", session="s-q"), posts_then_caps,
+                  asked("Which timezone?", session="s-wall"), asked("Which locale?", session="s-wall"))
     composed, _ = role(gh, agent)
-    assert dispatched(tick(composed), AgentKind.FIX_CI)  # asks
+    assert dispatched(tick(composed), kind)  # asks
     tick(composed)  # stops with the question
-    gh.comment("pr", 100, "Mock the clock.", author=FIX_BOT)
+    gh.comment(target, number, "Mock the clock.", author=operator)
     tick(composed)  # released
-    assert Label.NEEDS_HUMAN not in gh.prs[100].labels
-    assert dispatched(tick(composed), AgentKind.FIX_CI)  # posts, then the wall cap
-    gh.comment("pr", 100, "Also pin the timezone.", author=FIX_BOT)
+    assert Label.NEEDS_HUMAN not in subjects[number].labels
+    assert dispatched(tick(composed), kind)  # posts, then the wall cap
+    assert tick(composed) == []  # the capped leg's continuation waits for backoff
+    assert len(agent.tasks) == 2
+    gh.comment(target, number, "Also pin the timezone.", author=operator)
     later()
-    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    assert len(dispatched(tick(composed), kind)) == 1
     continued = agent.tasks[2].prompt
-    urls = {c.body: c.url for c in gh.prs[100].comments}
+    urls = {c.body: c.url for c in subjects[number].comments}
     assert urls["Mock the clock."] in continued  # the answer it points at
     assert urls["Progress report: still red after the retry."] not in continued
+    tick(composed)  # the resumed agent asks another question
+    assert tick(composed) == []
+    assert Label.NEEDS_HUMAN in subjects[number].labels
+    assert len(agent.tasks) == 3
+    gh.comment(target, number, "UTC.", author=operator)
+    tick(composed)
+    assert Label.NEEDS_HUMAN not in subjects[number].labels
+    assert len(dispatched(tick(composed), kind)) == 1
+    assert subjects[number].comments[-1].url in agent.tasks[3].prompt
+    tick(composed)
+    assert tick(composed) == []
+    assert len(agent.tasks) == 4
 
 
 def test_a_human_closed_pr_is_reopened_once_the_agent_pushes_again(role):
