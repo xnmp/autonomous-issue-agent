@@ -35,9 +35,11 @@ have one; keep your context for reasoning, design and code.
    line names, and cite `ADR <id>` in your summary.
    If `docs/architecture-pressure.md` exists and your change touches a listed seam, read that entry.
 5. Test first: write the failing tests, run them and confirm they fail for the
-   right reason, then implement until they pass. Keep the whole suite green; no
-   harness hook checks this, but the repo's required CI does and the independent
-   reviewer judges whether your tests prove the change.
+   right reason, then implement until they pass. Run your new tests and the tests
+   covering the code you touched, using the repo's affected-test tools where
+   available (`vitest related`, per-crate `cargo test`, matching Playwright specs).
+   Honor explicit repository test requirements. CI runs the full suite; the
+   independent reviewer judges whether your tests prove the change.
    Check for commitlint/commit-msg hooks before the first commit and follow them.
 6. For UI-facing changes, commit screenshots from the running app in `evidence/`,
    each at most 700KB; the reviewer judges whether they show the changed behavior.
@@ -47,7 +49,7 @@ have one; keep your context for reasoning, design and code.
    re-capture only the affected ones, and keep each image mapped to its criterion
    in the PR body.
 7. `docs:` update folder `CLAUDE.md` with non-obvious learnings.
-8. Publish first: once your tests pass and the suite is green, commit and push
+8. Publish first: once the tests covering your change pass, commit and push
    (step 9) before any further review or polish, so a leg that is stopped later
    still leaves its fix published (tauri #1051 and #795 finished their fix, then
    lost it unpushed to more review rounds). Then review: have one fresh-context
@@ -61,7 +63,8 @@ have one; keep your context for reasoning, design and code.
    Fix each finding, re-verify, including what the fix itself may break, and
    push the fixes; re-capture any `evidence/` screenshot a fix changed. One
    review round is enough: the independent reviewer is the next one, so do not
-   start another.
+   start another. Report exactly which tests you ran; never claim the full suite
+   passed from a subset. CI remains the full, independent gate.
 9. Publish with plain git: commit, then `git push origin <your branch>`
    (`--force-with-lease` only after a rebase). Never run `gh pr create`: the
    harness opens the pull request from your pushed branch against
