@@ -22,7 +22,7 @@ import signal
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Iterator, Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any
@@ -355,9 +355,51 @@ class MalformedRolloutCounters(ValueError):
     nothing can price the leg, so its live budget cannot hold."""
 
 
+def _starts_turn(raw: str) -> bool:
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return False
+    payload = event.get("payload") if isinstance(event, dict) else None
+    return (isinstance(payload, dict) and event.get("type") == "event_msg"
+            and payload.get("type") == "task_started" and isinstance(payload.get("turn_id"), str)
+            and bool(payload["turn_id"].strip()) and _rollout_timestamp(event.get("timestamp")) is not None)
+
+
+def _incomplete_json(raw: str) -> bool:
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if exc.pos == len(raw) or exc.msg.startswith("Unterminated string"):
+            return True
+        # A truncated literal, exponent or unicode escape reports before EOF.
+        # Completing only that token must leave a valid prefix, not hide corruption.
+        tail = raw[exc.pos:]
+        suffix = next((word[len(tail):] for word in ("null", "true", "false") if tail and word.startswith(tail)),
+                      "00000" if exc.msg == r"Invalid \uXXXX escape" else "0")
+        repaired = raw + suffix
+        try:
+            json.loads(repaired)
+        except json.JSONDecodeError as end:
+            return end.pos == len(repaired) or end.msg.startswith("Unterminated string")
+        except ValueError:
+            return False
+        return True
+    except ValueError:
+        return False
+    return False
+
+
+def _interrupted_record(line: str, following: Iterator[str]) -> bool:
+    prefix, separator, tail = line.rpartition('{"timestamp":')
+    resumed = bool(prefix) and _starts_turn(separator + tail)
+    return _incomplete_json((prefix if resumed else line).rstrip()) and (resumed or _starts_turn(next(following, "")))
+
+
 def _rollout_events(session_id: str, codex_home: str | None, marker: str, *, strict: bool = False):
     """Parsed rollout events whose line contains `marker`. An unparseable line
-    skips, or under `strict` raises once complete (codex may be mid-write)."""
+    skips, or under `strict` raises unless interrupted at EOF or a new turn
+    (#277; ADR 0002). A resumed writer may append without first adding a newline."""
     path = _rollout_path(session_id, codex_home)
     if path is None:
         return
@@ -366,9 +408,13 @@ def _rollout_events(session_id: str, codex_home: str | None, marker: str, *, str
             if marker not in line:
                 continue
             try:
-                event = json.loads(line)
+                raw = line.lstrip()
+                event, end = json.JSONDecoder().raw_decode(raw)
+                if raw[end:].strip() and not _starts_turn(raw[end:]):
+                    raise ValueError("extra data after rollout record")
             except ValueError:
-                if strict and line.endswith("\n"):
+                if (strict and line.endswith("\n")
+                        and not _interrupted_record(line, f)):
                     raise MalformedRolloutCounters(f"unparseable {marker} record") from None
                 continue
             payload = event.get("payload") if isinstance(event, dict) else None

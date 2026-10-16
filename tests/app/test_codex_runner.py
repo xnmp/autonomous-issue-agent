@@ -1304,3 +1304,80 @@ def test_a_codex_leg_the_sandbox_refuses_never_spawns(tmp_path):
 def test_a_sandboxed_codex_runner_without_a_process_supervisor_is_a_wiring_error(tmp_path):
     with pytest.raises(ValueError):
         CodexRunner(codex_bin="codex", leg_sandbox=_codex_sandbox(tmp_path))
+
+
+def _resumed_turn_start(**changes):
+    return json.dumps({"timestamp": "2026-10-16T00:00:01Z", "type": "event_msg",
+                       "payload": {"type": "task_started", "turn_id": "next-turn"}, **changes})
+
+
+@pytest.mark.parametrize("separator", ["\n", ""])
+def test_a_partial_counter_before_a_resumed_turn_does_not_poison_later_usage(tmp_path, separator):
+    before = json.loads(_totals(100, 0, 0, 10))
+    before["timestamp"] = "2026-10-16T00:00:00Z"
+    after = json.loads(_totals(300, 0, 0, 30))
+    after["timestamp"] = "2026-10-16T00:00:02Z"
+    _rollout_with(tmp_path, "resumed", json.dumps(before),
+                  '{"payload":{"type":"token_count"' + separator + _resumed_turn_start(), json.dumps(after))
+    assert read_rollout_usage("resumed", str(tmp_path))["input_tokens"] == 300
+    assert read_rollout_usage("resumed", str(tmp_path),
+                              until=datetime(2026, 10, 16, tzinfo=timezone.utc).timestamp())["input_tokens"] == 100
+
+
+@pytest.mark.parametrize("next_record", [
+    "not json", "null", "[]", json.dumps({"type": "task_started"}),
+    _resumed_turn_start(type="response_item"), _resumed_turn_start(timestamp="bad"),
+    _resumed_turn_start(payload={"type": "task_started", "turn_id": ""}),
+    _totals(300, 0, 0, 30),
+], ids=["garbage", "null", "array", "wrong-shape", "wrong-event", "bad-time", "missing-turn", "counter"])
+def test_an_unparseable_counter_without_a_real_next_turn_still_fails_closed(tmp_path, next_record):
+    _rollout_with(tmp_path, "bad", '{"payload":{"type":"token_count"', next_record)
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("bad", str(tmp_path))
+
+
+def test_a_parseable_invalid_counter_is_not_an_interrupted_write_even_before_a_new_turn(tmp_path):
+    _rollout_with(tmp_path, "bad", _token_count({"total_token_usage": {"input_tokens": "100", "output_tokens": 2}}),
+                  _resumed_turn_start(), _totals(300, 0, 0, 30))
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("bad", str(tmp_path))
+
+
+@pytest.mark.parametrize("broken", [
+    '{"type":"event_msg","payload":{"type":"token_count","info":INVALID}}',
+    '{"payload":{"type":"token_count"}} garbage',
+    'garbage "token_count"',
+])
+@pytest.mark.parametrize("separator", ["\n", ""])
+def test_complete_counter_corruption_before_a_new_turn_still_fails_closed(tmp_path, broken, separator):
+    _rollout_with(tmp_path, "bad", broken + separator + _resumed_turn_start(), _totals(300, 0, 0, 30))
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("bad", str(tmp_path))
+
+
+@pytest.mark.parametrize("separator", ["\n", ""])
+def test_a_native_counter_can_be_interrupted_at_any_byte_before_resume(tmp_path, separator):
+    record = json.loads(_totals(200, 0, 0, 20))
+    record["payload"]["rate_limits"] = {"limit_name": None, "used_percent": 46.3, "credits": {
+        "has_credits": True, "unlimited": False, "balance": 4.6e+20, "name": "\u4f60"}}
+    raw = json.dumps(record)
+    for end in range(1, len(raw)):
+        _rollout_with(tmp_path, "cut", _totals(100, 0, 0, 10),
+                      raw[:end] + separator + _resumed_turn_start(), _totals(300, 0, 0, 30))
+        assert read_rollout_usage("cut", str(tmp_path))["input_tokens"] == 300, (end, raw[:end])
+
+
+def test_a_complete_counter_followed_by_resume_without_a_newline_keeps_its_usage(tmp_path):
+    _rollout_with(tmp_path, "complete", _totals(200, 0, 0, 20) + _resumed_turn_start())
+    assert read_rollout_usage("complete", str(tmp_path))["input_tokens"] == 200
+
+
+@pytest.mark.parametrize("after", ["", "\n", "resumed"], ids=["complete", "next-line-resume", "concatenated-resume"])
+def test_a_complete_counter_beyond_pythons_integer_bound_still_fails_closed(tmp_path, after):
+    record = '{"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":' + "9" * 5000 +              ',"output_tokens":2}}}}'
+    suffix = "" if not after else after if after == "\n" else ""
+    if after:
+        suffix += _resumed_turn_start()
+    _rollout_with(tmp_path, "huge", record + suffix)
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("huge", str(tmp_path))

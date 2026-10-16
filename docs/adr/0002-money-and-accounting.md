@@ -118,3 +118,22 @@ an accounting hold or a human-review escalation.
 - Rate-card identity/version is historical evidence and cannot be rewritten.
 - Lowering a cap blocks future admission; it does not alter settled history.
 - JSONL spend output is a projection, never admission authority.
+
+## Amendment (2026-10-16, #277): interrupted rollout records after resume
+
+A Codex resume can append a native `event_msg/task_started` after a killed
+writer's incomplete JSON record, with or without an intervening newline.
+That incomplete prefix is treated as the same interrupted evidence as an
+unparseable tail. The boundary must parse as a native task start with a valid
+timestamp and nonempty turn id; the damaged prefix must end at an incomplete
+JSON token or delimiter. Complete syntax corruption and parseable malformed
+counter values still fail closed, even before a new turn. No tokens are
+invented for the interrupted write.
+
+Usage after resume and recovery share this reader. Recovery still excludes
+counters after the killed leg's recorded end, so resuming before recovery
+cannot charge the later leg to the earlier one. Tests in
+`tests/app/test_codex_runner.py` cover both append forms, invalid turn starts,
+complete corruption and malformed counters; `tests/adapters/test_spend_recovery.py`
+asserts the settled charge and released reservation after a later resume.
+No accounting schema, state, retry or configuration is added.

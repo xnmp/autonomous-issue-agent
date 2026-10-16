@@ -349,3 +349,14 @@ def test_recovery_never_settles_without_the_runs_recorded_end(tmp_path):
 
     assert store.active_reservation_runs(OWNER) == (run_id,)
     assert store.snapshot(scope).settled == Money("USD", 0)
+
+
+def test_a_resumed_turn_after_a_partial_write_does_not_change_the_killed_legs_charge(tmp_path):
+    home = _home(tmp_path)
+    with next(home.rglob(f"*{ROOT}.jsonl")).open("a") as stream:
+        stream.write('{"payload":{"type":"token_count"\n')
+        stream.write(json.dumps(_ev("event_msg", {"type": "task_started", "turn_id": "later-turn"},
+                                   END + timedelta(seconds=1))) + "\n")
+        stream.write(json.dumps(_count({"input_tokens": 10**9, "output_tokens": 100},
+                                      END + timedelta(seconds=2))) + "\n")
+    assert _recover(tmp_path, home, max_budget_usd=1) == Money("USD", ROOT_MICROS)
