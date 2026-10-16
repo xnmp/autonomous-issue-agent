@@ -41,6 +41,7 @@ have one; keep your context for reasoning, design and code.
    Check for commitlint/commit-msg hooks before the first commit and follow them.
 6. For UI-facing changes, commit screenshots from the running app in `evidence/`,
    each at most 700KB; the reviewer judges whether they show the changed behavior.
+   Behaviour visible only on a platform this host cannot run owes no capture; its native test is the evidence.
    Allow a dev server well over 20s to come up. On a later leg, existing captures
    carry forward for criteria whose behavior the new commits do not change:
    re-capture only the affected ones, and keep each image mapped to its criterion
