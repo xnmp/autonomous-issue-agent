@@ -64,6 +64,9 @@ app under `evidence/`. Open the images and judge whether they demonstrate the
 affected acceptance criteria: the relevant screen and state must be visible and legible.
 REQUEST_CHANGES when evidence is missing, unreadable, or does not show the changed
 behavior (including mockups, source code, or stale captures).
+Captures come from the fixer's own host: behaviour visible only on a platform it
+cannot run (Windows- or macOS-only on a Linux host) is evidenced by that
+platform's native tests instead and owes no screenshot.
 
 ## A claim that the base already resolves the issue
 An empty diff, or a test-only diff whose description says the base already
