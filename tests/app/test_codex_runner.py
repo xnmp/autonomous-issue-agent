@@ -933,6 +933,14 @@ def test_read_rollout_usage_skips_damaged_lines_before_resumed_counters(tmp_path
     }
 
 
+def test_read_rollout_usage_skips_a_line_with_invalid_utf8(tmp_path):
+    _rollout_with(tmp_path, "bytes", _totals(100, 50, 0, 10))
+    rollout = next((tmp_path / "sessions").rglob("rollout-now-bytes.jsonl"))
+    with rollout.open("ab") as stream:
+        stream.write(b'{"payload": {"type": "token_count", "x": "\xff"}}\n' + _totals(300, 150, 7, 30).encode() + b"\n")
+    assert read_rollout_usage("bytes", codex_home=str(tmp_path))["input_tokens"] == 300
+
+
 @pytest.mark.parametrize(
     "record",
     [

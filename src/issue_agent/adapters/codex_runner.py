@@ -361,7 +361,8 @@ def _rollout_events(session_id: str, codex_home: str | None, marker: str):
     path = _rollout_path(session_id, codex_home)
     if path is None:
         return
-    with open(path) as f:
+    # Invalid bytes make only their line unparseable (skipped), not the file.
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             if marker not in line:
                 continue
