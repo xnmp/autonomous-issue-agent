@@ -168,7 +168,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     exit_reason = exit_reason_from_envelope(subtype, is_error)
     if is_error and getattr(msg, "terminal_reason", None) == "api_error":
         # The provider ended the leg (auth failure, 5xx, overload, or a
-        # permanent 400; #418): codex's shape, so `domain.attempt` bounds it.
+        # permanent 400; #418): codex's shape, retried through machine backoff.
         exit_reason, subtype = ExitReason.TRANSPORT_DEATH, PROVIDER_REFUSED_SUBTYPE
     return AgentResult(
         is_error=is_error, status=status, envelope_subtype=subtype, summary=summary, needs=needs,
@@ -717,7 +717,7 @@ class AgentRunner(AgentRuntime):
                                                    stream_usage=usage_acc))
         result = self._priced(task, with_stream_identity(result_to_agent_result(final)), final, delegated, exited)
         if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE:
-            self._log(f"sdk: provider ended the turn ({result.summary[:200]}) — a machine failure unless this leg resumed one")
+            self._log(f"sdk: provider ended the turn ({result.summary[:200]}) — machine backoff")
         reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
             self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "

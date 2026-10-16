@@ -1,12 +1,11 @@
 """Whether a returned leg is an attempt, and how an item's next leg starts. Pure.
 
-The one rule (#441); derive and the dashboard read it through `tick.leg_end`,
-the fix role through `next_leg`. A cut-off end (`outcome.CUT_OFF_ENDS`: a
-per-leg cap, or the provider ending the turn) leaves its session intact, so
-the item resumes it once at the same tier, free (#411, #418); a cut-off of
-that resume counts, or a permanent provider error would retry free forever
-(#421). STEWARD, TRIAGE and REVIEW never resume, so their cut-off counts at
-once. A counted cut-off did not finish with its evidence (`LegEnd.capped`, #415).
+The cut-off rule (#441) is read by derive and dashboard through `tick.leg_end`
+and by the fix role through `next_leg`. Per-leg caps and nonterminal returns
+resume once at the same tier; a cut-off of that resume counts. Provider
+failures instead remain machine ends under the existing backoff. STEWARD,
+TRIAGE and REVIEW never resume, so their agent-work cut-offs count at once.
+A counted cut-off did not finish its evidence (`LegEnd.capped`, #415).
 """
 
 from __future__ import annotations

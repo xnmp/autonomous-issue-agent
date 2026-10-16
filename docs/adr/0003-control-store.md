@@ -39,7 +39,7 @@ A leg's `leg_class` is the raw class it returned with; attempt classification
 is derived on read (#441: `tick.leg_end` with `domain/attempt.py`), from the
 order the item's legs ended, which is exact because the per-issue fix lease
 runs one fix leg per issue at a time, so the legs ended before a leg are the
-legs its dispatch saw. A counted cut-off (a per-leg cap or provider-ended turn
+legs its dispatch saw. A counted cut-off (a per-leg cap or nonterminal return
 on the free resume, or of a kind that never resumes) is stored `machine` and
 read as an attempt, so operator SQL that counts infra deaths from
 `leg_class = 'machine'` overcounts; count `result_json`'s `end` class instead.
@@ -76,3 +76,19 @@ lease/reserve/result/settle crash handling is unchanged.
 Metric: fresh RESOLVE starts after a clean nonterminal end, adjudicated by the
 next comparable journal sample. Guardrails: attempts remain bounded by the
 existing rule, publication precedence and legitimate human blocks stay intact.
+
+
+Amended by #129: a provider-ended turn is a machine failure under the
+existing machine backoff and no longer joins the cut-off attempt rule.
+Claude and Codex already mint provider_refused from their own envelopes or
+rollouts. Repeated provider failures preserve the existing session and never
+consume the issue's agent attempts. Per-leg caps and nonterminal agent returns
+keep their bounded continuation. No provider pause/probe, threshold, reset
+clock, runtime fallback, counter or state is introduced. Backoff and money
+caps remain the bounds, including for a permanently invalid provider request.
+The public regression drives six failed provider legs, verifies backoff and
+no human hold, then observes recovery publish one PR. Existing raw receipts
+and reserve/settle/recovery paths are unchanged.
+Metric: issue-attempt stops caused solely by provider failure; guardrail:
+ordinary agent failures and per-leg cap attempts retain their existing limits.
+Adjudicate with the next provider-outage journal sample.

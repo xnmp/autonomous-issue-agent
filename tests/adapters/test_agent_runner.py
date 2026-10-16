@@ -816,8 +816,8 @@ def test_a_provider_api_error_end_is_a_machine_failure_whose_session_stays_resum
         is_error=True, subtype="success", terminal_reason="api_error", session_id="s1",
         result="Failed to authenticate: OAuth session expired", total_cost_usd=0.1))
     assert r.is_error
-    assert classify_leg(r) is LegClass.MACHINE  # a cut-off end: `domain.attempt` bounds its resume
-    assert machine_end(r) in CUT_OFF_ENDS
+    assert classify_leg(r) is LegClass.MACHINE
+    assert machine_end(r) not in CUT_OFF_ENDS
     assert resumable_session(r) == "s1"
 
 

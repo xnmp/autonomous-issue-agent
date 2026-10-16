@@ -145,12 +145,12 @@ def test_unknown_or_garbage_status_counts_as_agent_work():
 
 
 @pytest.mark.parametrize("reason", [ExitReason.TRANSPORT_DEATH, ExitReason.AGENT_ERROR])
-def test_a_provider_refused_end_is_recorded_as_a_cut_off_machine_end(reason):
-    # Claude's api_error and codex's provider failure share this marker (#418);
-    # `domain.attempt` bounds its resume like a leg cap's.
+def test_a_provider_refused_end_is_recorded_as_a_machine_failure_without_issue_attempts(reason):
+    # Claude and Codex provider failures use the same machine-backoff path;
+    # the adapter-minted marker never consumes an issue attempt.
     ended = AgentResult(is_error=True, exit_reason=reason, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s")
     assert classify_leg(ended) is LegClass.MACHINE
-    assert machine_end(ended) in CUT_OFF_ENDS
+    assert machine_end(ended) not in CUT_OFF_ENDS
     assert resumable_session(ended) == "s"
 
 

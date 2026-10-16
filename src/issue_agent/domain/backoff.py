@@ -73,7 +73,7 @@ class LegEnd:
     # The commit the leg's PR branch was at on the remote when it ended, as the
     # harness read it ("" when unread): not `head` means the leg pushed.
     end_head: str = ""
-    # This agent end was cut off (a per-leg cap or the provider, `domain.attempt`):
+    # This agent end was cut off (a per-leg cap or no result, `domain.attempt`):
     # it did not finish with the evidence it was handed.
     capped: bool = False
     # The agent reported a harness defect (`domain.gaps`; its text stays in the receipt).
