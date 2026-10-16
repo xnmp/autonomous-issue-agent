@@ -21,7 +21,7 @@ import {
 import { ago, localHour, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Histogram, Meter, StatTile } from "./ui/Charts";
-import { EmptyState, ErrorBanner, Loading, ReadingGitHub, SkeletonRows, StoreUnavailable, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, Loading, SkeletonRows, awaitingGitHub, StoreUnavailable, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
 
@@ -62,9 +62,8 @@ export function OverviewTab({
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
       <StoreUnavailable detail={ov.data?.store_error} />
-      <ReadingGitHub loaded={!!ov.data} observedAt={ov.data?.observed_at} />
       <WarningList warnings={ov.data?.warnings} />
-      {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
+      {ov.loading || awaitingGitHub(ov.data) ? <SkeletonRows what="overview" rows={5} /> : null}
 
       <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile

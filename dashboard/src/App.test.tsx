@@ -80,6 +80,7 @@ describe("App navigation", () => {
             closed: 1,
             net_open: 2,
           }],
+          observed_at: "2026-10-12T12:00:00Z",
           warnings: [],
         });
       }),

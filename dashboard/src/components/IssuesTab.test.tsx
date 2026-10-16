@@ -111,14 +111,22 @@ describe("IssuesTab", () => {
     expect(screen.getByRole("columnheader", { name: /Rounds/ })).toBeVisible();
   });
 
-  it("says while the first GitHub observation is still being read", () => {
-    render(<IssuesTab repo="demo" sub="inflight" issues={polled({ observed_at: null })} onOpenIssue={vi.fn()} />);
-    expect(screen.getAllByText("Reading GitHub…").length).toBe(1);
+  it.each([
+    ["inflight", "Loading issues"],
+    ["done", "Loading done issues"],
+    ["backlog", "Loading backlog"],
+  ] as const)("shows a %s skeleton, not an empty list, until the first GitHub observation lands", (sub, label) => {
+    const pending = render(<IssuesTab repo="demo" sub={sub} issues={polled({ observed_at: null })} onOpenIssue={vi.fn()} />);
+    expect(screen.getByRole("status", { name: label })).toBeVisible();
+    expect(screen.queryByText(/nothing merged by the harness|the backlog is clear/)).toBeNull();
+    pending.unmount();
+    render(<IssuesTab repo="demo" sub={sub} issues={polled({})} onOpenIssue={vi.fn()} />);
+    expect(screen.queryByRole("status", { name: label })).toBeNull();
   });
 
-  it("does not say it once the observation has landed", () => {
-    render(<IssuesTab repo="demo" sub="inflight" issues={polled({})} onOpenIssue={vi.fn()} />);
-    expect(screen.queryByText("Reading GitHub…")).toBeNull();
+  it("says a list is empty only once GitHub has been read", () => {
+    render(<IssuesTab repo="demo" sub="backlog" issues={polled({})} onOpenIssue={vi.fn()} />);
+    expect(screen.getByText(/the backlog is clear/)).toBeVisible();
   });
 
   it("expands formatted backlog context and keeps noisy columns disabled by default", async () => {

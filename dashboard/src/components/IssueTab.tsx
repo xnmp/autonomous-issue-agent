@@ -8,7 +8,7 @@ import { GROUP_META, boardTone, plainHarnessMessage, railNodes } from "../featur
 import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
 import { JsonBlock } from "./ui/Json";
-import { EmptyState, ErrorBanner, ReadingGitHub, SkeletonRows, StoreUnavailable, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, SkeletonRows, StoreUnavailable, WarningList, awaitingGitHub } from "./ui/Feedback";
 import { UnblockControl } from "./UnblockControl";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import { CiRunningBadge, StepBadge, StepStatusChip } from "./ui/StepBadge";
@@ -150,9 +150,8 @@ export function IssueTab({
         <ErrorBanner message={detail.error} onRetry={detail.refresh} stale={!!d} />
       ) : null}
       <StoreUnavailable detail={d?.store_error} />
-      <ReadingGitHub loaded={!!d} observedAt={d?.observed_at} />
       <WarningList warnings={d?.warnings} />
-      {detail.loading ? <SkeletonRows what={`issue #${issue}`} rows={6} /> : null}
+      {detail.loading || awaitingGitHub(d) ? <SkeletonRows what={`issue #${issue}`} rows={6} /> : null}
 
       {d ? (
         <>

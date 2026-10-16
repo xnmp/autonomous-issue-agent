@@ -47,13 +47,14 @@ function overview(over: Partial<OverviewPayload> = {}) {
 }
 
 describe("OverviewTab", () => {
-  it("says once while the first GitHub observation is still being read, and not after", async () => {
+  it("keeps a loading skeleton while the first GitHub observation is still being read, and drops it after", async () => {
     const pending = overview({ observed_at: null });
-    expect(await screen.findAllByText("Reading GitHub…")).toHaveLength(1);
+    await screen.findByText("Needs a decision");
+    expect(screen.getAllByRole("status", { name: "Loading overview" })).toHaveLength(1);
     pending.unmount();
     overview({ observed_at: "2026-08-01T08:00:00Z" });
-    await screen.findByText("Merged");
-    expect(screen.queryByText("Reading GitHub…")).toBeNull();
+    await screen.findByText("Needs a decision");
+    expect(screen.queryByRole("status", { name: "Loading overview" })).toBeNull();
   });
 
   it("leads with the metrics folded from legs and merges, then the items waiting on a person", async () => {

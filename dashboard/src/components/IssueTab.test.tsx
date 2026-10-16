@@ -18,7 +18,7 @@ function detail(over: Partial<IssueDetailPayload> = {}): IssueDetailPayload {
     issue: 50, title: "An issue", url: "https://github.com/o/r/issues/50", labels: [], board: null, action: null,
     done: false, held_for_human: false, pull_requests: [], cost_usd: 2, estimated: false,
     rail: { current: "resolve", furthest: "resolve", resolve_attempts: 1, review_rounds: 0, ci_runs: 0, steps: 1, live: false },
-    history: [], steps: [], warnings: [], ...over,
+    history: [], steps: [], warnings: [], observed_at: "2026-08-01T08:00:00Z", ...over,
   };
 }
 
@@ -36,15 +36,16 @@ afterEach(() => {
 });
 
 describe("IssueTab", () => {
-  it("says once while the first GitHub observation is still being read, and not after", async () => {
+  it("keeps a loading skeleton while the first GitHub observation is still being read, and drops it after", async () => {
     serve(detail({ observed_at: null }));
     const first = render(<IssueTab repo="demo" issue={50} />);
-    expect(await screen.findAllByText("Reading GitHub…")).toHaveLength(1);
+    await screen.findByText("An issue");
+    expect(screen.getAllByRole("status", { name: "Loading issue #50" })).toHaveLength(1);
     first.unmount();
     serve(detail({ observed_at: "2026-08-01T08:00:00Z" }));
     render(<IssueTab repo="demo" issue={50} />);
     await screen.findByText("An issue");
-    expect(screen.queryByText("Reading GitHub…")).toBeNull();
+    expect(screen.queryByRole("status", { name: "Loading issue #50" })).toBeNull();
   });
 
   it("shows CI activity on the open PR beside the issue's status", async () => {
