@@ -57,6 +57,12 @@ Rollout files are runtime
 observations, never review verdict authority; harness-owned invocation coordinates
 and locked rates bound their financial interpretation (ADR 0012).
 
+Codex rollout readers skip unparseable lines because later session-cumulative
+counters supersede interrupted writes (#277). A complete parsed counter record
+with invalid totals still fails closed. Residual: an unparseable final counter
+line under-counts that last increment; the rollout is agent-writable anyway,
+so this is not a new trust hole.
+
 Codex persists rollout coordinates, pre-run baselines and locked rates before
 launch. Boot/wake recovery reads only the harness-owned invocation window and
 settles ended, lease-free unsettled legs through the normal transaction. Missing/unusable recovery evidence settles zero as an

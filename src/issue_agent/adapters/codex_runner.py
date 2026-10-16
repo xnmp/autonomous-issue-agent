@@ -355,21 +355,20 @@ class MalformedRolloutCounters(ValueError):
     nothing can price the leg, so its live budget cannot hold."""
 
 
-def _rollout_events(session_id: str, codex_home: str | None, marker: str, *, strict: bool = False):
-    """Parsed rollout events whose line contains `marker`. An unparseable line
-    skips, or under `strict` raises once complete (codex may be mid-write)."""
+def _rollout_events(session_id: str, codex_home: str | None, marker: str):
+    """Parsed rollout events whose line contains `marker`, skipping unparseable
+    lines; later session-cumulative counters supersede interrupted writes."""
     path = _rollout_path(session_id, codex_home)
     if path is None:
         return
-    with open(path) as f:
+    # Invalid bytes make only their line unparseable (skipped), not the file.
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             if marker not in line:
                 continue
             try:
                 event = json.loads(line)
-            except ValueError:
-                if strict and line.endswith("\n"):
-                    raise MalformedRolloutCounters(f"unparseable {marker} record") from None
+            except (ValueError, RecursionError):
                 continue
             payload = event.get("payload") if isinstance(event, dict) else None
             if isinstance(payload, dict):
@@ -412,13 +411,13 @@ def read_rollout_usage(
 
     The last valid timestamped `token_count` wins (the counter is cumulative).
     `until` excludes counters after the run's recorded end, which a later leg
-    resuming the same session may have written. A counter record that does not
-    parse raises `MalformedRolloutCounters` (fail closed); a record without
-    counters yet (`info: null`) is skipped.
+    resuming the same session may have written. Unparseable lines are skipped;
+    later cumulative counters supersede them. A parsed record with invalid totals
+    raises `MalformedRolloutCounters` (fail closed); `info: null` is skipped.
     """
     try:
         found: dict | None = None
-        for event, payload in _rollout_events(session_id, codex_home, '"token_count"', strict=True):
+        for event, payload in _rollout_events(session_id, codex_home, '"token_count"'):
             if payload.get("type") != "token_count":
                 continue
             stamp = _rollout_timestamp(event.get("timestamp"))

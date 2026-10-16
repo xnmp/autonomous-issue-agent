@@ -914,16 +914,43 @@ def test_read_rollout_usage_is_none_when_file_or_session_missing(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "record",
+    "damaged_line",
     [
         '{"payload": {"type": "token_count"',
+        '{"payload": {"type": "token_count"' + _totals(200, 100, 0, 20),
+        "[" * 10_000 + '"token_count"' + "]" * 10_000,
+    ],
+    ids=["interrupted", "concatenated-resume", "deeply-nested"],
+)
+def test_read_rollout_usage_skips_damaged_lines_before_resumed_counters(tmp_path, damaged_line):
+    _rollout_with(tmp_path, "resumed", _totals(100, 50, 0, 10), damaged_line, _totals(300, 150, 7, 30))
+    assert read_rollout_usage("resumed", codex_home=str(tmp_path)) == {
+        "input_tokens": 300,
+        "output_tokens": 30,
+        "cache_read_input_tokens": 150,
+        "cache_creation_input_tokens": 7,
+        "source": "rollout",
+    }
+
+
+def test_read_rollout_usage_skips_a_line_with_invalid_utf8(tmp_path):
+    _rollout_with(tmp_path, "bytes", _totals(100, 50, 0, 10))
+    rollout = next((tmp_path / "sessions").rglob("rollout-now-bytes.jsonl"))
+    with rollout.open("ab") as stream:
+        stream.write(b'{"payload": {"type": "token_count", "x": "\xff"}}\n' + _totals(300, 150, 7, 30).encode() + b"\n")
+    assert read_rollout_usage("bytes", codex_home=str(tmp_path))["input_tokens"] == 300
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
         _token_count({"total_token_usage": {"input_tokens": "12", "output_tokens": 3}}),
         _token_count({"total_token_usage": None}),
         _token_count(["not", "a", "dict"]),
     ],
-    ids=["unparseable", "string-counter", "null-totals", "non-dict-info"],
+    ids=["string-counter", "null-totals", "non-dict-info"],
 )
-def test_a_complete_counter_record_that_does_not_parse_fails_closed(tmp_path, record):
+def test_a_parsed_counter_record_with_invalid_totals_fails_closed(tmp_path, record):
     _rollout_with(tmp_path, "bad", record)
     with pytest.raises(MalformedRolloutCounters):
         read_rollout_usage("bad", codex_home=str(tmp_path))
