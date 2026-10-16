@@ -1024,6 +1024,32 @@ def test_steward_then_triage_then_one_comment_then_resolve_each_on_its_own_route
     assert len(gh.comments_with("issue", 5, "issue-agent:triage")) == 1
 
 
+@pytest.mark.parametrize("lose_reply", [False, True], ids=["accepted", "reply-lost-after-post"])
+def test_deleting_a_settled_triage_comment_reaches_resolve_and_opens_the_pr(role, lose_reply):
+    gh = FakeGitHub(issues={5: ready()})
+    light = triaged("high")
+    agent = Agent(light, light, pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES)
+    tick(composed)  # STEWARD
+    tick(composed)  # TRIAGE
+    tick(composed)  # Its comment has landed and its idempotency key is settled.
+    (original,) = gh.comments_with("issue", 5, "issue-agent:triage")
+    gh.issues[5] = replace(gh.issues[5], comments=())
+    if lose_reply:
+        gh.lose_reply.add("comment")
+
+    assert not any(isinstance(a, RunAgent) for a in tick(composed))
+    (restored,) = gh.comments_with("issue", 5, "issue-agent:triage")
+    assert restored.body == original.body
+    assert [a.number for a in dispatched(tick(composed), AgentKind.RESOLVE)] == [5]
+    tick(composed)  # The pushed branch becomes a PR, not another triage/comment loop.
+    assert len(agent.tasks) == 3
+    assert "A null token returns 401, not 500" in agent.tasks[-1].prompt
+    assert gh.prs[100].head_ref_name == "fix/5-null-token-crashes"
+    assert gh.prs[100].body == "Fixed the null token."
+    assert len(gh.comments_with("issue", 5, "issue-agent:triage")) == 1
+
+
 def test_an_issue_with_its_own_criteria_is_resolved_against_the_issue(role):
     own = "Crash on null token.\n\n## Acceptance criteria\n- [ ] The API answers 401"
     gh = FakeGitHub(issues={5: replace(ready(), body=own)})
