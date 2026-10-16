@@ -95,12 +95,24 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
     assert not any(evidence_dir.iterdir())
 
 
-def test_a_recovered_leg_whose_counters_are_malformed_settles_its_reserved_maximum(tmp_path):
+@pytest.mark.parametrize("invalid", [
+    {"input_tokens": "1000"},
+    {"input_tokens": -1},
+    {"output_tokens": 10**12 + 1},
+    {"cached_input_tokens": "x"},
+    {"cached_input_tokens": 1001},
+    {"cache_write_input_tokens": 1001},
+    {"cached_input_tokens": 600, "cache_write_input_tokens": 401},
+])
+def test_a_recovered_leg_whose_counters_are_malformed_settles_its_reserved_maximum(tmp_path, invalid):
     """Fail closed: unknown spend bounded by the reservation is charged at
     that bound, never at zero."""
     store, scope, run_id = _reserved_store(tmp_path)
     codex_home = tmp_path / "codex-home"
-    _write_rollout(codex_home, "session-1", [_count({"input_tokens": "1000"})])
+    _write_rollout(codex_home, "session-1", [
+        _count({"input_tokens": 1000, "output_tokens": 200}),
+        _count({"input_tokens": 1000, "output_tokens": 200, **invalid}),
+    ])
     evidence_dir = tmp_path / "state" / "spend-evidence"
     write_spend_evidence(
         str(evidence_dir),

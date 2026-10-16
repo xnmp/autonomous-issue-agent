@@ -63,6 +63,14 @@ with invalid totals still fails closed. Residual: an unparseable final counter
 line under-counts that last increment; the rollout is agent-writable anyway,
 so this is not a new trust hole.
 
+Amended 2026-10-16 (#494): the Codex rollout reader validates every parsed
+counter before pricing or resumed-session subtraction: input, output and both
+cache counters must be integers (excluding booleans) within `0..10**12`, and
+the two cache counters together cannot exceed inclusive input. Absent cache
+counters default to zero. Invalid totals raise `MalformedRolloutCounters`;
+live and recovered legs use the existing reserved-maximum charge rather than
+discarding earlier spend as a zero estimate.
+
 Codex persists rollout coordinates, pre-run baselines and locked rates before
 launch. Boot/wake recovery reads only the harness-owned invocation window and
 settles ended, lease-free unsettled legs through the normal transaction. Missing/unusable recovery evidence settles zero as an
