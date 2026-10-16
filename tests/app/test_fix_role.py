@@ -857,7 +857,7 @@ def _api_error(session: str):
         result="Failed to authenticate", total_cost_usd=0.0, usage={"input_tokens": 0, "output_tokens": 100_000}))
 
 
-def test_a_provider_ended_leg_is_a_machine_end_and_a_second_on_its_resume_counts(role, later):
+def test_provider_ended_legs_remain_machine_ends_when_the_session_resumes(role, later):
     gh = FakeGitHub(issues={5: ready()})
     agent = Agent(_api_error("s-1"), _api_error("s-1"))
     composed, _ = role(gh, agent, **TIERS)
@@ -865,7 +865,7 @@ def test_a_provider_ended_leg_is_a_machine_end_and_a_second_on_its_resume_counts
     later()
     assert dispatched(tick(composed), AgentKind.RESOLVE)
     assert [t.resume for t in agent.tasks] == [None, "s-1"]
-    assert _resolve_legs(composed) == ["machine", "agent"]
+    assert _resolve_legs(composed) == ["machine", "machine"]
 
 
 def _resolve_legs(composed) -> list[str | None]:
@@ -1937,3 +1937,22 @@ def test_a_sessionless_interrupted_ci_repair_keeps_its_unfinished_evidence(role,
     assert dispatched(tick(composed),AgentKind.FIX_CI)
     assert len(agent.tasks) == 2 and gh.harness_reruns == []
     assert Label.NEEDS_HUMAN not in gh.prs[100].labels
+
+
+
+def test_a_provider_outage_backs_off_without_escalating_the_issue_and_recovery_publishes(role,later):
+    gh=FakeGitHub(issues={5:ready()})
+    agent=Agent(*[_api_error("quota-session") for _ in range(6)],
+                pushed(gh,"fix/5-null-token-crashes","h1",session="quota-session"))
+    composed,_=role(gh,agent,**TIERS)
+    for count in range(6):
+        assert dispatched(tick(composed),AgentKind.RESOLVE)
+        assert Label.NEEDS_HUMAN not in gh.issues[5].labels
+        assert _resolve_legs(composed) == ["machine"]*(count+1)
+        if count == 0:
+            assert dispatched(tick(composed),AgentKind.RESOLVE) == []
+        later()
+    assert dispatched(tick(composed),AgentKind.RESOLVE)
+    tick(composed)
+    assert len(gh.prs) == 1 and len(agent.tasks) == 7
+    assert all(task.resume == "quota-session" for task in agent.tasks[1:])

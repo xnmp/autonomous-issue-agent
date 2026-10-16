@@ -98,10 +98,10 @@ MACHINE_ENDS = frozenset({reason.value for reason in ExitReason} | {PROVIDER_REF
 # Machine ends no harness fix removes: a teardown, or a provider's capacity or
 # quota window. They are no harness gap (`domain.gaps`).
 OUTSIDE_ENDS = frozenset({ExitReason.OPERATOR_CANCELLED.value, PROVIDER_REFUSED_SUBTYPE})
-# The cut-off ends: a per-leg cap or the provider ended a live session, which
-# stays resumable. Whether one is an attempt is `domain.attempt.cut_off_counts`.
+# Cut-offs of agent work use the existing bounded continuation. Provider
+# failures use machine backoff: an outage cannot consume issue attempts.
 CUT_OFF_ENDS = frozenset({ExitReason.WALL_TIMEOUT.value, ExitReason.BUDGET_EXHAUSTED.value,
-                          ExitReason.NO_RESULT.value, PROVIDER_REFUSED_SUBTYPE})
+                          ExitReason.NO_RESULT.value})
 
 
 def machine_end(result: "AgentResult", kind: str = "") -> str:
@@ -171,6 +171,7 @@ def infra_class_failure(result: AgentResult) -> bool:
         infra_death(result.exit_reason)
         or runtime_unavailable(result.exit_reason)
         or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
+        or result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE
     )
 
 

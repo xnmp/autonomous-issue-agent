@@ -22,7 +22,7 @@ from issue_agent.domain.world import IssueView, PRView, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 H = Harness("fix-bot", "review-bot")
-CUT_OFFS = ("wall_timeout", "budget_exhausted", "provider_refused")
+CUT_OFFS = ("wall_timeout", "budget_exhausted", "no_result")
 LATER = 24 * 60  # past every machine backoff
 
 
@@ -170,8 +170,6 @@ def _fix_ci_state(*receipts: dict):
 
 @pytest.mark.parametrize("second", CUT_OFFS)
 def test_a_cut_off_resume_hands_its_failures_to_a_leg_one_tier_up(second):
-    # Deliberate (#441): a provider-ended resume did not finish either, so it hands
-    # its failures on like a capped one; before, it read as a finished repair.
     state = _fix_ci_state(cut(), cut(second))
     assert isinstance(state, Dispatch) and state.act is AgentKind.FIX_CI and state.tier is escalate(DEFAULT_TIER, 1)
 
@@ -221,3 +219,29 @@ def test_a_huge_receipt_reads_by_its_classifying_keys_alone():
     junk = {f"k{i}": "v" * 100 for i in range(10_000)}
     runs = (leg("RESOLVE", 0, cut(**junk)), leg("RESOLVE", 5, cut(**junk)))
     assert [(end.machine, end.capped) for _, end in leg_ends(runs)] == [(True, False), (False, True)]
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+@pytest.mark.parametrize("kind", ["RESOLVE", "FIX_CI", "ADDRESS_REVIEW", "REBASE", "STEWARD", "TRIAGE", "REVIEW"])
+def test_provider_failures_never_spend_attempts_or_advance_the_workflow(kind, runtime):
+    runs = tuple(leg(kind, 5 * i, cut("provider_refused", runtime=runtime),
+                     number=7 if kind in ("REVIEW", "FIX_CI", "ADDRESS_REVIEW", "REBASE") else 3, head="h1")
+                 for i in range(ATTEMPT_CAP + 2))
+    assert all(end.machine and not end.capped for _, end in leg_ends(runs))
+    if kind == "RESOLVE":
+        assert resolve_state(*runs) == Dispatch(AgentKind.RESOLVE, tier=DEFAULT_TIER)
+        assert resolve_plan(*runs, runtime=runtime).start == Continue("s-1")
+    elif kind in ("STEWARD", "TRIAGE"):
+        before = () if kind == "STEWARD" else (TRIAGED[0],)
+        world = WorldState(issues=(IssueView(3, labels=frozenset({Label.AI_READY})),))
+        state = derive(world, Local(now=T0 + timedelta(minutes=LATER), legs=local_legs((*before, *runs))), H)
+        assert state[issue_key(3)] == Dispatch(AgentKind[kind])
+    elif kind == "REVIEW":
+        state = derive(WorldState(prs=(_green_pr(),)),
+                       Local(now=T0 + timedelta(minutes=LATER), legs=local_legs(runs)), H)[pr_key(7)]
+        assert isinstance(state, Dispatch) and state.act is AgentKind.REVIEW
+    else:
+        assert next_leg(local_legs(runs)[pr_key(7)], runtime).start == Continue("s-1")
+        if kind == "FIX_CI":
+            state = _fix_ci_state(*(cut("provider_refused", runtime=runtime) for _ in runs))
+            assert isinstance(state, Dispatch) and state.act is AgentKind.FIX_CI and state.tier is DEFAULT_TIER
