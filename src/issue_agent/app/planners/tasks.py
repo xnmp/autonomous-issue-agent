@@ -143,7 +143,9 @@ def build_steward_task(
         "Short, testable statements of observable behaviour, one per item, covering what "
         "the issue asks and only that. Write criteria only for what the issue already "
         "settles; state a reasonable, reversible assumption as a criterion rather than "
-        "asking. Never describe files, functions, steps or an approach.\n\n"
+        "asking. Each must be checkable on the PR before it merges; a result that exists "
+        "only after merge, such as the base branch's CI passing, is not a criterion. "
+        "Never describe files, functions, steps or an approach.\n\n"
         if criteria_wanted else ""
     )
     prompt = (
