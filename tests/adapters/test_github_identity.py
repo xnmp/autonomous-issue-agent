@@ -1,20 +1,21 @@
 """Account provenance across REST, GraphQL, pickup and privileged effects (#481)."""
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
 
-from issue_agent.adapters.github import GitHubGateway, parse_issue, parse_pr
+from issue_agent.adapters.github import GitHubGateway, parse_fix_issue, parse_fix_pr, parse_issue, parse_pr
 from issue_agent.adapters.github_identity import parse_account
 from issue_agent.domain.actions import AgentKind, Relabel
+from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.identity import account_eq
 from issue_agent.domain.policy import architecture_actions, base_ci_actions
-from issue_agent.domain.state import Dispatch, Harness, Local, bot_verdict_on_head, derive, harness_gap, issue_key
+from issue_agent.domain.state import Dispatch, Harness, Local, bot_verdict_on_head, derive, harness_gap, human_comments, issue_key
 from issue_agent.domain.world import Pickup
 from tests.adapters.test_architecture_observe import Server
 from tests.adapters.test_github_base_ci import job, run_row, tip
-from tests.adapters.test_github_fix_observe import issue_node, labels
+from tests.adapters.test_github_fix_observe import issue_node, labels, pr_node
 
 H = Harness("steward[bot]", "reviewer[bot]")
 NOW = datetime(2026, 10, 16, tzinfo=timezone.utc)
@@ -93,6 +94,31 @@ def test_a_user_pat_filer_is_still_recognized_as_a_user_account():
     world = observed("Architecture pass (first)", {"__typename": "User", "login": "xnmp-fixer"})
     harness = replace(H, fix_bot="xnmp-fixer")
     assert derive(world, Local(now=NOW), harness)[issue_key(5)].act is AgentKind.RESOLVE
+
+
+@pytest.mark.parametrize("fix_login", ["xnmp-fixer", "xnmp"])
+@pytest.mark.parametrize("target", ["issue", "pr"])
+def test_342_a_user_pat_agents_mid_leg_comment_is_not_a_human_reply(target, fix_login):
+    # A PAT belongs to a User, so typed attribution alone cannot disown the
+    # agent's unmarked progress. Its parsed author must match the window's actor.
+    harness = Harness(fix_login, "reviewer[bot]")
+    capped = LegEnd(AgentKind.RESOLVE if target == "issue" else AgentKind.FIX_CI,
+                    NOW + timedelta(minutes=10), True, started_at=NOW + timedelta(minutes=1))
+    comments = [
+        {"author": {"__typename": "User", "login": fix_login}, "body": harness.marker + " question",
+         "createdAt": NOW.isoformat()},
+        {"author": {"__typename": "User", "login": fix_login}, "body": "Progress report",
+         "createdAt": (NOW + timedelta(minutes=5)).isoformat()},
+    ]
+
+    def observed_comments():
+        view = parse_fix_issue(issue_node(), comments) if target == "issue" else parse_fix_pr(pr_node(), comments, [], [])
+        return view.comments
+
+    assert human_comments(observed_comments(), harness, (capped,)) == ()
+    comments.append({"author": {"__typename": "User", "login": "xnmp"}, "body": "Please continue",
+                     "createdAt": (NOW + timedelta(minutes=11)).isoformat()})
+    assert [c.body for _, c in human_comments(observed_comments(), harness, (capped,))] == ["Please continue"]
 
 
 @pytest.mark.parametrize("kind,login,accepted", [("User", "steward", False), ("Bot", "steward", True),
