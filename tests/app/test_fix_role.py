@@ -1874,3 +1874,66 @@ def test_an_invalid_settings_change_keeps_the_daemon_on_its_previous_settings(ro
 
     env.write_text("ISSUE_PICKUP=open\nFIX_DISPATCH_CONCURRENCY=0\n")
     assert dispatched(tick(composed), AgentKind.RESOLVE) == []
+
+
+@pytest.mark.parametrize("status", ["", "success", "x" * 100_000], ids=["empty", "success", "oversized"])
+def test_a_clean_resolve_without_a_terminal_claim_uses_the_existing_free_continuation(role, later, status):
+    gh=FakeGitHub(issues={5:ready()})
+    unfinished=lambda task: AgentResult(False,status=status,exit_reason=ExitReason.OK,session_id="unfinished")
+    agent=Agent(unfinished,pushed(gh,"fix/5-null-token-crashes","h1"))
+    composed,_=role(gh,agent)
+    assert dispatched(tick(composed),AgentKind.RESOLVE)
+    later()
+    assert dispatched(tick(composed),AgentKind.RESOLVE)
+    assert agent.tasks[1].resume == "unfinished"
+    tick(composed)
+    assert len(gh.prs) == 1
+    assert _resolve_legs(composed) == ["machine","agent"]
+
+
+def test_a_second_nonterminal_return_on_the_free_resume_counts_and_starts_fresh(role,later):
+    gh=FakeGitHub(issues={5:ready()})
+    unfinished=lambda task: AgentResult(False,status="",exit_reason=ExitReason.OK,session_id="unfinished")
+    agent=Agent(unfinished,unfinished,pushed(gh,"fix/5-null-token-crashes","h1"))
+    composed,_=role(gh,agent)
+    tick(composed)
+    later()
+    tick(composed)
+    later()
+    tick(composed)
+    assert [t.resume for t in agent.tasks] == [None,"unfinished",None]
+    assert _resolve_legs(composed) == ["machine","agent","agent"]
+
+
+
+def test_a_nonterminal_return_without_a_session_counts_without_a_free_resume(role):
+    gh=FakeGitHub(issues={5:ready()})
+    agent=Agent(lambda task: AgentResult(False,status="",exit_reason=ExitReason.OK))
+    composed,_=role(gh,agent)
+    tick(composed)
+    assert _resolve_legs(composed) == ["agent"]
+
+
+def test_a_published_branch_wins_over_a_nonterminal_resolve_return(role):
+    gh=FakeGitHub(issues={5:ready()})
+    def unfinished(task):
+        gh.push("fix/5-null-token-crashes","h1","pending")
+        return AgentResult(False,status="",exit_reason=ExitReason.OK,session_id="unfinished")
+    agent=Agent(unfinished)
+    composed,_=role(gh,agent)
+    tick(composed)
+    tick(composed)
+    assert len(gh.prs) == 1 and len(agent.tasks) == 1
+
+
+
+def test_a_sessionless_interrupted_ci_repair_keeps_its_unfinished_evidence(role,later):
+    gh=FakeGitHub(issues={5:ready()})
+    open_pr(gh,ci="fail")
+    agent=Agent(_cap_hit("wall",""),_cap_hit("wall",""))
+    composed,_=role(gh,agent)
+    tick(composed)
+    later()
+    assert dispatched(tick(composed),AgentKind.FIX_CI)
+    assert len(agent.tasks) == 2 and gh.harness_reruns == []
+    assert Label.NEEDS_HUMAN not in gh.prs[100].labels

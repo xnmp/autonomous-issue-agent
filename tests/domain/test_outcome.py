@@ -152,3 +152,31 @@ def test_a_provider_refused_end_is_recorded_as_a_cut_off_machine_end(reason):
     assert classify_leg(ended) is LegClass.MACHINE
     assert machine_end(ended) in CUT_OFF_ENDS
     assert resumable_session(ended) == "s"
+
+
+@pytest.mark.parametrize("kind", ["RESOLVE", "FIX_CI", "REBASE", "ADDRESS_REVIEW"])
+@pytest.mark.parametrize("status", ["", "success", "x" * 100000], ids=["absent", "unknown", "huge"])
+def test_a_resumable_routed_leg_without_a_terminal_claim_is_the_no_result_cut_off(kind,status):
+    result=AgentResult(False,status=status,exit_reason=ExitReason.OK,session_id="session")
+    assert classify_leg(result,kind) is LegClass.MACHINE
+    assert machine_end(result,kind) == ExitReason.NO_RESULT.value
+    assert resumable_session(result) == "session"
+
+
+@pytest.mark.parametrize("kind", ["STEWARD", "TRIAGE", "REVIEW"])
+def test_light_and_review_schemas_do_not_require_a_fix_terminal_status(kind):
+    assert classify_leg(AgentResult(False,exit_reason=ExitReason.OK,session_id="session"),kind) is LegClass.AGENT
+
+
+@pytest.mark.parametrize("reason,expected", [(ExitReason.NO_RESULT,LegClass.AGENT),
+    (ExitReason.WALL_TIMEOUT,LegClass.MACHINE),(ExitReason.BUDGET_EXHAUSTED,LegClass.MACHINE)])
+def test_no_result_without_a_session_counts_and_existing_cap_provenance_survives(reason,expected):
+    assert classify_leg(AgentResult(True,exit_reason=reason)) is expected
+
+
+@pytest.mark.parametrize("session", [None, {}, [], "", " ", "s"*129, "s"*256, "s"*100000],
+                         ids=["null","object","list","empty","blank","129","256","huge"])
+def test_nonterminal_returns_with_unusable_sessions_keep_counting(session):
+    result=AgentResult(False,exit_reason=ExitReason.OK,session_id=session)
+    assert classify_leg(result,"RESOLVE") is LegClass.AGENT
+    assert resumable_session(result) == ""

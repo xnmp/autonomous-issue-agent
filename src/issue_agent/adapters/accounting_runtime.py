@@ -312,7 +312,7 @@ class AccountingRuntime(AgentRuntime):
         if self.role in LEG_ROLES:
             # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
-            leg = classify_leg(result)
+            leg = classify_leg(result, kind)
             triage = steward = None
             if kind in ("TRIAGE", "STEWARD"):
                 # They ask no one: a `blocked` claim in their output is not a question.
@@ -344,7 +344,7 @@ class AccountingRuntime(AgentRuntime):
                 # Kept on this host only: a gap report publishes none of it (`domain.gaps`).
                 **({"harness_issue": gap.record()} if gap is not None else {}),
                 # A machine end's class, from a fixed vocabulary: what a stall report names.
-                **({"end": machine_end(result)} if leg is LegClass.MACHINE else {}),
+                **({"end": machine_end(result, kind)} if leg is LegClass.MACHINE else {}),
                 # Triage's laundered result: the tier. Steward's: criteria, suspected duplicate.
                 **({"triage": triage.record()} if triage is not None else {}),
                 **({"steward": steward.record()} if steward is not None else {}),

@@ -319,7 +319,7 @@ that matters is not "wrong answer" but "loop that bills forever":
   harness prices the root rollout counters with the captured rate card and
   kills the process group on crossing
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
-- the two per-leg caps and a provider-ended turn share one rule
+- per-leg caps, no-result returns and a provider-ended turn share one rule
   (`domain/attempt.py`, #441): the receipt records the cut-off end as a
   machine end with its session; read in order with the item's earlier legs,
   a first cut-off is a machine end and the next leg resumes that session at
