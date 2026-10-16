@@ -478,8 +478,10 @@ class SQLiteControlStore:
                 if prior is not None:
                     identical = tuple(prior) == (
                         request.repository, request.role, request.kind, request.owner_id,
-                        requested.micros, requested.currency, prior["state"],
-                    ) and prior["state"] in ("reserved", "running")
+                        prior["reserved_micros"], requested.currency, prior["state"],
+                    ) and prior["state"] in ("reserved", "running") and prior["reserved_micros"] <= requested.micros
+                    if identical:
+                        requested = Money(requested.currency, prior["reserved_micros"])
                     return result(
                         AccountingDisposition.AVAILABLE if identical else AccountingDisposition.CONFLICT,
                         zero, "idempotent reservation" if identical else "conflicting reservation",
@@ -490,13 +492,13 @@ class SQLiteControlStore:
                     limit_committed = Money(limit.scope.currency, settled + reserved)
                     if index == 0:
                         committed = limit_committed
-                    if limit_committed.micros + requested.micros > limit.cap.micros:
+                    if limit_committed.micros >= limit.cap.micros:
                         return result(
                             AccountingDisposition.EXHAUSTED, limit_committed,
-                            "settled + active reservations + requested maximum "
-                            f"exceeds {limit.scope.dimension} cap",
+                            f"settled + active reservations exhaust {limit.scope.dimension} cap",
                             limit.cap, limit.scope.dimension,
                         )
+                    requested = Money(requested.currency, min(requested.micros, limit.cap.micros - limit_committed.micros))
                 lease = db.execute(
                     "SELECT leg_id FROM leases WHERE repository=? AND role=? AND target=? AND owner=?",
                     (request.repository, request.role, request.lease_target, request.owner_id),

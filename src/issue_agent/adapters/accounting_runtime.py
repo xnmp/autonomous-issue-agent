@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import math
 import sqlite3
 import uuid
 import contextvars
@@ -286,6 +287,10 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
             )
+        maximum = reservation.requested
+        budget = maximum.micros / 1_000_000
+        task = replace(task, max_budget_usd=(math.nextafter(budget, 0.0)
+                       if Money.from_major("USD", budget).micros > maximum.micros else budget))
         authority = {
             "ISSUE_AGENT_RUN_ID": str(run_id),
             "ISSUE_AGENT_CONFIG_VERSION": caps.config_version,

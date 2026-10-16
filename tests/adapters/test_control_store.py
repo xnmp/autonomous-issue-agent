@@ -251,9 +251,11 @@ def test_reservations_admit_until_the_cap_and_name_the_limit_that_tripped(tmp_pa
     second = _reserve(store, 2, issue=7, limits=limits)
 
     assert first.admitted
-    assert second.disposition is AccountingDisposition.EXHAUSTED
-    assert second.tripped_dimension == "issue:7"
-    assert store.snapshot(_issue_scope(7)).reserved == Money("USD", 60)
+    assert second.admitted and second.requested == Money("USD", 40)
+    third = _reserve(store, 3, issue=7, limits=limits)
+    assert third.disposition is AccountingDisposition.EXHAUSTED
+    assert third.tripped_dimension == "issue:7"
+    assert store.snapshot(_issue_scope(7)).reserved == Money("USD", 100)
 
 
 def test_the_global_cap_sums_every_repository_and_the_daily_cap_only_its_own(tmp_path):
@@ -275,9 +277,12 @@ def test_the_global_cap_sums_every_repository_and_the_daily_cap_only_its_own(tmp
         owner="b/two:fix:d",
     )
 
-    assert blocked.tripped_dimension == "global"
+    assert blocked.admitted and blocked.requested == Money("USD", 40)
+    exhausted = _reserve(store, 3, repository="b/two", owner="b/two:fix:d",
+                         limits=(BudgetLimit(_daily("b/two"), Money("USD", 60)), global_limit))
+    assert exhausted.tripped_dimension == "global"
     assert store.snapshot(_daily("a/one")).committed == Money("USD", 60)
-    assert store.snapshot(_daily("b/two")).committed == Money("USD", 0)
+    assert store.snapshot(_daily("b/two")).committed == Money("USD", 40)
 
 
 def test_yesterdays_spend_does_not_count_against_todays_cap(tmp_path):
@@ -291,14 +296,15 @@ def test_yesterdays_spend_does_not_count_against_todays_cap(tmp_path):
     assert store.snapshot(_daily()).committed == Money("USD", 60)
 
 
-def test_concurrent_reservations_admit_exactly_one_for_the_final_capacity(tmp_path):
+def test_concurrent_reservations_admit_only_the_remaining_capacity(tmp_path):
     store = _store(tmp_path)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda index: _reserve(store, index).disposition, range(1, 9)))
 
-    assert results.count(AccountingDisposition.AVAILABLE) == 1
-    assert results.count(AccountingDisposition.EXHAUSTED) == 7
+    assert results.count(AccountingDisposition.AVAILABLE) == 2
+    assert results.count(AccountingDisposition.EXHAUSTED) == 6
+    assert store.snapshot(_daily()).reserved == Money("USD", 100)
 
 
 def test_a_replayed_reservation_is_idempotent_and_a_different_one_conflicts(tmp_path):
@@ -795,7 +801,10 @@ def test_cutover_carries_settled_spend_into_the_caps_and_retires_the_legacy_file
     assert store.snapshot(_daily()).settled == Money("USD", 350)
     assert store.snapshot(_daily("*", "global")).settled == Money("USD", 350)
     assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
-    capped = store.reserve(_request(1, maximum=60, issue=7, limits=(BudgetLimit(_issue_scope(7), Money("USD", 520)),)))
+    assert store.lease(REPO, "fix", 1, OWNER)
+    tail = store.reserve(_request(1, maximum=60, issue=7, limits=(BudgetLimit(_issue_scope(7), Money("USD", 520)),)))
+    assert tail.admitted and tail.requested == Money("USD", 20)
+    capped = store.reserve(_request(2, maximum=60, issue=7, limits=(BudgetLimit(_issue_scope(7), Money("USD", 520)),)))
     assert capped.tripped_dimension == "issue:7"
     # Money only: attempts restart, so carried legs are no legs to derive.
     assert store.leg_runs(REPO, (7, 8)) == ()
@@ -949,3 +958,18 @@ def test_a_hard_kill_mid_copy_leaves_a_stray_file_the_retry_removes(tmp_path):
 
     assert not stray.exists()
     assert len(list(tmp_path.glob("control.db.retired-*"))) == 1
+
+
+
+def test_reservation_spends_the_smallest_scope_headroom_and_replays_the_same_amount(tmp_path):
+    store=_store(tmp_path)
+    limits=(BudgetLimit(_daily(),Money("USD",100)), BudgetLimit(_issue_scope(7),Money("USD",25)))
+    request=_request(1, maximum=60, issue=7, limits=limits)
+    assert store.lease(REPO,"fix",1,OWNER)
+    admitted=store.reserve(request)
+    assert admitted.admitted and admitted.requested == Money("USD",25)
+    replay=store.reserve(request)
+    assert replay.admitted and replay.requested == Money("USD",25)
+    assert store.snapshot(_daily()).reserved == Money("USD",25)
+    assert store.snapshot(_issue_scope(7)).reserved == Money("USD",25)
+    assert _reserve(store,2,issue=7,limits=limits).disposition is AccountingDisposition.EXHAUSTED

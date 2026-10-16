@@ -132,3 +132,21 @@ an accounting hold or a human-review escalation.
 - Rate-card identity/version is historical evidence and cannot be rewritten.
 - Lowering a cap blocks future admission; it does not alter settled history.
 - JSONL spend output is a projection, never admission authority.
+
+
+Amended by #167: paid admission reserves the lesser of the leg maximum and
+the remaining headroom of every armed scope, calculated inside the existing
+reservation transaction. Only exhausted headroom refuses a leg. Observation
+prechecks use the same positive-headroom rule; the inner runtime receives the
+reservation's actual amount as its existing max_budget_usd. Claude's native
+limit and Codex's rollout meter therefore enforce the reservation, and malformed
+usage settles at that same reduced maximum. No minimum-budget knob or new
+admission/retry state is introduced.
+Crash points: tests/adapters/test_control_store.py covers concurrent admissions
+never reserving more than the cap, a replay preserving the original partial
+reservation, and exhausted headroom creating no reservation. The existing
+register/settle/release/recovery tests remain the launch crash map.
+tests/adapters/test_accounting_runtime.py observes the reservation before the
+inner runtime starts and verifies its enforced budget for a one-micro tail,
+partial, exact, and very large headroom; existing malformed-evidence settlement
+and live-cap regressions retain their contracts.

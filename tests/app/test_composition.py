@@ -37,12 +37,11 @@ def test_paid_headroom_follows_the_daily_cap_and_fails_closed_on_an_unreadable_l
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
 
-    assert headroom(cfg, store, 5.0)() is True
-    assert headroom(cfg, store, 11.0)() is False
-    assert headroom(cfg, _UnreadableLedger(), 5.0)() is False
+    assert headroom(cfg, store)() is True
+    assert headroom(cfg, _UnreadableLedger())() is False
     # No cap configured: nothing to read, nothing to wait on.
     uncapped = HarnessConfig(repo="o/r", daily_spend_cap_usd=0.0)
-    assert headroom(uncapped, _UnreadableLedger(), 5.0)() is True
+    assert headroom(uncapped, _UnreadableLedger())() is True
 
 
 def test_process_supervision_isolated_between_checkouts_sharing_state(tmp_path) -> None:

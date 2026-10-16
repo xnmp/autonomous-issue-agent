@@ -388,9 +388,8 @@ def test_a_write_refreshes_the_observation(deployment):
     assert gateway.reads == reads + 1
 
 
-def test_a_review_waits_on_the_review_legs_price_while_a_fix_leg_still_fits(deployment, tmp_path):
-    """Daily cap $12, nothing spent: a $10 fix leg fits, a $15 review leg
-    does not, so the review role waits and the board says so."""
+def test_both_roles_can_use_positive_daily_headroom_smaller_than_their_leg_budget(deployment, tmp_path):
+    """The $15 review leg can use the daily cap's remaining $12."""
     backend, *_ = deployment
     env = tmp_path / "root" / "config" / ".active.demo.env"
     env.write_text(env.read_text().replace('DAILY_SPEND_CAP_USD="700"', 'DAILY_SPEND_CAP_USD="12"'))
@@ -421,7 +420,7 @@ def test_a_review_waits_on_the_review_legs_price_while_a_fix_leg_still_fits(depl
     board = {card["issue"]: card["board"] for card in backend.issues("demo")["in_flight"]}
 
     assert (board[1]["status"], board[1]["on"]) == ("waiting", "slot")
-    assert (board[9]["status"], board[9]["on"]) == ("waiting", "headroom")
+    assert (board[9]["status"], board[9]["on"]) == ("waiting", "slot")
 
 
 def test_a_truncated_merged_list_is_not_a_github_failure(deployment):

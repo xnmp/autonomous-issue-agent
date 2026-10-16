@@ -67,11 +67,11 @@ def daemon_control_path(cfg: HarnessConfig) -> str:
                               authority_root=cfg.control_authority_root)
 
 
-def _role_facts(cfg: HarnessConfig, store: ReadOnlyControlStore, leg_usd: float,
+def _role_facts(cfg: HarnessConfig, store: ReadOnlyControlStore,
                 now: Callable[[], datetime]) -> Facts:
-    """The local facts one role builds, priced at its leg (`tick` wiring).
+    """The local facts one role builds (`tick` wiring).
     Nothing is in flight in this process; leases come from the store."""
-    return Facts(store, cfg.repo, active=tuple, headroom=headroom(cfg, store, leg_usd),
+    return Facts(store, cfg.repo, active=tuple, headroom=headroom(cfg, store),
                  lifetime_capped=lifetime_capped(cfg, store), log=_unlogged, now=now)
 
 
@@ -267,8 +267,8 @@ class Backend:
                 legs = leg_rows(store, dep.cfg.repo)
                 repository = canonical_repository(dep.cfg.repo) if dep.cfg.repo else ""
                 leases = tuple(lease for lease in store.leases() if lease.repository == repository)
-                facts = {role: _role_facts(dep.cfg, store, usd, self.now_fn)
-                         for role, usd in (("fix", dep.cfg.fix_budget_usd), ("review", dep.cfg.review_budget_usd))}
+                facts = {role: _role_facts(dep.cfg, store, self.now_fn)
+                         for role in ("fix", "review")}
                 caps = self._caps(dep.cfg, store, facts)
                 if world is None or dep.harness is None:
                     return StoreRead(legs, leases=leases, caps=caps)
