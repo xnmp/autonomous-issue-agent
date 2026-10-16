@@ -33,6 +33,7 @@ have one; keep your context for reasoning, design and code.
 4. Read the directory `CLAUDE.md` files for the paths you touch. If the repo keeps
    ADRs in `docs/adr/`, read the index before changing a path an ADR's `Governs:`
    line names, and cite `ADR <id>` in your summary.
+   If `docs/architecture-pressure.md` exists and your change touches a listed seam, read that entry.
 5. Test first: write the failing tests, run them and confirm they fail for the
    right reason, then implement until they pass. Keep the whole suite green; no
    harness hook checks this, but the repo's required CI does and the independent
@@ -95,7 +96,8 @@ Xvfb `-nolisten local`.
   positives or truly untestable glue: justify in the PR description AND a site
   comment, and scope as narrowly as possible. Never suppress the point of the
   change or code your tests prove testable.
-- Never call `gh issue create`. Report a defect in what the harness gives you
+- Never call `gh issue create` except for the bounded tech-debt filing in an
+  Architecture pass issue body. Report a defect in what the harness gives you
   (sandbox, toolchain, credentials, these rules), never the repository's code,
   in `harness_issue`: a one-line `title` and a `body` with the command you ran
   and its output. The harness keeps it with this leg's record and files an
@@ -147,6 +149,8 @@ revert it on your branch with `git revert` (`-m 1` for a merge commit) and say
 in the summary which pull request you reverted and why; otherwise fix forward.
 A flaky test that turned the base red is a defect: make it deterministic
 rather than retrying it. End the summary with `Closes #<issue>` as usual.
+
+For an `Architecture pass` issue, the issue body is your full task.
 
 Before blocking for a platform you cannot run locally, check whether CI runs it
 and collect its evidence, adding diagnostic instrumentation as needed (e.g.

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from .identity import is_bot_login
+from .architecture import ArchitectureObservation
 from .labels import Label
 from .checks import BaseHealth, Check, CIObservation, Observed, Unavailable
 
@@ -229,6 +230,7 @@ class WorldState:
     # The issue scope this observation listed: derive picks up what it covers,
     # so a READY observation can never be read as listing every open issue.
     pickup: Pickup = Pickup.READY
+    architecture: ArchitectureObservation | None = None
 
 
 # Convenience re-export so callers can `from .world import replace`.

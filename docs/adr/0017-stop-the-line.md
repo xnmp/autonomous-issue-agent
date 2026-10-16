@@ -3,7 +3,8 @@
 Status: Accepted
 Date: 2026-10-15
 Governs: src/issue_agent/domain/policy.py src/issue_agent/domain/ci.py src/issue_agent/domain/state.py
-  src/issue_agent/adapters/github_ci.py
+  src/issue_agent/domain/architecture.py src/issue_agent/domain/labels.py
+  src/issue_agent/adapters/github_ci.py src/issue_agent/adapters/github.py plugin/AGENT.md
 
 ## Context
 
@@ -143,3 +144,69 @@ workflow files, under write access. The green-close comment is
 harness-written, but a fix leg holds the same token and could forge one; the
 worst case is an early refile of the streak, whose paid leg the caps bound. The close is read back like the green
 close and re-derived from the next observation if lost.
+
+## Amendment (2026-10-16, #161): continuous architecture passes as issues
+
+The owner wants continuous architectural stewardship. This narrowly reverses
+refactor decision Q9's removal of that work, while retaining its two daemons:
+the fix role files `Architecture pass (after #<previous pass number>)`, or
+`Architecture pass (first)` when none exists, with the harness marker,
+using the existing `FileIssue` act as FIX_BOT. There is no repository-scoped
+leg or nullable issue identity. Money, leases, caps, branches, PR publication,
+review and merge keep the ordinary issue path.
+
+A pure trigger owes a pass when no pass issue exists, or at least five PRs
+merged into the base strictly after the newest pass ended. A pass ends at its
+harness PR's merge time, or otherwise its issue's close time. The strict
+boundary excludes the pass PR itself. Only the newest pass matters: it is in
+flight while open without a merged harness PR, including when parked with
+`needs-human`. A merged PR ends even an issue left open on a non-default base.
+Each tick searches the newest 20 bot-authored title hits, open or closed,
+filters by the exact `Architecture pass` prefix and takes the newest pass,
+with state, close time and existing harness-PR cross-reference facts, then
+counts merges after the end when needed: at most two extra GraphQL requests.
+Missing, malformed or truncated required facts defer filing. Twenty hits with
+no genuine pass also defer, with one log line per observation and no pagination.
+Ledger history, base-head comparisons and elapsed age do not participate in
+the trigger. There is no harness watermark, counter, table, daemon or
+configuration knob.
+
+Like required base-CI issues, the newest in-flight pass is readied with `ai-ready`
+unless already ready or marked `needs-human`. Recognition requires FIX_BOT's
+authorship and the `Architecture pass` title prefix only;
+a human's similarly titled issue has no privilege. `Origin.ARCHITECTURE` skips
+STEWARD and TRIAGE and supplies a fixed HIGH starting tier through existing
+routing and escalation. Base-fix priority and base-failure charging remain
+specific to required base-CI repairs.
+
+The harness-written issue body holds the complete fixed, bounded pass contract
+so both fixer and independent reviewer receive it without the harness checkout.
+The ledger records `Covered through: <full commit sha on base>`: each pass
+inspects changes after that commit through the current base tip, or from the
+beginning when absent, and records only the full base SHA actually inspected.
+Merges during review remain covered by the next pass even though the trigger
+counts only merges after completion. The ledger holds evidence-linked pressure
+entries, trends, small candidate interventions, reconsideration thresholds and
+expiries; the agent merges entries and drops expired ones. Defer is valid. It
+may file at most three `tech-debt` issues for thresholds crossed, reuse existing issues,
+and link them from the ledger, never marking them `ai-ready`. This bounded
+authority is the sole exception to the fixer's issue-filing prohibition.
+Both fix and review consult an entry when a change touches its seam.
+
+`ISSUE_PICKUP=open` excludes `tech-debt` just as it excludes harness-gap reports;
+explicit `ai-ready` admits either. The extra parsed label is necessary to avoid
+turning architectural observations into a self-feeding paid queue. Provenance:
+GitHub stamps authorship and commit/merge metadata; repository writers control
+ledger content and labels. A fix leg has FIX_BOT_TOKEN and can imitate a pass;
+the existing sandbox and spend caps bound this accepted same-token exposure
+(ADR 0001, ADR 0007). No agent verdict can approve its own PR.
+
+Crash points reuse ADR 0001's keyed filing and label read-back: before filing,
+the next tick still owes it; an unanswered successful filing or a lagging
+search is found by act's own-issue listing; after filing but before readiness,
+the next observation readies the issue; a lost label is retried from its
+observed labels. The previous pass number fixes both title and idempotency key
+across ticks and UTC midnight, so exact-title read-back also suppresses a
+repeat filing while search lags. Tests: `tests/domain/test_architecture.py`,
+`tests/adapters/test_architecture_observe.py`, and
+`tests/app/test_architecture_steward.py`.

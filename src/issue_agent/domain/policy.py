@@ -19,11 +19,13 @@ from .actions import (
     ReportGap, RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .backoff import STALL_STREAK, LegEnd, machine_streak
+from .architecture import PassEnded, PassInFlight, architecture_owed
 from .checks import BaseHealth, BaseIssue, BaseRun
 from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_unsettled, base_title, base_verdicts, parse_timestamp, workflow_issues
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
+from .world import WorldState
 from .state import (
     AttemptsStop, Backoff, Blocked, Busy, DerivedState, Dispatch, DuplicateStop, Harness, ItemKey, LinkBlocker, Merge,
     NeedsHuman, OpenPR, QuestionStop, Refresh, Rerun, Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP,
@@ -127,6 +129,44 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
     link's state now, and is never acted on again."""
     return (f"{marker}\n{BLOCKER_TAG}\n**Steward**'s blocked-by #{blocker} claim was already handled; "
             "the harness will not write that link again.")
+
+
+_ARCHITECTURE_TASK = """Review architectural pressure in the target repository.
+
+- Read `docs/architecture-pressure.md` and its line `Covered through: <full commit sha on base>`.
+  Inspect all changes from that SHA (exclusive) to the current base tip (inclusive);
+  when the line or ledger is absent, inspect from the beginning of the base history.
+  Read the related PRs' review threads and residual sections. Record the full base commit SHA
+  actually inspected in `Covered through`; never advance it to uninspected changes or use
+  the previous pass's completion time as the coverage boundary.
+- Update the ledger with these fields for each pressured seam: seam; evidence links
+  (commits, PRs, review threads, residuals); trend; candidate intervention (the smallest
+  abstraction that removes several special cases); reconsideration trigger (an explicit
+  intervention threshold); expiry. Ground each entry and intervention in that evidence.
+  Merge overlapping entries, drop expired entries and keep the ledger small. "defer" is
+  a valid verdict; do not invent refactors to fill a quota.
+- For entries past their intervention threshold, use `gh` to file at most **3** issues
+  labelled `tech-debt` across all legs of this pass. Check for existing filings first and
+  reuse them. Link this pass issue from each filing and link each from the ledger.
+  Never mark these issues `ai-ready`; a human chooses which debt to work. This is the
+  only exception to the fixer's issue-filing prohibition.
+- Commit and push your normal fix branch with the ledger update, even when the verdict
+  is defer. Follow the normal publication workflow and end the summary with `Closes #<issue>`;
+  the harness opens the PR and runs independent review and merge.
+"""
+
+
+def architecture_actions(world: WorldState, harness: Harness) -> tuple[Action, ...]:
+    """File and ready an ordinary pass issue through the base-CI path (ADR 0017)."""
+    observed = world.architecture
+    if isinstance(observed, PassInFlight):
+        issue = observed.issue
+        return ((Relabel(Target.ISSUE, issue.number, None, Label.AI_READY),)
+                if not issue.labels & {Label.AI_READY, Label.NEEDS_HUMAN} else ())
+    if not architecture_owed(observed):
+        return ()
+    title = f"Architecture pass (after #{observed.number})" if isinstance(observed, PassEnded) else "Architecture pass (first)"
+    return (FileIssue(title, f"{harness.marker}\n{_ARCHITECTURE_TASK}", f"architecture:{title}"),)
 
 
 def base_ci_actions(health: BaseHealth | None, marker: str,
@@ -329,6 +369,6 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     raise TypeError(f"unknown derived state {state!r}")
 
 
-__all__ = ["QUESTION_LIMIT", "actions", "base_ci_actions",
+__all__ = ["QUESTION_LIMIT", "actions", "architecture_actions", "base_ci_actions",
            "blocker_closed_comment", "blocker_comment", "dispatch_order", "gap_actions", "needs_human_key",
            "question_text", "triage_comment"]

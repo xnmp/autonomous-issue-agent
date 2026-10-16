@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..domain.checks import BaseHealth, Unavailable
+from ..domain.architecture import ArchitectureObservation, NoPass, PassEnded, PassInFlight, architecture_pass
 from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
@@ -358,6 +359,11 @@ _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCo
                 "... on IssueComment{author{login} body} "
                 "... on ClosedEvent{closer{... on PullRequest{mergeCommit{oid}} ... on Commit{oid}}}}}}}}}")
 
+_PASS_ISSUES = ('query($q:String!){search(query:$q,type:ISSUE,first:20){issueCount nodes{... on Issue{'
+                'number title state closedAt author{login} ' + _LABELS + ' '
+                + _TIMELINE.format(before="") + '}}}}')
+_MERGED_COUNT = 'query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}'
+
 
 def _escaped(fields: str) -> str:
     return fields.replace("{", "{{").replace("}", "}}")
@@ -548,12 +554,17 @@ def parse_merged_harness_prs(items: list, repository: str) -> tuple[PRView, ...]
     out = []
     for item in items:
         source = item.get("source") if isinstance(item, dict) else None
-        if not isinstance(source, dict) or source.get("state") != "MERGED":
+        if source == {}:  # A non-PR source has no fields in the PullRequest fragment.
             continue
+        if not isinstance(source, dict):
+            raise FixObservationIncomplete("cross-reference source is unreadable")
         repo = (source.get("repository") or {}).get("nameWithOwner") if isinstance(source.get("repository"), dict) else ""
         head = source.get("headRefName")
-        if (not isinstance(repo, str) or repo.casefold() != repository.casefold() or type(source.get("number")) is not int
-                or not isinstance(head, str) or not head.startswith(_HARNESS_BRANCH_PREFIX)):
+        if (source.get("state") not in ("OPEN", "CLOSED", "MERGED") or not isinstance(repo, str) or not repo
+                or type(source.get("number")) is not int or not 0 < source["number"] <= 2**63 - 1
+                or not isinstance(head, str) or not head):
+            raise FixObservationIncomplete("cross-reference PR facts are malformed")
+        if source["state"] != "MERGED" or repo.casefold() != repository.casefold() or not head.startswith(_HARNESS_BRANCH_PREFIX):
             continue
         merged_at = source.get("mergedAt")
         out.append(PRView(number=source["number"], head_ref_name=head, state="MERGED", content_known=False,
@@ -840,8 +851,8 @@ class GitHubGateway:
                 blockers, problem = parse_blockers(node.get("blockedBy"), self.repo)
                 if problem:
                     sys.stderr.write(f"issue #{number}: {problem}; unreadable blockers never block\n")
-                issues.append(parse_fix_issue(node, comments, blockers))
                 merged.update((p.number, p) for p in parse_merged_harness_prs(xrefs, self.repo))
+                issues.append(parse_fix_issue(node, comments, blockers))
             except FixObservationIncomplete as exc:
                 self._skip_item("issue", number if type(number) is int else 0, exc)
         prs: list[PRView] = []
@@ -868,7 +879,53 @@ class GitHubGateway:
         for number, why in sorted(unknown.items()):
             self._skip_item("issue", number, FixObservationIncomplete(why))
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches, base=self._base_health(base, filed_by), pickup=pickup)
+                          branches=branches, base=self._base_health(base, filed_by), pickup=pickup,
+                          architecture=self._architecture(base, filed_by) if filed_by else None)
+
+    def _architecture(self, base: str, filer: str) -> ArchitectureObservation | None:
+        """Two bounded reads at most; unknown pass facts defer filing (ADR 0017)."""
+        try:
+            search = self._graphql(_PASS_ISSUES, q=(
+                f'repo:{self.repo} is:issue author:{filer} in:title "Architecture pass" sort:created-desc')).get("search")
+            if (not isinstance(search, dict) or not isinstance(search.get("nodes"), list)
+                    or type(search.get("issueCount")) is not int or not 0 <= search["issueCount"] <= 2**63 - 1
+                    or len(search["nodes"]) != min(20, search["issueCount"])):
+                return None
+            for node in search["nodes"]:
+                if (not isinstance(node, dict) or not isinstance(node.get("title"), str) or len(node["title"]) > 256
+                        or type(node.get("number")) is not int or not 0 < node["number"] <= 2**63 - 1
+                        or not 0 < len(_login(node.get("author"))) <= 256):
+                    return None
+                issue = IssueView(node["number"], title=node["title"], author=_login(node.get("author")))
+                if architecture_pass(issue, filer):
+                    break
+            else:
+                if search["issueCount"] >= 20:
+                    raise FixObservationIncomplete("no genuine pass among 20 search hits")
+                return NoPass()
+            if node.get("state") not in ("OPEN", "CLOSED"):
+                return None
+            issue = replace(issue, state=node["state"].lower(), labels=_complete_labels(node))
+            xrefs, info = _connection(node, "timelineItems", "hasPreviousPage")
+            if info["hasPreviousPage"] or len(xrefs) > 100:
+                return None
+            merged = tuple(p for p in parse_merged_harness_prs(xrefs, self.repo)
+                           if harness_branch_issue(p.head_ref_name) == issue.number)
+            if not merged and issue.state == "open":
+                return PassInFlight(issue)
+            stamps = tuple(p.merged_at for p in merged) if merged else (node["closedAt"],)
+            if any(not isinstance(s, str) or len(s) > 64 for s in stamps):
+                return None
+            ends = tuple(datetime.fromisoformat(s.replace("Z", "+00:00")) for s in stamps)
+            if any(end.utcoffset() is None for end in ends):
+                return None
+            count = self._graphql(_MERGED_COUNT, q=(
+                f'repo:{self.repo} is:pr is:merged base:{json.dumps(base)} merged:>{max(ends).isoformat()}'
+            )).get("search", {}).get("issueCount")
+            return PassEnded(issue.number, count)
+        except (ValueError, TypeError, KeyError, AttributeError, GhUnavailable) as exc:
+            sys.stderr.write(f"architecture unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
+            return None
 
     def _top_level(self, name: str, base: str, template: str) -> list:
         """One top-level connection, its own request per page (#425), read in
