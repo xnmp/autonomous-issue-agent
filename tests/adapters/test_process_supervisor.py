@@ -50,6 +50,67 @@ def _touch(marker: Path) -> tuple[str, ...]:
     return _python(f"from pathlib import Path; Path({str(marker)!r}).write_text('bad')")
 
 
+@pytest.mark.skipif(not os.access("/proc/self/oom_score_adj", os.W_OK), reason="writable Linux OOM adjustment required")
+@pytest.mark.parametrize("sdk", [False, True])
+def test_leg_launcher_and_descendants_are_oom_victims_without_adjusting_daemon(tmp_path, sdk):
+    daemon_adjustment = Path("/proc/self/oom_score_adj").read_text().strip()
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    run_id = RunId("oom-victim")
+    target = _python(
+        "import os, subprocess, sys; from pathlib import Path; "
+        "print(Path(f'/proc/{os.getppid()}/oom_score_adj').read_text().strip()); "
+        "print(Path('/proc/self/oom_score_adj').read_text().strip()); "
+        "subprocess.run([sys.executable, '-c', "
+        "\"from pathlib import Path; print(Path('/proc/self/oom_score_adj').read_text().strip())\"], check=True)"
+    )
+    if sdk:
+        wrapper, env = supervisor.supervised_cli(run_id, target)
+        command = (wrapper,)
+    else:
+        command = supervisor.supervised_command(run_id, target)
+        env = supervisor.launch_guard_env()
+    try:
+        completed = subprocess.run(
+            command, env={**os.environ, **env}, start_new_session=not sdk,
+            capture_output=True, text=True, timeout=10,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.splitlines() == ["1000", "1000", "1000"]
+        assert Path("/proc/self/oom_score_adj").read_text().strip() == daemon_adjustment
+    finally:
+        supervisor.kill_tree(run_id)
+
+
+@pytest.mark.parametrize("error", ["FileNotFoundError", "PermissionError", "OSError"])
+def test_unavailable_oom_adjustment_does_not_prevent_leg_execution(tmp_path, error):
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    run_id = RunId("oom-unavailable")
+    command = supervisor.supervised_command(run_id, _python("print('leg ran')"))
+    attempted = tmp_path / "adjustment-attempted"
+    bootstrap = (
+        "import builtins\n"
+        "original_open = builtins.open\n"
+        "def restricted_open(path, *args, **kwargs):\n"
+        "    if str(path) == '/proc/self/oom_score_adj':\n"
+        f"        with original_open({str(attempted)!r}, 'w') as stream: stream.write('unavailable')\n"
+        f"        raise {error}('OOM adjustment unavailable')\n"
+        "    return original_open(path, *args, **kwargs)\n"
+        "builtins.open = restricted_open\n"
+        "from issue_agent.adapters.supervised_exec import main\n"
+        "main()\n"
+    )
+    try:
+        completed = subprocess.run(
+            (*_python(bootstrap), *command[3:]), start_new_session=True,
+            capture_output=True, text=True, timeout=10,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.strip() == "leg ran"
+        assert attempted.read_text() == "unavailable"
+    finally:
+        supervisor.kill_tree(run_id)
+
+
 @pytest.mark.parametrize(
     "raw",
     [

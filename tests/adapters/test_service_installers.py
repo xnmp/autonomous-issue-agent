@@ -228,6 +228,8 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     units = sorted(_artifacts(home, True).glob("*.service"))
     assert len(units) == 3
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
+    assert all("OOMPolicy=continue\n" in unit.read_text() for unit in units)
+    assert all("MemoryMax=4G\n" in unit.read_text() for unit in units)
     terminal_hook = ROOT / "bin/service-terminal-evidence.sh"
     assert terminal_hook.is_file()
     for unit in _role_units(units):

@@ -24,6 +24,22 @@ mirrors its exit status. This preserves ancestor-recoverable durable publication
 without turning ordinary agent commands or target tests into control-store
 clients.
 
+Leg launchers set Linux's inherited `oom_score_adj` to 1000 before forking
+and executing the sandbox/runtime: legs are the preferred victims of cgroup
+or host OOM kills and earlyoom, preserving the daemon. The fix, review and
+dashboard units use `OOMPolicy=continue`; their existing `MemoryMax` remains
+the aggregate bound, with all leg processes inside the service. On hosts
+without writable `/proc/self/oom_score_adj` (including macOS/launchd and
+restricted containers), launch behaviour is unchanged.
+
+At the Codex classification boundary, exit 137 (`128 + SIGKILL`, as reported
+by bubblewrap for a killed runtime) is the same external machine death as a
+direct SIGKILL, never an agent attempt. Watchdog and budget stops retain their
+own classification; harness drain retains cancellation. Other positive exit
+statuses, including 143, keep their existing classification. The Claude SDK
+already treats pre-result process errors as transport deaths regardless of
+exit status and honours a captured result after a trailing process error.
+
 ## Consequences
 
 After earlyoom SIGTERMed the daemons on 2026-10-16 and their clean exit 0 left
