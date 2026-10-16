@@ -141,8 +141,8 @@ def test_an_enterprise_managed_user_login_is_a_login():
     assert login == "fixer_acme"
 
 
-def test_the_login_matches_up_to_case_and_bot_suffix_and_github_spelling_is_kept():
-    _identity, login, *_ = resolve("fix", {"FIX_BOT_TOKEN": "t"}, "Fix-Bot", "fix-bot[bot]")
+def test_the_login_matches_up_to_case_and_github_spelling_is_kept():
+    _identity, login, *_ = resolve("fix", {"FIX_BOT_TOKEN": "t"}, "Fix-Bot[bot]", "fix-bot[bot]")
     assert login == "fix-bot[bot]"
 
 
@@ -202,3 +202,9 @@ def test_build_role_refuses_when_github_names_another_login(tmp_path, monkeypatc
     env = _env(tmp_path, monkeypatch, FIX_BOT_TOKEN="ghp_fix", REVIEW_BOT_TOKEN="ghp_review")
     with pytest.raises(ValueError, match="acts as 'operator'"):
         main_module.build_role(role, env)
+
+
+@pytest.mark.parametrize("expected,answer", [("steward[bot]", "steward"), ("steward", "steward[bot]")])
+def test_same_name_different_account_type_refuses_at_boot(expected, answer):
+    with pytest.raises(ValueError, match="acts as"):
+        resolve("fix", {"FIX_BOT_TOKEN": "t"}, expected, answer)

@@ -125,12 +125,12 @@ def test_scalar_knobs_parse_absent_empty_and_malformed_values(knob, raw, field, 
         (None, None, True),  # P1R-7: an unset FIX_BOT used to sail through validate()
         ("   ", None, True),
         ("fix-bot", None, False),
-        # review C1/D1: a raw compare misses fix-bot vs fix-bot[bot], a self-approving
-        # pair GitHub rejects with a 422 on every approval; P1R-6: a trailing space
-        # (shell round-trip) used to defeat the normalization.
-        ("fix-bot", "fix-bot[bot]", True),
-        ("fix-bot ", "fix-bot[bot]", True),
+        # A User and an app Bot with the same base name are separate accounts (#481).
+        ("fix-bot", "fix-bot[bot]", False),
+        ("fix-bot ", "fix-bot[bot]", False),
         ("fix-bot", "review-bot", False),
+        (" Fix-Bot[bot] ", "fix-bot[bot]", True),
+        ("FIX-BOT", "fix-bot", True),
         (" fix-bot ", "review-bot", False),
     ],
 )

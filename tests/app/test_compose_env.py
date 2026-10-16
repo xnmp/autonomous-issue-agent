@@ -8,7 +8,7 @@ diff and the assignment names scanned from the files — hence the set-equality
 test. C5(b): main() exports the composed config into os.environ, since systemd
 units set only AGENT_ENV + TARGET_DIR and subprocesses (git, gh, codex) inherit
 it. D7: doctor fails when two overlays resolve to one state dir, and compares
-normalized logins (`fix-bot` vs `fix-bot[bot]`).
+account logins without collapsing Users and Bots (#481).
 
 These run the REAL scripts: compose-env.sh is copied into a scratch tree so its
 self-locating root resolves to scratch config, and doctor.sh runs with
@@ -457,9 +457,7 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
 
 
 def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
-    # normalize_login casefolds first, then strips — a differently-cased
-    # [BOT] suffix must be caught too.
-    result = _doctor_with(_fake_tool_path(tmp_path), FIX_BOT="Acme-Fixer", REVIEW_BOT="acme-fixer[BOT]", REPO="o/r")
+    result = _doctor_with(_fake_tool_path(tmp_path), FIX_BOT="Acme-Fixer[bot]", REVIEW_BOT="acme-fixer[BOT]", REPO="o/r")
     assert result.returncode != 0
     assert "FIX_BOT distinct from it" in result.stdout
 
@@ -593,3 +591,9 @@ def test_doctor_warns_when_base_pushes_cancel_each_others_runs(tmp_path):
         (target / ".github" / "workflows" / "ci.yml").write_text(workflow)
         result = _ci_doctor(tmp_path / name, {"TARGET_DIR": str(target)})
         assert ("cancel-in-progress: true on a push-triggered workflow ( ci.yml )" in result.stdout) == (name == "cancels")
+
+
+def test_doctor_distinguishes_a_user_from_the_same_name_app_bot(tmp_path):
+    result = _doctor_with(_fake_tool_path(tmp_path), FIX_BOT="Acme-Fixer", REVIEW_BOT="acme-fixer[bot]", REPO="o/r")
+    assert "two distinct identities (fix=Acme-Fixer, review=acme-fixer[bot])" in result.stdout
+    assert "FIX_BOT distinct from it" not in result.stdout

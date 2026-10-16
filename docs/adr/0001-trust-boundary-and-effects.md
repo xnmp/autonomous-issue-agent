@@ -187,3 +187,26 @@ The automatic pickup mode exists since 2026-10-15: `ISSUE_PICKUP=open`, a live
 per-deployment knob (ADR 0007 amendment, which records the trust it moves). It
 excludes the gap reports above through `domain.state.harness_gap`; a human's
 `ai-ready` on one is still honoured.
+
+Account recognition (#481, 2026-10-16) binds author trust to GitHub's account
+kind plus login. Adapters validate `author { __typename login }` (GraphQL),
+`user { type login }` (REST), or gh's typed `is_bot` projection into an
+immutable `Account`; missing, malformed or oversized authors grant no
+identity. GraphQL Bot `steward` and REST Bot `steward[bot]` encode the same
+account, distinct from User `steward`. Issue observations retain the typed
+account; reviews, comments and pushes retain its canonical spelling, with
+`[bot]` for Bot accounts. Identity-bearing single-item reads use GraphQL
+rather than gh's lossy review-author projection. Configuration and the
+credential's `viewer.login` use the full account spelling (`xnmp-fixer` for
+a User PAT, `steward[bot]` for an app); boot rejects a different account kind
+as well as a different login. Sibling-role configuration keeps that spelling. Concrete `CommitAuthor.user`
+also uses full login spelling, even for app bots whose concrete type is User.
+This replaces suffix-stripping comparisons for base-CI issue selection and
+close evidence, architecture-pass discovery and dispatch, gap-report pickup
+exclusion, harness comment provenance and human replies/resets, review
+verdicts and rejection ceilings, and comment/review write read-backs. CLI and shell doctor
+credential checks and self-approval configuration validation use the same
+exact account rule. No state, gate, knob or retry mechanism is added. The
+regressions exercise these boundaries offline in `tests/adapters/test_github_identity.py`
+and the existing identity, observation and role tests; live GitHub verification
+is outside this offline change.

@@ -531,7 +531,7 @@ def test_a_non_harness_comment_review_or_push_resets_attempts(change):
         {"comments": (Comment("alice", "hm", "not-a-time"),)},
         {"reviews": (review("CHANGES_REQUESTED", 10, head="old"),)},
         {"pushes": (Push("fix-bot", iso(10)),)},
-        {"pushes": (Push("Fix-Bot[bot] ", iso(10)),)},
+        {"pushes": (Push("Fix-Bot ", iso(10)),)},
         {"pushes": (Push("alice", ""),)},
         {"pushes": (Push("", iso(10)),)},  # GitHub could not attribute the commit
         {"pushes": (Push("  ", iso(10)),)},

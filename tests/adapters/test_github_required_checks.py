@@ -105,8 +105,13 @@ def gateway(*, branch=None, rules=None, pages=None, meta=None, jobs=None):
     )
 
     def run(argv, token):
-        if argv[1:3] == ["pr", "view"]:
-            return json.dumps({"number": 3, "headRefOid": "head", "baseRefName": "dev"})
+        if any("pullRequest(number:3){id number title body" in a for a in argv):
+            node = {"id": "P3", "number": 3, "headRefOid": "head", "baseRefName": "dev",
+                    "labels": {"totalCount": 0, "nodes": []}}
+            node |= {name: {"nodes": [], "totalCount": 0, "pageInfo": {
+                "hasNextPage" if name == "files" else "hasPreviousPage": False}}
+                for name in ("comments", "reviews", "files")}
+            return json.dumps({"data": {"repository": {"pullRequest": node}}})
         if jobs is not None and any("/actions/runs/77/jobs?filter=all" in v for v in argv):
             return json.dumps(jobs)
         if any("/rules/branches/" in v for v in argv):

@@ -6,6 +6,7 @@ import pytest
 
 from issue_agent.domain.actions import AgentKind, FileIssue, Relabel, Target
 from issue_agent.domain.architecture import NoPass, PassEnded, PassInFlight, architecture_owed
+from issue_agent.domain.identity import Account
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import architecture_actions
 from issue_agent.domain.routing import Tier
@@ -14,7 +15,7 @@ from issue_agent.domain.world import IssueView, Pickup, WorldState
 
 NOW = datetime(2026, 10, 16, tzinfo=timezone.utc)
 H = Harness("fix-bot", "review-bot")
-PASS = IssueView(7, "Architecture pass (first)", author="FIX-BOT ")
+PASS = IssueView(7, "Architecture pass (first)", author=Account("User", "FIX-BOT"))
 
 
 @pytest.mark.parametrize("observed,owed", [

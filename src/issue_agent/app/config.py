@@ -23,7 +23,7 @@ from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.effort import Effort
-from ..domain.identity import normalize_login
+from ..domain.identity import account_eq
 from ..domain.contracts import Money
 from ..domain.pricing import (
     CLAUDE_ALIASES,
@@ -209,7 +209,7 @@ class HarnessConfig:
         if not self.fix_bot.strip():
             # Without it the fixer's own PRs/reviews can never be identified.
             errors.append("FIX_BOT must be set")
-        if normalize_login(self.fix_bot) == normalize_login(self.review_bot):
+        if account_eq(self.fix_bot, self.review_bot):
             errors.append("FIX_BOT and REVIEW_BOT normalize to the same identity "
                           "(GitHub rejects self-approval with a 422)")
         for name, value in (("POLL_SECONDS", self.poll_seconds),

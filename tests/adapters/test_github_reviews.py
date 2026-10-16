@@ -11,7 +11,7 @@ BOT = "review-bot[bot]"
 
 
 def row(review_id=1, state="CHANGES_REQUESTED", *, login=BOT, commit=HEAD, submitted="2026-10-15T15:32:20Z"):
-    return {"id": review_id, "state": state, "user": {"login": login}, "commit_id": commit,
+    return {"id": review_id, "state": state, "user": {"type": "Bot" if login.lower().endswith("[bot]") else "User", "login": login}, "commit_id": commit,
             "submitted_at": submitted}
 
 
@@ -33,7 +33,7 @@ def test_a_standing_verdict_by_the_login_on_the_head_is_reviewed(state):
 
 def test_every_page_is_read_and_the_login_compares_normalized():
     calls = []
-    pages = [[row(1, login="someone")], [row(2, state="APPROVED", login="Review-Bot")]]
+    pages = [[row(1, login="someone")], [row(2, state="APPROVED", login="Review-Bot[bot]")]]
 
     assert gateway(json.dumps(pages), calls).reviewed_on(7, HEAD, BOT) is True
     assert "--paginate" in calls[0] and "--slurp" in calls[0]

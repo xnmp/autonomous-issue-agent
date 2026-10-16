@@ -39,7 +39,7 @@ from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
 from .config import default_state_dir as config_default_state_dir
 from .doctor import doctor_findings, identity_findings, parse_unit
-from .identity import LOGIN
+from ..domain.identity import account_eq, configured_account
 
 # …/src/issue_agent/app/cli.py → the harness checkout (plugin/ and config/).
 HARNESS_ROOT = os.path.dirname(
@@ -285,12 +285,6 @@ def detect_base_branch(target_dir: str, repo: str = "", sample: int = 20) -> tup
 _PROMPT_ATTEMPTS = 3
 
 
-def normalize_login(login: str) -> str:
-    """doctor.sh `_normalize_login`: `fix-bot` and `fix-bot[bot]` are one identity."""
-    value = login.strip().lower()
-    return value[: -len("[bot]")] if value.endswith("[bot]") else value
-
-
 def _gh_login(env: dict[str, str] | None = None) -> tuple[str, bool]:
     """(login, gh_answered). Not answered only when gh could not run at all;
     a non-zero exit is GitHub's verdict."""
@@ -301,7 +295,7 @@ def _gh_login(env: dict[str, str] | None = None) -> tuple[str, bool]:
         return "", False
     first = (proc.stdout or "").strip().splitlines()[:1]
     login = first[0].strip() if first else ""
-    valid = proc.returncode == 0 and login != "null" and bool(LOGIN.fullmatch(login))
+    valid = proc.returncode == 0 and login != "null" and configured_account(login) is not None
     return (login if valid else ""), True
 
 
@@ -355,7 +349,7 @@ def prompt_token(var: str, expected_login: str = "") -> str:
             return token
         if not login:
             warn("GitHub rejected that token (expired, revoked, or lacking read:user). It will NOT be stored.")
-        elif expected_login and normalize_login(login) != normalize_login(expected_login):
+        elif expected_login and not account_eq(login, expected_login):
             warn(f"that token belongs to '{login}', not '{expected_login}' — the role refuses to start "
                  "on another account's credential. It will NOT be stored.")
         else:
@@ -415,7 +409,7 @@ def cmd_init(args) -> int:
     review_bot = ""
     for attempt in range(1, _PROMPT_ATTEMPTS + 1):
         review_bot = _ask("Reviewer login (distinct from the fixer)")
-        if not review_bot or normalize_login(review_bot) != normalize_login(fix_bot):
+        if not review_bot or not account_eq(review_bot, fix_bot):
             break
         warn(f"'{review_bot}' is also the fixer — GitHub 422s a review by the PR's author."
              + (" Keeping it; `issue-agent doctor` will flag it." if attempt == _PROMPT_ATTEMPTS else ""))

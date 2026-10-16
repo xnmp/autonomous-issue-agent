@@ -23,7 +23,7 @@ def merge(at=NOW, *, issue=7, base="dev", repo="o/r"):
 
 
 def pass_issue(number=7, *, pr=None, closed=None, **changes):
-    return issue_node(number, title="Architecture pass (first)", author={"login": "FIX-BOT "}, labels=labels(),
+    return issue_node(number, title="Architecture pass (first)", author={"__typename": "User", "login": "FIX-BOT"}, labels=labels(),
                       state="CLOSED" if closed else "OPEN", closedAt=closed,
                       timelineItems={"pageInfo": {"hasPreviousPage": False},
                                      "nodes": [{"source": pr}] if pr else []}, **changes)
@@ -129,7 +129,7 @@ def test_open_pass_is_in_flight_and_unlabelled_pass_is_readied_without_its_body(
 def test_only_the_newest_bot_authored_pass_anchors_the_count():
     passes = tuple(pass_issue(n) for n in range(1, 8))
     latest = pass_issue(8, closed=NOW.isoformat())
-    stranger = {**pass_issue(9), "author": {"login": "alice"}}
+    stranger = {**pass_issue(9), "author": {"__typename": "User", "login": "alice"}}
     server = Server(passes=passes + (latest, stranger), merges=work_merges(5))
     assert filing(world(server))[0].title == "Architecture pass (after #8)"
 
@@ -146,7 +146,7 @@ def test_older_pass_details_and_label_history_do_not_control_the_trigger():
     assert filing(world(Server(passes=(older, newest), merges=work_merges(5))))[0].title == "Architecture pass (after #8)"
 
 
-@pytest.mark.parametrize("changes", [{"author": {"login": "alice"}}, {"title": "Discuss Architecture pass"}])
+@pytest.mark.parametrize("changes", [{"author": {"__typename": "User", "login": "alice"}}, {"title": "Discuss Architecture pass"}])
 def test_non_bot_or_non_prefix_search_hits_are_ignored(changes):
     node = {**pass_issue(), **changes}
     assert filing(world(Server(passes=(node,))))[0].title == "Architecture pass (first)"
@@ -270,7 +270,7 @@ def test_optional_graphql_error_does_not_lose_ordinary_work():
 def test_fix_issue_reads_keep_bodies_out_of_the_tick_payload():
     server = Server(issues=(issue_node(),))
     world(server)
-    assert any("id number title state author{login}" in query for query in server.graphql_queries)
+    assert any("id number title state author{__typename login}" in query for query in server.graphql_queries)
     assert all("number title body state" not in query for query in server.graphql_queries)
 
 

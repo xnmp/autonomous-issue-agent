@@ -108,7 +108,7 @@ def test_a_comment_whose_presence_cannot_be_read_is_not_posted_again(tmp_path):
         gh.reply = reply
         with pytest.raises(FixObservationIncomplete):
             act.execute(STOP)
-    gh.reply = {"comments": [None, 7, {"body": STOP.body, "author": {"login": "fixer"}}]}  # junk entries beside the real one
+    gh.reply = {"comments": [None, 7, {"body": STOP.body, "author": {"__typename": "User", "login": "fixer"}}]}  # junk entries beside the real one
     act.execute(STOP)
     assert gh.posted == [STOP.body]
 
