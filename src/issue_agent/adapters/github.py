@@ -354,7 +354,7 @@ _BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid sta
              + _BASE_CONTEXTS.format(after="") + "}}}}")
 
 _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount "
-                "nodes{... on Issue{number title state closedAt author{login} "
+                "nodes{... on Issue{number title body state closedAt author{login} "
                 "timelineItems(itemTypes:[ISSUE_COMMENT,CLOSED_EVENT,REOPENED_EVENT],last:2){nodes{__typename "
                 "... on IssueComment{author{login} body} "
                 "... on ClosedEvent{closer{... on PullRequest{mergeCommit{oid}} ... on Commit{oid}}}}}}}}}")

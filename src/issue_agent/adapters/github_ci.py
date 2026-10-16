@@ -146,11 +146,12 @@ def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
     count = search.get("issueCount") if isinstance(search, dict) else None
     if (not isinstance(nodes, list) or type(count) is not int or len(nodes) != min(count, 100)
             or any(not isinstance(n, dict) or type(n.get("number")) is not int or not isinstance(n.get("title"), str)
+                   or not isinstance(n.get("body", ""), str)
                    or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
                    for n in nodes)):
         raise ValueError("issue search is absent, malformed or short")
     return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
-                           *_closer(n, filer) if n["state"] == "CLOSED" else ())
+                           *_closer(n, filer) if n["state"] == "CLOSED" else ("", ""), body=n.get("body") or "")
                  for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
 
 

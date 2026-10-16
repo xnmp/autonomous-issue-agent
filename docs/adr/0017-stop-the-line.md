@@ -210,3 +210,47 @@ across ticks and UTC midnight, so exact-title read-back also suppresses a
 repeat filing while search lags. Tests: `tests/domain/test_architecture.py`,
 `tests/adapters/test_architecture_observe.py`, and
 `tests/app/test_architecture_steward.py`.
+
+## Amendment (2026-10-16, #486): one repair for the red base
+
+Base-CI filing, readiness and closure now operate on the branch, rather than
+separately on each workflow. The title is `CI: base failing on <base> (first)`
+or `(after #<previous issue>)`. The previous ended issue fixes identity across
+lost filing replies and stale searches even when another workflow completes
+later, revealing an earlier first failure. No new streak anchor is stored.
+The body lists the currently red workflows and each first failing run in the
+observed history, and directs the fixer to inspect current runs too: another
+workflow can finish after this snapshot. Any required red workflow makes this
+single issue required work.
+
+All prior per-workflow titles on this base belong to this same repair. The
+oldest open issue owns dispatch; other open copies close in favor of that
+owner unless parked by a human. Other base issues and their PRs, closed copies
+included, cannot dispatch paid work. When no workflow is red, all base repair
+work waits unpaid for closure. A close requires green verdicts and no newer
+pending run. Workflows named in the filing body (or a legacy title) cannot
+silently disappear from scope when their run ages out of the bounded listing:
+they need green evidence, or a readable workflow inventory proving removal.
+An unrelated nightly or PR-only workflow does not hold closure.
+
+The new observation input is the existing issue body, authored as FIX_BOT and
+editable by repository writers, like the legacy title. Its workflow names are
+evidence of scope, never approval or merge authority. They are compared in the
+same inert display form in which policy writes them. The body is a filing
+snapshot; later-finishing workflows are discovered from current push runs.
+The existing 100-run history ceiling remains; no pagination or new history
+store is introduced.
+
+The per-workflow title builder, issue lookup, green hold and separate
+orphan-close action are removed. Close anchors and post-merge handoff remain
+at branch scope: GitHub can close an issue before its fix's CI runs, and a
+non-default-base merge can leave an issue open but shadowed by a merged PR.
+A still-red post-fix run files one successor before its predecessor closes.
+No new action, label, store field, counter, retry or knob is added.
+
+Crash coverage: `tests/domain/test_base_ci.py` retains close/filing replay and
+creation-time boundaries, including a late earlier failure preserving filing
+identity. `tests/app/test_fix_role.py` verifies two workflows file one issue
+and dispatch one RESOLVE leg; lost filing replies and stale search still use
+ADR 0001's keyed read-back. Adapter tests cover the issue-body input and
+malformed input; domain tests cover history aging and workflow removal.

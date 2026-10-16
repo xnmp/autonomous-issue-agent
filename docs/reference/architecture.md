@@ -310,9 +310,9 @@ that matters is not "wrong answer" but "loop that bills forever":
   per poll, as a refused update-branch does, until a push or a human
   (residuals §2).
 - a red base is not charged to PRs (#313) and is fixed first (#402, ADR
-  0017): one base-CI issue per workflow per red streak, from the base's
-  completed push runs (`policy.base_ci_actions`); a required workflow's
-  (`ci.base_fix`: its check run on the tip carries a required context) is
+  0017): one base-CI issue per branch red streak (#486), listing the red
+  workflows from the base's push runs (`policy.base_ci_actions`); when any is
+  required (`ci.base_fix`: its check run on the tip carries a required context), it is
   readied, ordered first and resolved without STEWARD, TRIAGE or a blocker,
   and its PR is charged the base's failures. Nothing is paused or stored.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the

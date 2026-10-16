@@ -521,7 +521,7 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
                # A base-fix PR must fix the base's failures: none of them is the base's to it.
                base=world.base.reports if world.base and world.base.ref == p.base_ref_name and n not in fixing
                else None, origin=Origin.ARCHITECTURE if n in architecture else Origin.HUMAN)
-         for p, n in prs if p.number > 0]
+         for p, n in prs if p.number > 0 and n not in held]
     observed = parse_timestamp(world.now)
     return {item.key: _decide(item, local, harness, observed) for item in items}
 

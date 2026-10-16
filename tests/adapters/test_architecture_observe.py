@@ -271,7 +271,7 @@ def test_fix_issue_reads_keep_bodies_out_of_the_tick_payload():
     server = Server(issues=(issue_node(),))
     world(server)
     assert any("id number title state author{login}" in query for query in server.graphql_queries)
-    assert all("number title body state" not in query for query in server.graphql_queries)
+    assert all("number title body state" not in query for query in server.graphql_queries if "issues(first:" in query)
 
 
 def test_tech_debt_label_survives_github_parsing():

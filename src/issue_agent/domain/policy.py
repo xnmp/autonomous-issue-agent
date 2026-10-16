@@ -21,7 +21,7 @@ from .actions import (
 from .backoff import STALL_STREAK, LegEnd, machine_streak
 from .architecture import PassEnded, PassInFlight, architecture_owed
 from .checks import BaseHealth, BaseIssue, BaseRun
-from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_unsettled, base_title, base_verdicts, parse_timestamp, workflow_issues
+from .ci import RED_CONCLUSIONS, base_fix, base_issues, base_title, base_verdicts, parse_timestamp
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
@@ -172,75 +172,86 @@ def architecture_actions(world: WorldState, harness: Harness) -> tuple[Action, .
 def base_ci_actions(health: BaseHealth | None, marker: str,
                     labels: Mapping[int, frozenset[Label]] = MappingProxyType({}),
                     merged: Mapping[int, str] = MappingProxyType({})) -> tuple[Action, ...]:
-    """One issue per workflow per red streak on the base branch, required or
-    not (#402, ADR 0017). Green closes the workflow's open issues. A red
-    verdict with none open files one, named and keyed by the streak's first
-    failing run created at or after the close of the workflow's last closed
-    issue (any close, legacy titles too), or of the commit that closed it: a
-    run that tested pre-fix code never files. Green closes only when settled:
-    no newer run of the workflow is still running (#442). An open issue whose harness PR merged (`merged`: issue -> merged at;
-    a fix into a non-default base that `Closes #` does not close) has ended
-    once a failing run created at or after the merge has completed: that run
-    files the next issue, and the ended issue is closed only once another
-    issue of the workflow is seen open. The close never precedes the filing,
-    so a lost write (an error, a kill) leaves the next tick to derive what is
-    left. A run from before the merge counts for neither, and `needs-human`
-    keeps the issue open. A required
-    workflow's open issue is readied (`ai-ready`) unless it carries
-    `ai-ready` or `needs-human` (`labels`, of the open issues the fix role
-    reads). An open issue whose workflow is neither listed in the base's runs
-    nor among the repository's workflows is closed (#449) unless it carries
-    `needs-human`: renamed or removed, it would never pass."""
+    """One branch-wide red streak issue (ADR 0017, #486).
+
+    A merged repair that still fails hands off to one successor, observed
+    before its predecessor closes. All workflows share the same close anchor
+    and off-switch; no per-workflow issue lifecycle remains.
+    """
     if health is None or health.runs is None:
         return ()
-    base, unsettled = health.ref, base_unsettled(health.runs)
+    base, issues = health.ref, base_issues(health)
+    verdicts = base_verdicts(health.runs)
+    red = [(latest, since, bounded) for latest, since, bounded in verdicts
+           if latest.conclusion in RED_CONCLUSIONS]
+    opened = [i for i in issues if not i.closed_at]
+    if not red:
+        # A newer queued/run/re-run can still fail; an empty listing is not green.
+        green = [latest for latest, _, _ in verdicts]
+        if (not green or any(not r.conclusion and (not any(g.workflow == r.workflow for g in green)
+                           or _created(r) > max(_created(g) for g in green if g.workflow == r.workflow))
+                            for r in health.runs)):
+            return ()
+        scoped = _base_scope(issues, opened, marker)
+        named = {name for i in scoped for name in re.findall(
+            r"^- \*\*(.+)\*\*: (?:First|Earliest listed) failing run:", i.body, re.M)}
+        named.update(_inert(' '.join(found[1].split())[:200]) for i in scoped
+                     if (found := re.fullmatch(rf"CI: (.+) failing on {re.escape(base)}(?: since \S+)?", i.title)))
+        # Keep the filing's evidence when its workflow ages out of the run
+        # listing. An unrelated nightly workflow is not part of that scope.
+        missing = named - {_inert(' '.join(g.workflow.split())[:200]) for g in green}
+        if missing and (health.workflows is None or missing & {
+                _inert(' '.join(w.split())[:200]) for w in health.workflows}):
+            return ()
+        latest = min(green, key=_created)
+        return tuple(SetIssueState(i.number, False, f"{marker}\nBase CI passes on `{base}` again: {latest.url} "
+                                   f"(head `{latest.head_sha}`, created `{latest.created_at}`).") for i in opened)
+    failures = sorted((r for latest, since, _ in red for r in health.runs
+                       if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
+                       and _created(r) >= _created(since)), key=_created)
+    ended = {i.number: next((r for r in failures if _created(r)[0] >= at), None) for i in opened
+             if (at := parse_timestamp(merged.get(i.number, "")))
+             and Label.NEEDS_HUMAN not in labels.get(i.number, frozenset())}
+    ended = {n: r for n, r in ended.items() if r is not None}
     out: list[Action] = []
-    for latest, since, bounded in base_verdicts(health.runs):
-        issues, name = workflow_issues(health, latest.workflow), _inert(" ".join(latest.workflow.split())[:200])
-        opened = [i for i in issues if not i.closed_at]
-        if latest.conclusion in GREEN_CONCLUSIONS:
-            out.extend(SetIssueState(i.number, False, f"{marker}\n**{name}** passes on `{base}` again: {latest.url} "
-                                                      f"(head `{latest.head_sha}`, created `{latest.created_at}`).")
-                       for i in opened if latest.workflow not in unsettled)
-            continue
-        streak = sorted((r for r in health.runs if r.workflow == latest.workflow and r.conclusion in RED_CONCLUSIONS
-                         and _created(r) >= _created(since)), key=_created)
-        closed = {i.title for i in issues if i.closed_at}
-        failed = {i.number: next((r for r in streak if _created(r)[0] >= at), None) for i in opened
-                  if (at := parse_timestamp(merged.get(i.number, ""))) and Label.NEEDS_HUMAN not in labels.get(
-                      i.number, frozenset())}
-        ended = {n: r for n, r in failed.items() if r is not None}  # its fix merged, and a later run still fails
-        if len(ended) < len(opened):  # another issue stays open for the red base: the ended ones may close
-            out.extend(SetIssueState(n, False, f"{marker}\nIts fix merged, but **{name}** still fails on `{base}` "
-                                               f"after it: {r.url}. That failure has an issue of its own.")
-                       for n, r in sorted(ended.items()))
-            continue
-        # The commit whose merge or push closed the last issue tested the fix, whenever GitHub dates the close.
-        after, closer = max(((_anchor(i, at, marker, base), i.closed_by) for i in issues
-                             if (at := parse_timestamp(i.closed_at))), default=(None, ""))
-        first = min(ended.values(), key=_created) if ended else next((
-            r for r in streak if base_title(latest.workflow, base, r.head_sha) not in closed
-            and (after is None or _created(r)[0] >= after or closer and r.head_sha == closer)), None)
-        if first is None:
-            continue  # every listed failure predates what ended the last issue: the next failing run files
-        title = base_title(latest.workflow, base, first.head_sha)
-        lead = "Earliest listed" if first == since and not bounded else "First"
-        out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {lead} failing run: {first.url} "
-                                    f"(head `{first.head_sha}`).\n\nThe harness closes this issue when it passes; a "
-                                    "later failure gets an issue of its own.", f"base-ci:{base}:{title}"))
-    if health.workflows is not None:  # the 100 listed runs span hours: a path-filtered workflow may be absent
-        live = {i.number for w in health.workflows | {r.workflow for r in health.runs}
-                for i in workflow_issues(health, w)}
-        shape = re.compile(rf"CI: .+ failing on {re.escape(base)}(?: since \S+)?")
-        out.extend(SetIssueState(i.number, False, f"{marker}\nNo workflow of this repository runs under this issue's "
-                                                  f"name on `{base}` any more (renamed, removed or disabled), so it "
-                                                  "would never pass here.")
-                   for i in health.issues if not i.closed_at and i.number not in live and shape.fullmatch(i.title)
-                   and Label.NEEDS_HUMAN not in labels.get(i.number, frozenset()))
-    admitted = {n for n, held in labels.items() if Label.AI_READY in held or Label.NEEDS_HUMAN in held}
+    if any(i.number not in ended for i in opened):
+        keeper = next(i for i in opened if i.number not in ended)
+        out.extend(SetIssueState(i.number, False, f"{marker}\nBase CI is tracked by #{keeper.number}.")
+                   for i in opened if i != keeper and Label.NEEDS_HUMAN not in labels.get(i.number, frozenset()))
+    else:
+        previous = max((i for i in issues if i.closed_at or i.number in ended),
+                       key=lambda i: (parse_timestamp(i.closed_at or merged[i.number])
+                                      or datetime.min.replace(tzinfo=timezone.utc), i.number), default=None)
+        after = (_anchor(previous, parse_timestamp(previous.closed_at) or datetime.min.replace(tzinfo=timezone.utc),
+                         marker, base) if previous and previous.closed_at else None)
+        first = min(ended.values(), key=_created) if ended else next((r for r in failures
+            if after is None or _created(r)[0] >= after or previous and previous.closed_by == r.head_sha), None)
+        if first is not None:
+            title = base_title(base, previous.number if previous else None)
+            details = "\n".join(f"- **{_inert(' '.join(latest.workflow.split())[:200])}**: "
+                                 f"{'First' if bounded else 'Earliest listed'} failing run: {since.url} "
+                                 f"(head `{since.head_sha}`)." for latest, since, bounded in red)
+            out.append(FileIssue(title, f"{marker}\nBase CI is failing on `{base}`.\n\n{details}\n\n"
+                "Fix the red base across all workflows. Read the current base runs as well: another workflow "
+                "may finish after this snapshot. The harness closes this issue only when base CI passes; "
+                "a later red streak gets a new issue.", f"base-ci:{base}:{title}"))
+    admitted = {n for n, held in labels.items() if held & {Label.AI_READY, Label.NEEDS_HUMAN}}
+    closing = {a.number for a in out if isinstance(a, SetIssueState)}
     out.extend(Relabel(Target.ISSUE, n, remove=None, add=Label.AI_READY)
-               for n in sorted(base_fix(health) - admitted))
+               for n in sorted(base_fix(health) - admitted - closing))
     return tuple(out)
+
+
+def _base_scope(issues: tuple[BaseIssue, ...], opened: list[BaseIssue], marker: str) -> tuple[BaseIssue, ...]:
+    # Consolidation changes the owner, not the workflows owed green evidence.
+    # Follow existing close comments, including a predecessor handed to a successor.
+    scoped = {i.number for i in opened}
+    while True:
+        notes = {f"{marker}\nBase CI is tracked by #{n}." for n in scoped}
+        expanded = scoped | {i.number for i in issues if i.note in notes}
+        if expanded == scoped:
+            return tuple(i for i in issues if i.number in scoped)
+        scoped = expanded
 
 
 def _anchor(issue: BaseIssue, closed_at: datetime, marker: str, base: str) -> datetime:
@@ -248,8 +259,8 @@ def _anchor(issue: BaseIssue, closed_at: datetime, marker: str, base: str) -> da
     closed. The harness's green close, known by the comment it closed with:
     its green run's creation, since a run created between the tick's read and
     the close landing must still file. The harness's other closes need no
-    care: a merged fix's issue closes only once the next is open, and an
-    orphan's workflow no longer runs. Any other close: the close itself (#442)."""
+    care: a merged fix's issue closes only once the next is open. Any other
+    close anchors on the close itself (#442)."""
     green = None if issue.closed_by else re.fullmatch(
         rf"{re.escape(marker)}\n.* passes on `{re.escape(base)}` again: \S+ \(head `\S*`, created `([^`]+)`\)\.",
         issue.note, re.S)

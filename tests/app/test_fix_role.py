@@ -97,7 +97,7 @@ class FakeGitHub:
         required workflows."""
         if not filer:
             return BaseHealth("dev", self.base_reports)
-        issues = tuple(BaseIssue(n, i.title, "" if i.state == "open" else self.closed_times[n])
+        issues = tuple(BaseIssue(n, i.title, "" if i.state == "open" else self.closed_times[n], body=i.body)
                        for n, i in sorted(self.issues.items())
                        if i.author == filer and "failing on dev" in i.title and n not in self.unindexed)
         return BaseHealth("dev", self.base_reports, tuple(self.base_runs), issues, self.required)
@@ -1366,7 +1366,7 @@ def test_a_base_failure_files_one_unlabelled_issue_naming_the_run_and_head(role)
     tick(composed)
 
     (issue,) = base_issues(gh).values()
-    assert issue.title == "CI: macOS Smoke failing on dev since sha2" and issue.labels == frozenset()
+    assert issue.title == "CI: base failing on dev (first)" and issue.labels == frozenset()
     assert issue.state == "open" and "https://github.com/o/r/actions/runs/2 (head `sha2`)" in issue.body
     assert gh.observed_by[-1] == FIX_BOT
 
@@ -1396,7 +1396,7 @@ def test_a_flaky_suite_gets_one_issue_per_red_streak_each_closed_on_green(role):
 
     gh.base_runs.append(base_run("macOS Smoke", 5, "failure", 5))
     tick(composed)
-    fresh = base_issues(gh)["CI: macOS Smoke failing on dev since sha5"]
+    fresh = base_issues(gh)[f"CI: base failing on dev (after #{issue.number})"]
     assert fresh.state == "open" and gh.issues[issue.number].state == "closed"
 
 
@@ -1411,7 +1411,7 @@ def test_a_close_while_still_red_files_the_next_streaks_issue_on_the_next_red_ru
     assert len(base_issues(gh)) == 1  # no red run since the close yet
     gh.base_runs.append(base_run("macOS Smoke", 3, "failure", 5))
     tick(composed)
-    assert base_issues(gh)["CI: macOS Smoke failing on dev since sha3"].state == "open"
+    assert base_issues(gh)[f"CI: base failing on dev (after #{issue.number})"].state == "open"
 
 
 @pytest.mark.parametrize("conclusion", ["cancelled", "skipped"])
@@ -1430,14 +1430,17 @@ def test_cancelled_or_skipped_runs_neither_file_nor_close(role, conclusion):
     assert gh.issues[issue.number].state == "open" and gh.closed == []  # red under a cancelled run is still red
 
 
-def test_two_failing_workflows_file_two_issues(role):
+def test_two_failing_workflows_file_one_issue_and_dispatch_one_leg(role):
     gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -5),
                                base_run("Windows smoke", 3, "timed_out", -5), base_run("CI", 4, "success", -5)])
-    composed, _ = role(gh, Agent())
+    gh.required = frozenset({"Windows smoke"})
+    composed, _ = role(gh, Agent(did_nothing()))
     tick(composed)
     tick(composed)
-    assert sorted(base_issues(gh)) == ["CI: Windows smoke failing on dev since sha3",
-                                       "CI: macOS Smoke failing on dev since sha2"]
+    (issue,) = base_issues(gh).values()
+    assert issue.title == "CI: base failing on dev (first)"
+    assert "**macOS Smoke**" in issue.body and "**Windows smoke**" in issue.body
+    assert [a.number for a in dispatched(tick(composed), AgentKind.RESOLVE)] == [issue.number]
 
 
 def test_a_lost_reply_on_filing_files_exactly_one_issue(role):
@@ -1526,7 +1529,7 @@ def test_402_a_fix_merged_into_a_non_default_base_that_leaves_it_red_files_the_n
     assert gh.issues[issue.number].state == "open" and len(base_issues(gh)) == 1
     gh.base_runs.append(base_run("Smoke", 4, "failure", 5))  # the merge's run is red
     tick(composed)
-    fresh = base_issues(gh)["CI: Smoke failing on dev since sha4"]  # filed before the fixed issue closes
+    fresh = base_issues(gh)[f"CI: base failing on dev (after #{issue.number})"]  # filed before the fixed issue closes
     tick(composed)
     assert gh.issues[issue.number].state == "closed"  # not left open and shadowed by its merged PR
     tick(composed)
@@ -1543,7 +1546,7 @@ def test_402_a_second_red_streak_after_a_merged_fix_files_and_dispatches_a_new_i
     assert gh.merged == [(100, "h1")] and gh.issues[issue.number].state == "closed"  # the merge closes it
     gh.base_runs.append(base_run("Smoke", 3, "failure", 5))  # the base is still red
     tick(composed)
-    fresh = base_issues(gh)["CI: Smoke failing on dev since sha3"]
+    fresh = base_issues(gh)[f"CI: base failing on dev (after #{issue.number})"]
     tick(composed)
     assert Label.AI_READY in gh.issues[fresh.number].labels
     assert [a.number for a in dispatched(tick(composed), AgentKind.RESOLVE)] == [fresh.number]

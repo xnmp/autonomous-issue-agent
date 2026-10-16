@@ -1,4 +1,4 @@
-"""Gap 22 / #402 (ADR 0017): one base-CI issue per workflow per red streak,
+"""Gap 22 / #402 (ADR 0017): one base-CI issue per branch red streak,
 and a required workflow's issue readied and fixed first. Through
 `base_ci_actions`, `derive` and `dispatch_order`."""
 
@@ -20,6 +20,7 @@ from issue_agent.domain.world import BlockerRef, IssueView, PRView, WorldState
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 PREFIX = "CI: macOS Smoke failing on dev"
+TITLE = "CI: base failing on dev"
 CLOSED_AT = "2026-10-14T02:00:00Z"
 
 
@@ -45,10 +46,10 @@ def test_an_unread_base_acts_on_nothing():
     assert base_ci_actions(BaseHealth("dev"), "<!-- m -->") == ()  # the tip read, the runs not
 
 
-def test_a_red_streak_files_one_issue_named_and_keyed_by_its_first_failing_run():
+def test_a_red_streak_files_one_issue_with_stable_identity_and_first_failure_evidence():
     (filed,) = _act(_br(1, "success"), _br(2, "failure"), _br(3, "failure"))
-    assert isinstance(filed, FileIssue) and filed.title == f"{PREFIX} since sha2"
-    assert filed.key == f"base-ci:dev:{PREFIX} since sha2"
+    assert isinstance(filed, FileIssue) and filed.title == f"{TITLE} (first)"
+    assert filed.key == f"base-ci:dev:{TITLE} (first)"
     assert filed.body.startswith("<!-- m -->\n") and "First failing run: https://x/runs/2 (head `sha2`)" in filed.body
 
 
@@ -61,7 +62,7 @@ def test_an_open_issue_of_the_workflow_files_nothing_and_green_closes_it():
     for title in (f"{PREFIX} since sha2", PREFIX):  # a legacy issue counts as the current streak's
         assert _act(_br(2, "failure"), issues=[BaseIssue(40, title)]) == ()
         (closed,) = _act(_br(9, "success"), issues=[BaseIssue(40, title)])
-        assert closed == SetIssueState(40, False, "<!-- m -->\n**macOS Smoke** passes on `dev` again: "
+        assert closed == SetIssueState(40, False, "<!-- m -->\nBase CI passes on `dev` again: "
                                                   "https://x/runs/9 (head `sha9`, created `2026-10-14T00:00:09Z`).")
     assert _act(_br(9, "success"), issues=[BaseIssue(40, PREFIX, CLOSED_AT)]) == ()
 
@@ -69,7 +70,7 @@ def test_an_open_issue_of_the_workflow_files_nothing_and_green_closes_it():
 def test_a_new_red_streak_after_green_files_a_fresh_issue():
     issues = [BaseIssue(40, f"{PREFIX} since sha2", CLOSED_AT)]
     (filed,) = _act(_br(2, "failure"), _br(3, "success", hour=1), _br(5, "failure", hour=3), issues=issues)
-    assert filed.title == f"{PREFIX} since sha5"
+    assert filed.title == f"{TITLE} (after #40)"
 
 
 def test_a_close_while_red_files_the_next_issue_on_the_next_red_run_only():
@@ -77,7 +78,7 @@ def test_a_close_while_red_files_the_next_issue_on_the_next_red_run_only():
     issues = [BaseIssue(40, f"{PREFIX} since sha1", CLOSED_AT)]
     assert _act(_br(1, "failure"), _br(2, "failure", hour=1), issues=issues) == ()
     (filed,) = _act(_br(1, "failure"), _br(2, "failure", hour=1), _br(3, "failure", hour=3), issues=issues)
-    assert filed.title == f"{PREFIX} since sha3"
+    assert filed.title == f"{TITLE} (after #40)"
 
 
 def _run(run: int, conclusion: str, created: str, completed: str) -> BaseRun:
@@ -106,10 +107,10 @@ def test_a_run_created_between_the_ticks_read_and_its_green_close_still_files():
     (close,) = _act(green, issues=[BaseIssue(40, f"{PREFIX} since sha0")])
     harness = BaseIssue(40, f"{PREFIX} since sha0", "2026-10-14T10:00:06Z", note=close.comment)
     (filed,) = _act(green, x, issues=[harness])
-    assert filed.title == f"{PREFIX} since sha2"
+    assert filed.title == f"{TITLE} (after #40)"
     # The closing green itself, re-run and failing, is the base red again: it files.
     (filed,) = _act(_run(1, "failure", "09:30:00", "10:40:00"), issues=[harness])
-    assert filed.title == f"{PREFIX} since sha1"
+    assert filed.title == f"{TITLE} (after #40)"
     # Any other close anchors on the close: X tested older code. No comment, another's words (a leg's
     # forgery is the residual), a comment naming no green run, or a closing commit.
     for other in ("", close.comment.replace("<!-- m -->", "<!-- other -->"), close.comment.replace(", created", ""),
@@ -137,7 +138,7 @@ def test_after_any_close_only_a_failure_created_at_or_after_the_last_close_files
         assert _act(_run(1, "failure", "10:30:00", "11:20:00"), issues=issues) == ()
         (filed,) = _act(_run(1, "failure", "10:30:00", "11:20:00"), _run(2, "failure", "11:00:00", "11:30:00"),
                         issues=issues)
-        assert filed.title == f"{PREFIX} since sha2"
+        assert filed.title == f"{TITLE} (after #40)"
 
 
 def test_after_a_close_mid_streak_only_a_failure_created_at_or_after_it_files():
@@ -145,7 +146,7 @@ def test_after_a_close_mid_streak_only_a_failure_created_at_or_after_it_files():
     first = _run(1, "failure", "09:00:00", "09:30:00")
     assert _act(first, _run(2, "failure", "10:00:00", "10:20:59"), issues=issues) == ()  # finished before the close
     (filed,) = _act(first, _run(3, "failure", "10:21:00", "10:21:00"), issues=issues)  # same second as the close
-    assert filed.title == f"{PREFIX} since sha3"
+    assert filed.title == f"{TITLE} (after #40)"
     # Running across the close, it tested code from before the fix (#442, tauri #1150 -> #1179).
     assert _act(first, _run(4, "failure", "10:00:00", "10:50:00"), issues=issues) == ()
 
@@ -171,7 +172,7 @@ def test_a_merge_closing_the_streaks_issue_files_nothing_until_the_merges_own_ru
         assert _act(*OLD_RED, issues=issues) == ()
         assert _act(*OLD_RED, IN_FLIGHT, issues=issues) == ()
         (filed,) = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", MERGE_RUN, "12:30:00"), issues=issues)
-        assert filed.title == f"{PREFIX} since sha4"
+        assert filed.title == f"{TITLE} (after #40)"
         assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", MERGE_RUN, "12:30:00"), issues=issues) == ()
 
 
@@ -181,7 +182,7 @@ def test_the_closing_commits_own_run_files_even_if_github_dated_it_before_the_cl
     for closer, files in (("sha4", True), ("", False), ("shaX", False)):  # absent or another commit: the close rules
         issues = [BaseIssue(40, PREFIX, MERGE_CLOSED, closer)]
         actions = _act(*OLD_RED, IN_FLIGHT, _tauri(4, "failure", merge_run, "12:30:00"), issues=issues)
-        assert [a.title for a in _filed(actions)] == ([f"{PREFIX} since sha4"] if files else [])
+        assert [a.title for a in _filed(actions)] == ([f"{TITLE} (after #40)"] if files else [])
         assert _act(*OLD_RED, IN_FLIGHT, _tauri(4, "success", merge_run, "12:30:00"), issues=issues) == ()
     # A run of the pre-merge code never files, closer or not.
     assert _act(*OLD_RED, IN_FLIGHT, issues=[BaseIssue(40, PREFIX, MERGE_CLOSED, "sha4")]) == ()
@@ -205,14 +206,14 @@ def test_a_run_created_before_the_fix_merged_neither_closes_its_issue_nor_files(
 
 
 AFTER = _run(3, "failure", "10:00:00", "10:40:00")  # the merge's own run
-NEXT = BaseIssue(41, f"{PREFIX} since sha3")
+NEXT = BaseIssue(41, f"{TITLE} (after #40)")
 
 
 def test_a_failure_created_at_or_after_the_merge_files_the_next_issue_then_closes_the_fixed_one():
     (filed,) = _act(FIRST, BEFORE, AFTER, issues=FIXED, merged={40: MERGED_AT})  # the filing comes first, alone
     assert isinstance(filed, FileIssue) and filed.title == NEXT.title and filed.key == f"base-ci:dev:{NEXT.title}"
     (closed,) = _act(FIRST, BEFORE, AFTER, issues=[*FIXED, NEXT], merged={40: MERGED_AT})  # seen filed: close it
-    assert _closes([closed]) == [40] and "still fails" in closed.comment and "runs/3" in closed.comment
+    assert _closes([closed]) == [40] and "tracked by #41" in closed.comment
     done = [BaseIssue(40, FIXED[0].title, "2026-10-14T10:41:00Z"), NEXT]
     assert _act(FIRST, BEFORE, AFTER, issues=done, merged={40: MERGED_AT}) == ()
 
@@ -239,7 +240,7 @@ def test_needs_human_keeps_an_issue_open_after_its_fix_merged():
     after = _run(3, "failure", "10:00:00", "10:40:00")
     parked = {40: frozenset({Label.NEEDS_HUMAN})}
     assert _act(FIRST, after, issues=FIXED, labels=parked, merged={40: MERGED_AT}) == ()
-    assert _act(FIRST, after, issues=[*FIXED, NEXT], labels=parked, merged={40: MERGED_AT}) == ()
+    assert _closes(_act(FIRST, after, issues=[*FIXED, NEXT], labels=parked, merged={40: MERGED_AT})) == [41]
     assert _closes(_act(FIRST, after, issues=[*FIXED, NEXT], labels={40: frozenset({Label.AI_READY})},
                         merged={40: MERGED_AT})) == [40]  # a reopen without the label is closed again
 
@@ -247,12 +248,12 @@ def test_needs_human_keeps_an_issue_open_after_its_fix_merged():
 def test_a_title_stays_within_githubs_limit_whatever_the_base_branch():
     base = "release/" + "b" * 192
     (filed,) = base_ci_actions(BaseHealth(base, runs=(_br(2, "failure", name="w" * 300),)), "<!-- m -->")
-    assert len(filed.title) <= 256 and f" failing on {base} since " in filed.title  # what the issue search finds
+    assert len(filed.title) <= 256 and f" failing on {base} " in filed.title  # what the issue search finds
 
 
-def test_another_bases_or_workflows_issue_is_not_the_workflows():
-    others = [BaseIssue(40, "CI: macOS Smoke failing on main"), BaseIssue(41, "CI: macOS Smoke 2 failing on dev")]
-    assert _filed(_act(_br(2, "failure"), issues=others))[0].title == f"{PREFIX} since sha2"
+def test_another_bases_issue_does_not_own_this_bases_streak():
+    others = [BaseIssue(40, "CI: macOS Smoke failing on main"), BaseIssue(41, "CI: base failing on dev-2")]
+    assert _filed(_act(_br(2, "failure"), issues=others))[0].title == f"{TITLE} (first)"
 
 
 def test_a_hostile_or_huge_workflow_name_is_bounded_in_the_title_and_inert_in_the_body():
@@ -274,12 +275,12 @@ def test_a_run_being_re_run_holds_the_green_close_of_an_older_run_until_it_ends(
     assert _act(_br(1, "success"), _br(2, "failure", hour=1), issues=issue) == ()  # it failed again
     (closed,) = _act(_br(1, "success"), _br(2, "success", hour=1), issues=issue)  # it was a flake
     assert _closes([closed]) == [40]
-    assert [a.title for a in _filed(_act(_br(1, "failure"), rerun))] == [f"{PREFIX} since sha1"]  # red regardless
+    assert [a.title for a in _filed(_act(_br(1, "failure"), rerun))] == [f"{TITLE} (first)"]  # red regardless
 
 
 def test_an_older_run_being_re_run_leaves_the_latest_verdict_and_its_streak_alone():
     (filed,) = _act(_br(1, "success"), _br(2, "failure", hour=1), _br(3, "", hour=2), _br(4, "failure", hour=3))
-    assert filed.title == f"{PREFIX} since sha2"
+    assert filed.title == f"{TITLE} (first)"
     (closed,) = _act(_br(2, "", hour=1), _br(4, "success", hour=3), issues=[BaseIssue(40, f"{PREFIX} since sha2")])
     assert _closes([closed]) == [40]
 
@@ -293,38 +294,19 @@ def test_base_health_reads_issues_and_workflows_only_with_the_runs():
             BaseHealth(**malformed)
 
 
-# ── a renamed or removed workflow's issue (#449) ─────────────────────────────
+# A workflow rename no longer changes issue identity or requires an orphan-close path.
 
-OLD = BaseIssue(40, "CI: Old Smoke failing on dev since sha1")
-CLOSED_OLD = "No workflow of this repository runs under this issue's name on `dev` any more"
-
-
-def test_an_open_issue_of_a_workflow_neither_listed_nor_in_the_repository_is_closed():
-    for old in (OLD, BaseIssue(40, "CI: Old Smoke failing on dev")):  # a legacy title too
-        (closed,) = _act(_br(2, "success"), issues=[old], workflows=frozenset({"macOS Smoke"}))
-        assert _closes([closed]) == [40] and CLOSED_OLD in closed.comment and "Old Smoke" not in closed.comment
+def test_a_workflow_rename_keeps_the_same_branch_repair():
+    old = BaseIssue(40, "CI: Old Smoke failing on dev since sha1")
+    assert _act(_br(2, "failure"), issues=[old], workflows=frozenset({"macOS Smoke"})) == ()
+    assert _closes(_act(_br(3, "success"), issues=[old], workflows=frozenset({"macOS Smoke"}))) == [40]
 
 
-def test_a_renamed_workflows_red_files_under_the_new_name_and_closes_the_old_issue():
-    actions = _act(_br(2, "failure"), issues=[OLD], workflows=frozenset({"macOS Smoke"}))
-    assert [a.title for a in _filed(actions)] == [f"{PREFIX} since sha2"] and _closes(actions) == [40]
-
-
-def test_an_issue_is_kept_while_its_workflow_exists_runs_or_cannot_be_read():
-    smoke = BaseIssue(40, f"{PREFIX} since sha1")
-    assert _act(_br(2, "success", name="Lint"), issues=[smoke], workflows=frozenset({"macOS Smoke"})) == ()
-    # listed in the base's runs but not by that name in the repository's workflows
-    assert _closes(_act(_br(2, "failure"), issues=[smoke], workflows=frozenset())) == []
-    assert _act(_br(2, "success", name="Lint"), issues=[OLD]) == ()  # the workflows are unread
-    assert _act(_br(2, "success", name="Lint"), issues=[OLD], workflows=frozenset(),
-                labels={40: frozenset({Label.NEEDS_HUMAN})}) == ()  # a human holds it
-
-
-def test_only_this_bases_open_base_ci_issues_are_closed_as_orphaned():
+def test_only_this_bases_open_ci_issues_close_on_green():
     others = [BaseIssue(41, "CI: Old Smoke failing on main since sha1"), BaseIssue(42, "Old Smoke failing on dev"),
-              BaseIssue(43, "CI: Old Smoke failing on dev-2"), BaseIssue(44, OLD.title, CLOSED_AT),
+              BaseIssue(43, "CI: Old Smoke failing on dev-2"), BaseIssue(44, PREFIX, CLOSED_AT),
               BaseIssue(45, "CI: Old Smoke failing on dev since sha1 again")]
-    assert _act(_br(2, "success"), issues=others, workflows=frozenset({"macOS Smoke"})) == ()
+    assert _act(_br(2, "success"), issues=others) == ()
 
 
 # ── a required workflow's issue is readied ───────────────────────────────────
@@ -395,3 +377,101 @@ def test_base_fix_work_is_served_first():
     keys = [pr_key(7), issue_key(3), issue_key(40)]  # the fix role adds the base fix's PR to `first` too
     assert dispatch_order(keys, {}, frozenset({issue_key(40)}))[0] == issue_key(40)
     assert dispatch_order(keys, {})[0] == pr_key(7)
+
+
+def test_486_two_red_workflows_file_one_issue_with_both_first_failures():
+    runs = (_br(1, "success", "Rust", 0), _br(2, "failure", "Rust", 1),
+            _br(3, "failure", "Smoke", 1), _br(4, "failure", "Rust", 2))
+    (issue,) = _filed(_act(*runs))
+    assert issue.title == "CI: base failing on dev (first)"
+    assert "**Rust**" in issue.body and "**Smoke**" in issue.body
+    assert "runs/2" in issue.body and "runs/3" in issue.body
+
+
+def test_486_another_workflow_finishing_red_joins_the_open_issue():
+    issue = BaseIssue(40, "CI: base failing on dev (first)")
+    assert _act(_br(2, "failure", "Rust"), _br(3, "failure", "Smoke", 1), issues=[issue]) == ()
+    assert _closes(_act(_br(4, "success", "Rust", 2), _br(3, "failure", "Smoke", 1), issues=[issue])) == []
+    assert _closes(_act(_br(4, "success", "Rust", 2), _br(5, "success", "Smoke", 2), issues=[issue])) == [40]
+
+
+def test_486_any_required_red_workflow_prioritizes_the_single_issue():
+    issue = BaseIssue(40, "CI: base failing on dev (first)")
+    assert _act(_br(2, "failure", "Rust"), _br(3, "failure", "Smoke", 1), issues=[issue],
+                required=frozenset({"Smoke"})) == (READY,)
+
+
+def test_486_overlapping_workflow_streaks_keep_one_branch_anchor():
+    runs = (_br(1, "failure", "Rust"), _br(2, "failure", "Smoke", 1), _br(3, "success", "Rust", 2))
+    assert _filed(_act(*runs))[0].title == "CI: base failing on dev (first)"
+
+
+def test_486_legacy_duplicates_dispatch_only_one_repair():
+    issues = (BaseIssue(40, "CI: Rust failing on dev since sha2"),
+              BaseIssue(41, "CI: Smoke failing on dev since sha3"))
+    health = BaseHealth("dev", runs=(_br(2, "failure", "Rust"), _br(3, "failure", "Smoke")),
+                        issues=issues, required=frozenset({"Smoke"}))
+    world = WorldState(issues=tuple(IssueView(number=i.number, title=i.title, author="fix-bot",
+                      labels=frozenset({Label.AI_READY})) for i in issues), base=health, now=NOW.isoformat())
+    assert derive(world, Local(NOW), H) == {issue_key(40): Dispatch(AgentKind.RESOLVE)}
+
+
+def test_486_a_late_earlier_failure_cannot_change_the_filing_identity():
+    first = _filed(_act(_br(3, "failure", "Rust", 1)))[0]
+    later = _filed(_act(_br(3, "failure", "Rust", 1), _br(2, "failure", "Smoke")))[0]
+    assert (first.title, first.key) == (later.title, later.key)
+
+
+def test_486_an_unrelated_active_workflow_cannot_hold_a_green_base_open():
+    assert _closes(_act(_br(3, "success", "CI"), issues=OPEN, workflows=frozenset({"CI", "Nightly"}))) == [40]
+
+
+def test_486_duplicate_base_prs_cannot_dispatch_repairs():
+    issues = (BaseIssue(40, "CI: Rust failing on dev since sha2"),
+              BaseIssue(41, "CI: Smoke failing on dev since sha3"))
+    health = BaseHealth("dev", runs=(_br(2, "failure", "Rust"), _br(3, "failure", "Smoke")),
+                        issues=issues, required=frozenset({"Smoke"}))
+    world = WorldState(issues=tuple(IssueView(number=i.number, title=i.title, author="fix-bot",
+                      labels=frozenset({Label.AI_READY})) for i in issues), base=health, now=NOW.isoformat(),
+                      prs=(replace(_pr(41), mergeable="CONFLICTING"),))
+    assert derive(world, Local(NOW), H) == {issue_key(40): Dispatch(AgentKind.RESOLVE)}
+
+
+def test_486_a_duplicate_pr_stays_unpaid_after_its_issue_closes():
+    issues = (BaseIssue(40, "CI: base failing on dev (first)"),
+              BaseIssue(41, "CI: Smoke failing on dev since sha3", NOW.isoformat()))
+    health = BaseHealth("dev", runs=(_br(2, "failure", "Rust"), _br(3, "failure", "Smoke")),
+                        issues=issues, required=frozenset({"Smoke"}))
+    world = WorldState(issues=(IssueView(number=40, title=issues[0].title, author="fix-bot",
+                      labels=frozenset({Label.AI_READY})),), base=health, now=NOW.isoformat(),
+                      prs=(replace(_pr(41), mergeable="CONFLICTING"),))
+    assert derive(world, Local(NOW), H) == {issue_key(40): Dispatch(AgentKind.RESOLVE)}
+
+
+def test_486_a_listed_failed_workflow_aging_out_is_unknown_until_green_or_removed():
+    (filed,) = _filed(_act(_br(2, "failure", "Smoke")))
+    issue = BaseIssue(40, filed.title, body=filed.body)
+    assert _act(_br(3, "success", "CI"), issues=[issue]) == ()
+    assert _act(_br(3, "success", "CI"), issues=[issue], workflows=frozenset({"Smoke", "CI", "Nightly"})) == ()
+    assert _closes(_act(_br(3, "success", "CI"), _br(4, "success", "Smoke"), issues=[issue])) == [40]
+    assert _closes(_act(_br(3, "success", "CI"), issues=[issue], workflows=frozenset({"CI", "Nightly"}))) == [40]
+
+
+def test_486_legacy_workflow_scope_also_survives_aging_out():
+    issue = BaseIssue(40, "CI: Smoke failing on dev since sha1")
+    assert _act(_br(3, "success", "CI"), issues=[issue]) == ()
+    assert _closes(_act(_br(3, "success", "CI"), issues=[issue], workflows=frozenset({"CI"}))) == [40]
+
+
+def test_486_consolidated_workflow_scope_survives_duplicate_close_and_handoff():
+    keeper = BaseIssue(40, "CI: Rust failing on dev since sha1")
+    duplicate = BaseIssue(41, "CI: Smoke failing on dev since sha2")
+    (close,) = _act(_br(2, "failure", "Rust"), _br(3, "failure", "Smoke"), issues=[keeper, duplicate])
+    duplicate = replace(duplicate, closed_at=NOW.isoformat(), note=close.comment)
+    active = frozenset({"Rust", "Smoke"})
+    assert _act(_br(4, "success", "Rust"), issues=[keeper, duplicate], workflows=active) == ()
+    successor = BaseIssue(42, "CI: base failing on dev (after #40)")
+    keeper = replace(keeper, closed_at=NOW.isoformat(), note="<!-- m -->\nBase CI is tracked by #42.")
+    assert _act(_br(4, "success", "Rust"), issues=[keeper, duplicate, successor], workflows=active) == ()
+    assert _closes(_act(_br(4, "success", "Rust"), _br(5, "success", "Smoke"),
+                        issues=[keeper, duplicate, successor], workflows=active)) == [42]

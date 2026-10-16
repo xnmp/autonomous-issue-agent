@@ -17,7 +17,7 @@ from ...domain import dashboard as dash
 from ...domain.actions import ISSUE_ACTS, AgentKind, Target
 from ...domain.backoff import LegEnd
 from ...domain.checks import BaseHealth
-from ...domain.ci import RED_CONCLUSIONS, base_verdicts, parse_timestamp, workflow_issues
+from ...domain.ci import RED_CONCLUSIONS, base_verdicts, parse_timestamp, base_issues
 from ...domain.labels import Label
 from ...domain.refs import harness_branch_issue
 from ...domain.state import DerivedState, Harness, ItemKey
@@ -366,7 +366,7 @@ def base_failures(health: BaseHealth | None, repo: str) -> list[dict] | None:
              "issue_url": issue_url(repo, issue.number) if issue and not issue.closed_at else None}
             for latest, since, _ in sorted(base_verdicts(health.runs), key=lambda v: v[1].created_at)
             if latest.conclusion in RED_CONCLUSIONS
-            for issue in [next((i for i in workflow_issues(health, latest.workflow) if not i.closed_at), None)]]
+            for issue in [next((i for i in base_issues(health) if not i.closed_at), None)]]
 
 
 def health_trend(issues_payload: object, local_tz: tzinfo) -> list[dict]:

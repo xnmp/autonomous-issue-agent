@@ -92,14 +92,15 @@ class BaseRun:
 
 @dataclass(frozen=True)
 class BaseIssue:
-    """A base-CI issue the fixer opened, known by its title: one per workflow
-    per red streak (#402)."""
+    """A base-CI issue the fixer opened, known by its title: one per branch
+    red streak (#486)."""
 
     number: int
     title: str
     closed_at: str = ""  # "" while open
     closed_by: str = ""  # the commit that closed it: a merged PR's merge commit, or a pushed commit
     note: str = ""  # with no closing commit: the fixer's comment the close came with (`gh issue close --comment`)
+    body: str = ""
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ Unavailable, never an answer (#48).
 from __future__ import annotations
 
 import itertools
+import re
 from dataclasses import dataclass
 
 from .checks import BaseHealth, BaseIssue, BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
@@ -163,50 +164,31 @@ def base_verdicts(runs: Iterable[BaseRun]) -> tuple[tuple[BaseRun, BaseRun, bool
 
 
 
-def base_title(workflow: str, base: str, head: str = "") -> str:
-    """A base-CI issue's title, one per workflow per red streak (#402), named
-    by the head of the streak's first failing run. Without `head`: the prefix
-    all of the workflow's titles share, and an issue from before #402, which
-    counts as its workflow's current streak. The name is cut so the title
-    stays within GitHub's 256 characters."""
-    name = " ".join(workflow.split())[:max(1, min(200, 226 - len(base)))]
-    return f"CI: {name} failing on {base}" + (f" since {head[:7]}" if head else "")
+def base_title(base: str, previous: int | None) -> str:
+    """The previous issue fixes identity even while more workflows finish red."""
+    return f"CI: base failing on {base} " + (f"(after #{previous})" if previous else "(first)")
 
 
-def workflow_issues(health: BaseHealth, workflow: str) -> tuple[BaseIssue, ...]:
-    """`workflow`'s base-CI issues, oldest first."""
-    prefix = base_title(workflow, health.ref)
-    return tuple(sorted((i for i in health.issues if i.title == prefix or i.title.startswith(prefix + " since ")),
-                        key=lambda i: i.number))
-
-
-def base_unsettled(runs: Iterable[BaseRun]) -> frozenset[str]:
-    """The workflows whose latest verdict is green while a newer run of
-    theirs is still running (#442): the green may not stand, so their issues
-    are neither closed nor dispatched until it settles."""
-    runs = tuple(runs)
-    return frozenset(latest.workflow for latest, _, _ in base_verdicts(runs) if latest.conclusion in GREEN_CONCLUSIONS
-                     and any(r.workflow == latest.workflow and not r.conclusion and _order(r) > _order(latest)
-                             for r in runs))
+def base_issues(health: BaseHealth) -> tuple[BaseIssue, ...]:
+    """This branch's issues, including the old per-workflow titles, oldest first."""
+    shape = re.compile(rf"CI: .+ failing on {re.escape(health.ref)}(?: since \S+| \(first\)| \(after #\d+\))?")
+    return tuple(sorted((i for i in health.issues if shape.fullmatch(i.title)), key=lambda i: i.number))
 
 
 def base_held(health: BaseHealth | None) -> frozenset[int]:
-    """The open base-CI issues of workflows whose latest verdict is green,
-    closing or waiting to settle: derive takes none of them up (#442)."""
+    """Only one issue can own a red base; green issues await closure unpaid."""
     if health is None or health.runs is None:
         return frozenset()
-    return frozenset(i.number for latest, _, _ in base_verdicts(health.runs) if latest.conclusion in GREEN_CONCLUSIONS
-                     for i in workflow_issues(health, latest.workflow) if not i.closed_at)
+    issues = base_issues(health)
+    opened = [i.number for i in issues if not i.closed_at]
+    red = any(latest.conclusion in RED_CONCLUSIONS for latest, _, _ in base_verdicts(health.runs))
+    return frozenset(i.number for i in issues) - (frozenset(opened[:1]) if red else frozenset())
 
 
 def base_fix(health: BaseHealth | None) -> frozenset[int]:
-    """The open base-CI issues of workflows the base branch requires (#402):
-    the harness readies them and serves them first, without STEWARD, TRIAGE
-    or a blocker, and their PRs are charged the base's failures, while the
-    workflow's latest verdict is red (#442; one whose workflow passes, even
-    unsettled, is held from every dispatch: `base_held`). None while the required
-    workflows are unread: the issues then wait for a human."""
+    """The single branch repair is first when any red workflow is required."""
     if health is None or health.runs is None or health.required is None:
         return frozenset()
     red = {latest.workflow for latest, _, _ in base_verdicts(health.runs) if latest.conclusion in RED_CONCLUSIONS}
-    return frozenset(i.number for w in health.required & red for i in workflow_issues(health, w) if not i.closed_at)
+    opened = [i.number for i in base_issues(health) if not i.closed_at]
+    return frozenset(opened[:1]) if health.required & red else frozenset()

@@ -799,7 +799,7 @@ def test_the_overview_lists_red_base_workflows_longest_red_first_with_their_open
         {"workflow": "Windows smoke", "since_ts": "2026-10-13T22:00:00Z",
          "run_url": "https://github.com/o/r/actions/runs/80", "issue_url": "https://github.com/o/r/issues/41"},
         {"workflow": "macOS Smoke", "since_ts": "2026-10-14T03:00:00Z",
-         "run_url": "https://github.com/o/r/actions/runs/71", "issue_url": None},  # its issue is closed
+         "run_url": "https://github.com/o/r/actions/runs/71", "issue_url": "https://github.com/o/r/issues/41"},
     ]
     assert gateway.observe == {"filed_by": "fixbot", "pickup": Pickup.READY}
 

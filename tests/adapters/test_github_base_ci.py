@@ -295,3 +295,11 @@ def test_the_comment_the_fixer_closed_an_issue_with_is_read_and_any_other_is_not
              closed(said(None), close), closed(said("fix-bot", None), close), closed(close), found(2, "t")]
     assert [(i.closed_by, i.note) for i in base_issues(search(*nodes), "fix-bot")] == [
         ("", "m"), ("abc", ""), ("", ""), ("", ""), ("", ""), ("", ""), ("", ""), ("", ""), ("", "")]
+
+
+def test_base_issue_filing_evidence_is_observed_for_closure_after_run_history_ages_out():
+    body = "- **Smoke**: First failing run: https://x/runs/1 (head `sha1`)."
+    (issue,) = base_issues(search({**found(40, "CI: base failing on dev (first)"), "body": body}), "fix-bot")
+    assert issue.body == body
+    with pytest.raises(ValueError):
+        base_issues(search({**found(40, issue.title), "body": ["not", "text"]}), "fix-bot")
