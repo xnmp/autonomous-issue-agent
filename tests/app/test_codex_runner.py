@@ -25,6 +25,7 @@ from issue_agent.adapters.codex_runner import (
     _is_transport_drop,
     _strict_schema,
     build_codex_argv,
+    leg_usage,
     parse_codex_envelope,
     read_rollout_usage,
     spend_evidence_path,
@@ -46,6 +47,7 @@ from issue_agent.domain.outcome import (
 from tests.fakes.legacy_journal import Journal, read_events
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.pricing import ModelRates, RateTable
+from issue_agent.domain.run_usage import MeasuredRunUsage
 
 # $5 in / $30 out / $0.50 cached per MTok, keyed on the unpinned-leg fallback.
 CARD = RateTable("card", "v1", "USD", {"<runtime-default>": ModelRates(5_000_000, 30_000_000, 500_000, 6_250_000)})
@@ -1090,6 +1092,22 @@ def test_usage_delta_edges():
     # than ledgering negative spend.
     assert usage_delta({"input_tokens": 3}, {"input_tokens": 9})["input_tokens"] == 0
 
+
+@pytest.mark.parametrize("start, end", [
+    ({"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 0},
+     {"input_tokens": 150, "output_tokens": 30, "cache_read_input_tokens": 100}),
+    ({"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 0},
+     {"input_tokens": 150, "output_tokens": 30, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 60}),
+])
+def test_494_valid_totals_whose_cache_grew_faster_than_input_still_price_the_leg(start, end):
+    # Both totals are valid, but the delta's cache (100 or 60) exceeds its input
+    # (50); it used to price as a zero estimate, erasing the output tokens too.
+    rollout = {"source": "rollout"}
+    usage = leg_usage("s", "m", usage_delta({**end, **rollout}, start), None)
+    assert isinstance(usage, MeasuredRunUsage)
+    tokens = usage.samples[0].usage
+    assert tokens.output_tokens == 10
+    assert tokens.input_tokens + tokens.cache_read_tokens + tokens.cache_write_tokens == 50
 
 def _costed_codex(tmp) -> str:
     """A stub that writes provider-owned rollout usage and an envelope."""

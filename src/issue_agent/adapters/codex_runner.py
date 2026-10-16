@@ -469,6 +469,13 @@ def usage_delta(end: dict | None, start: dict | None) -> dict | None:
         for key in _USAGE_KEYS
         if key in end or key in start
     }
+    # Each floor is separate, so valid totals can yield cache above input, which
+    # leg_usage would reject as a zero estimate (#494); the excess prices as input.
+    inputs = delta.get("input_tokens", 0)
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        if key in delta:
+            delta[key] = min(delta[key], inputs)
+            inputs -= delta[key]
     if isinstance(end.get("source"), str):
         delta["source"] = end["source"]
     return delta
