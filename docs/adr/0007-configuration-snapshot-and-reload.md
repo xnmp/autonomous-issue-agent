@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/app/config.py src/issue_agent/app/main.py src/issue_agent/app/live_config.py src/issue_agent/adapters/reload.py src/issue_agent/adapters/config_files.py src/issue_agent/app/dashweb/settings.py bin/point-at.sh config/
+Governs: src/issue_agent/app/config.py src/issue_agent/app/main.py src/issue_agent/app/live_config.py src/issue_agent/adapters/reload.py src/issue_agent/adapters/config_files.py src/issue_agent/app/settings.py bin/point-at.sh config/
 
 ## Context
 
@@ -125,6 +125,38 @@ issues.
 
 Exit: the exception is the `live` metadata. Removing a knob's flag returns it
 to restart semantics; removing every flag deletes the mechanism.
+
+### Amendment 2026-10-18: explicit configuration scope
+
+The configuration service is application-level, shared by the dashboard and
+`issue-agent config get|set|unset`. A repository name selects its overlay;
+absence selects shared defaults. The CLI requires either `--name` or
+`--shared`, without discovering a target checkout. Shared operations require
+no deployment, including when there are no configured repositories. Only the
+existing live-setting allowlist is exposed.
+
+Shared candidates are sourced privately as shared configuration, without an
+overlay or inherited `AGENT_ENV`. `HarnessConfig.settings_errors()` validates
+their parsing, ranges, routes, pricing and cross-field constraints; boot
+`validation_errors()` additionally requires the deployment repository and fixer
+identity. This removes the arbitrary deployment validation anchor without
+inventing a repository identity or weakening launch validation. A shared
+candidate cannot hide an invalid default behind a repository override.
+
+The same transaction then validates each launched deployment as before. For a
+shared save, every deployment with pending restart-required changes is held,
+including the one displaying Settings in the dashboard; there is no privileged
+anchor. A repository-scoped save still refuses such changes in its selected
+deployment. Source replacement, composition, publication, rollback and per-
+deployment journal receipts otherwise retain the existing contract.
+
+A kernel-released advisory lock in `config/.settings.lock` now encloses the
+whole read/validate/write/publish transaction for both entry points. It replaces
+the dashboard instance's thread-only settings lock, so a CLI save cannot race
+a dashboard save. The lock contains no configuration or secrets and is never
+used as a PID or liveness record. Manual edits retain expected-content checks.
+No parallel propagation implementation, repository override or runtime setting
+was added.
 
 ## Consequences
 

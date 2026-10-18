@@ -13,12 +13,15 @@ composed file to the service snapshots the installers created.
 from __future__ import annotations
 
 import os
+import fcntl
 import re
 import shlex
 import shutil
 import stat
 import subprocess
 from collections.abc import Mapping
+from contextlib import contextmanager
+from glob import glob
 
 from .atomic_file import atomic_write
 from .env_file import source_env_file
@@ -31,6 +34,37 @@ _VALUE_LIMIT = 1000
 
 class EditRefused(ValueError):
     """The edit cannot be made safely; the message says why."""
+
+
+@contextmanager
+def settings_lock(harness_root: str):
+    """Serialize CLI and dashboard saves across their read/validate/publish cycle."""
+    path = os.path.join(harness_root, "config", ".settings.lock")
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise EditRefused(f"unsafe settings lock: {path}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def deployment_names(repos_dir: str) -> tuple[str, ...]:
+    return tuple(sorted(os.path.splitext(os.path.basename(path))[0]
+                        for path in glob(os.path.join(repos_dir, "*.env"))))
+
+
+def deployment_env(harness_root: str, name: str, inherited: Mapping[str, str]) -> dict[str, str]:
+    """Read the launch snapshot, or source an unlaunched deployment's defaults and overlay."""
+    config = os.path.join(harness_root, "config")
+    active = os.path.join(config, f".active.{name}.env")
+    if os.access(active, os.R_OK):
+        return {**inherited, "AGENT_ENV": active}
+    paths = (os.path.join(config, "shared.env"), os.path.join(config, "repos", f"{name}.env"))
+    return sourced(tuple(path for path in paths if os.access(path, os.R_OK)), inherited)
 
 
 def _word_end(text: str) -> int:

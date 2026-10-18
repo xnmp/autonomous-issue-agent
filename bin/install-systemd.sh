@@ -304,14 +304,19 @@ stop_unit() {
 
 assert_running() {
   unit="$1"
+  restart_status="${2:-0}"
   active_state="$(
     systemctl --user show "$unit" --property=ActiveState --value
-  )"
+  )" || active_state=unknown
   sub_state="$(
     systemctl --user show "$unit" --property=SubState --value
-  )"
-  if [ "$active_state" != "active" ] || [ "$sub_state" != "running" ]; then
-    echo "activation check failed for $unit: ${active_state:-unknown} (${sub_state:-unknown})" >&2
+  )" || sub_state=unknown
+  if [ "$restart_status" != 0 ] || [ "$active_state" != "active" ] || [ "$sub_state" != "running" ]; then
+    echo "activation check failed for $unit: ${active_state:-unknown} (${sub_state:-unknown}); restart exit $restart_status" >&2
+    systemctl --user show "$unit" --property=Result --property=ConditionResult \
+      --property=ExecCondition --property=DropInPaths --property=Restart >&2 || true
+    echo "Inspect the condition and overrides with: systemctl --user cat $unit" >&2
+    echo "Operator overrides are preserved; renew an expired run restriction only for an authorized new run." >&2
     return 1
   fi
 }
@@ -340,9 +345,9 @@ done
 systemctl --user daemon-reload
 for s in "${services[@]}"; do
   systemctl --user enable "$s-$NAME.service"
-  systemctl --user restart "$s-$NAME.service"
-  systemctl --user is-active --quiet "$s-$NAME.service"
-  assert_running "$s-$NAME.service"
+  restart_status=0
+  systemctl --user restart "$s-$NAME.service" || restart_status=$?
+  assert_running "$s-$NAME.service" "$restart_status"
   echo "✓ enabled+started $s-$NAME: active (running)"
 done
 trap - ERR INT TERM
@@ -462,9 +467,9 @@ stop_unit "$DASHBOARD_SERVICE.service"
 mv "$dashboard_candidate" "$dashboard_dst"
 systemctl --user daemon-reload
 systemctl --user enable "$DASHBOARD_SERVICE.service"
-systemctl --user restart "$DASHBOARD_SERVICE.service"
-systemctl --user is-active --quiet "$DASHBOARD_SERVICE.service"
-assert_running "$DASHBOARD_SERVICE.service"
+restart_status=0
+systemctl --user restart "$DASHBOARD_SERVICE.service" || restart_status=$?
+assert_running "$DASHBOARD_SERVICE.service" "$restart_status"
 echo "✓ enabled+started $DASHBOARD_SERVICE: active (running)"
 trap - ERR INT TERM
 echo "Done. 'systemctl --user status issue-agent-*-$NAME' or"

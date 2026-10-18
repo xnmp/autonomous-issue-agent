@@ -7,7 +7,6 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from glob import glob
 
 from ..env_file import source_env_file
 from ...domain.dashboard import ROLE_NAMES
@@ -16,34 +15,6 @@ from .usage import tail_lines
 # The newest journal bytes searched for leg models: a model older than this
 # reads as unknown, never guessed.
 JOURNAL_TAIL_BYTES = 4 * 1024 * 1024
-
-
-def deployment_names(repos_dir: str) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            os.path.splitext(os.path.basename(path))[0]
-            for path in glob(os.path.join(repos_dir, "*.env"))
-        )
-    )
-
-
-def deployment_env(harness_root: str, name: str, inherited: Mapping[str, str]) -> dict[str, str]:
-    """The environment a deployment's daemons were configured from.
-
-    The launch snapshot `config/.active.<name>.env` is what the daemons loaded,
-    so it is named as AGENT_ENV and `config.from_env` reads it the daemons'
-    way (the file is authoritative). A deployment never launched has no
-    snapshot: shared.env then its overlay are sourced, as a launch would
-    compose them."""
-    config = os.path.join(harness_root, "config")
-    active = os.path.join(config, f".active.{name}.env")
-    if os.access(active, os.R_OK):
-        return {**inherited, "AGENT_ENV": active}
-    env = {key: value for key, value in inherited.items() if key != "AGENT_ENV"}
-    for path in (os.path.join(config, "shared.env"), os.path.join(config, "repos", f"{name}.env")):
-        if os.access(path, os.R_OK):
-            env.update(source_env_file(path, env, assigned_only=True))
-    return env
 
 
 @dataclass(frozen=True)

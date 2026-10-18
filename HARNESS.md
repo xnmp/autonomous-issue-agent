@@ -52,6 +52,38 @@ knob from it restores the dataclass default instead of accidentally inheriting a
 stale value from a relaunch shell. Each admitted run records the snapshot
 version that created it.
 
+### Editing live settings
+
+The CLI and dashboard use the same validated settings transaction. These
+commands work from any directory, including before any deployment is configured:
+
+```bash
+issue-agent config get --shared FIX_MODEL_MED
+issue-agent config set --shared FIX_MODEL_MED codex:gpt-6.1-sol:medium
+issue-agent config unset --shared FIX_MODEL_MED
+```
+
+`--shared` edits harness-wide defaults in `config/shared.env`; it never selects
+a repository as a validation anchor. `--name <deployment>` instead edits that
+deployment's overlay. To inherit the shared route, remove the repository override:
+
+```bash
+issue-agent config unset --name xnmp-ballast FIX_MODEL_MED
+```
+
+The scope is required; the current directory never decides it. Only live settings
+are accepted, so this command does not read or write secrets or restart-only knobs.
+Shared defaults are validated independently, then eligible launched deployments
+are recomposed and their installed snapshots published for the next tick.
+Repository overrides still win and are reported. A deployment with pending
+restart-required edits keeps its existing snapshots and receives a warning; it
+adopts the defaults at its next authorized launch. A failed compose restores
+the source and deployments already applied. CLI and dashboard saves share a
+process-safe lock, while edits made outside the service retain the existing
+expected-content check.
+
+### Launch configuration
+
 Important fields:
 
 - `REPO=owner/name` and `TARGET_DIR=/absolute/path` are required.
@@ -379,17 +411,20 @@ charges for the current budget period.
 
 ### Operator writes
 
-The dashboard changes labels on GitHub and nothing else (refactor decision
-Q19). `POST /api/repos/{name}/issues/{number}/park` adds `needs-human` to the
-issue and to each open harness PR for it (head `fix/<issue>-…`); the fix
-policy then waits until the label is removed or a human replies to the stop.
-`POST …/unblock` removes `needs-human` from the issue and those PRs and
-changes nothing else. Park and unblock read the issue and its open PRs fresh
-from GitHub and refuse a closed issue. `POST …/promote` adds `ai-ready`. There
-is no priority action. Each write reads the label first, writes
+The dashboard's GitHub actions change lifecycle labels (refactor decision
+Q19). `POST /api/repos/{name}/issues/{number}/unblock` removes `needs-human`
+from the open issue and its open harness PRs (head `fix/<issue>-…`). It reads
+them fresh and refuses a closed issue. `POST …/promote` adds `ai-ready` to an
+open issue from the dashboard's last observation. To hold work, add
+`needs-human` on GitHub to the issue and any open harness PR; the fix policy
+waits until the hold is removed or a human replies to the stop. There is no
+dashboard park endpoint or priority action. Each label write reads first, writes
 only what is missing, and reads it back; repeating a request moves nothing,
 and a write whose reply was lost is observed rather than repeated. There is no
 command queue, typed resolve command or retry grant (deleted in slice 5d-1).
+
+Live settings use the configuration service described in Configuration; they edit local
+configuration sources and publish validated snapshots, rather than GitHub labels.
 
 To hold an issue until another lands, mark it "blocked by" that issue on
 GitHub (issue dependencies; any repository). The harness only reads the link:
@@ -498,3 +533,11 @@ On Linux, `issue-agent install-service` verifies every systemd unit reaches
 `active (running)` before reporting success and rolls the installation back if
 any role does not. The earlier foreground release canary did not exercise
 systemd; verify the service-manager path separately for each host.
+
+An inactive or failed activation reports the unit's condition result,
+`ExecCondition`, effective `Restart` policy and `DropInPaths` before rollback.
+A condition that skips startup can return success from `systemctl restart`;
+the installer still requires `active (running)`. Inspect a named restriction
+with `systemctl --user cat <unit>`. Renew or remove an obsolete run-window
+override only when that new run is authorized; installation preserves operator
+drop-ins, including memory limits and deliberate expiry conditions.

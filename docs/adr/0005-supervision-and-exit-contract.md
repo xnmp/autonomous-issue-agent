@@ -51,3 +51,10 @@ for installed services, preventing automatic restart; foreground runs use SIGTER
 Shutdown is bounded by
 `TimeoutStopSec`; the final kill signal is a last resort, not normal teardown.
 Hot reload is commit/content-hash gated and takes effect only between ticks.
+
+The systemd installer verifies active/running state even when restart returns
+success: `ExecCondition` can skip a start without failing the restart command.
+On activation failure it reports the effective condition, restart policy and
+drop-in paths before the existing rollback. Operator drop-ins are preserved;
+the installer never interprets a new installation as authorization to remove
+an expiry or other host restriction.

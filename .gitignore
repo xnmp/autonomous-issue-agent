@@ -16,6 +16,7 @@ config/agent.env
 config/shared.env
 config/repos/
 config/.active*.env
+config/.settings.lock
 
 # Dashboard SPA build output + deps (built by `make dashboard-ui`)
 dashboard/dist/

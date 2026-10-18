@@ -230,6 +230,22 @@ def test_a_save_is_refused_while_a_hand_edit_needing_a_restart_is_pending(harnes
     assert _files(root) == before and snapshot.read_text() == published
 
 
+def test_a_shared_save_holds_the_selected_deployment_without_using_it_as_an_anchor(harness):
+    root, snapshot, _, client = harness
+    shared = root / "config" / "shared.env"
+    shared.write_text(shared.read_text() + "POLL_SECONDS=5\n")
+    active = root / "config" / ".active.demo.env"
+    before = active.read_bytes(), snapshot.read_bytes()
+
+    body = client.post("/api/repos/demo/settings",
+                       json={"key": "DAILY_SPEND_CAP_USD", "value": "7", "scope": "shared"}).json()
+
+    assert body["ok"], body
+    assert any("demo" in warning and "POLL_SECONDS" in warning for warning in body["warnings"])
+    assert (active.read_bytes(), snapshot.read_bytes()) == before
+    assert "DAILY_SPEND_CAP_USD=7" in shared.read_text()
+
+
 def test_a_route_onto_a_runtime_the_daemons_did_not_bind_is_refused_as_needing_a_restart(harness):
     root, *_, client = harness
     before = _files(root)

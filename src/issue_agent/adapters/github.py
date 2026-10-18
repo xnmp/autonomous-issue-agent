@@ -717,6 +717,14 @@ class GitHubGateway:
         push = isinstance(permissions, dict) and permissions.get("push") is True
         return str(data["visibility"]), push and data.get("has_issues") is True and data.get("archived") is False
 
+    def open_issue_count(self) -> int:
+        """Exact count for the pickup ceiling, without fetching issue bodies or history."""
+        issues = self._repository_page("issues(states:OPEN){totalCount}").get("issues")
+        count = issues.get("totalCount") if isinstance(issues, dict) else None
+        if type(count) is not int or count < 0:
+            raise FixObservationIncomplete("open issue count is unreadable")
+        return count
+
     def _gh(self, args: list[str]) -> str:
         try:
             return self._run(["gh", *args], self.identity.env_token())

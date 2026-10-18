@@ -1,11 +1,12 @@
-"""Dashboard settings: the live knobs, read and written per deployment.
+"""Live settings shared by the CLI and dashboard (ADR 0007).
 
 ADR 0007 amendment. Only `live` knobs are shown or written, so no secret is
 ever read back or accepted. A write edits the one source file the operator
 chose (the repo overlay, or shared.env for every deployment). The candidate
 is composed in a scratch directory and validated with the daemons' own
-parser; a save that would also change anything needing a restart is refused
-(`_vet`). Then an atomic write (refused over a concurrent hand edit)
+parser. Repo saves refuse pending restart changes; shared saves leave those
+deployments' running snapshots unchanged (`_vet`). An atomic source write
+(refused over a concurrent hand edit)
 recomposes each affected launched deployment with `bin/compose-env.sh`,
 publishes the result to its installed service snapshot, and journals the
 change. The running daemons pick it up at their next tick (`LiveConfig`).
@@ -20,13 +21,14 @@ import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 
-from ...adapters import config_files
-from ...domain.agent_task import RuntimeName
-from ...domain.pricing import CLAUDE_ALIASES, CLAUDE_DEFAULT_MODEL_RATES, with_default_model_rates
-from ...domain.routing import RUNTIME_EFFORTS, TIER_LADDER, ModelRoute, Tier
-from ...domain.world import Pickup
-from ...adapters.github import FIX_MAX_ITEMS
-from ..config import LIVE_KNOBS, HarnessConfig, from_env, restart_part
+from ..adapters import config_files
+from ..adapters.env_file import source_env_file
+from ..domain.agent_task import RuntimeName
+from ..domain.pricing import CLAUDE_ALIASES, CLAUDE_DEFAULT_MODEL_RATES, with_default_model_rates
+from ..domain.routing import RUNTIME_EFFORTS, TIER_LADDER, ModelRoute, Tier
+from ..domain.world import Pickup
+from ..adapters.github import FIX_MAX_ITEMS
+from .config import LIVE_KNOBS, HarnessConfig, from_env, restart_part
 
 SCOPES = ("repo", "shared")
 
@@ -245,12 +247,48 @@ def _pending(staged: str, running: tuple[str, ...], environ: Mapping[str, str]) 
     return sorted(names)
 
 
-def write_setting(
+def read_setting(harness_root: str, name: str | None, key: str, environ: Mapping[str, str]) -> str:
+    """Read a live default, or a named deployment's effective value; never a secret."""
+    if key not in _SPECS:
+        raise ValueError(f"{key!r} is not a live setting")
+    if name is None:
+        env = source_env_file(os.path.join(harness_root, "config", "shared.env"), environ, assigned_only=True)
+        env.pop("AGENT_ENV", None)
+    else:
+        if name not in config_files.deployment_names(os.path.join(harness_root, "config", "repos")):
+            raise ValueError(f"unknown deployment '{name}'")
+        env = config_files.deployment_env(harness_root, name, environ)
+    cfg = from_env(env)
+    if errors := cfg.settings_errors():
+        raise ValueError("invalid configuration: " + "; ".join(errors))
+    return _text(getattr(cfg, _FIELD[key]))
+
+
+def write_setting(harness_root: str, name: str | None, key: str, value: str | None, *,
+                  environ: Mapping[str, str], open_issues: Callable[[str], int | None],
+                  operator: str = "") -> WriteResult:
+    """None selects shared defaults; a name selects exactly one repository overlay."""
+    if key not in _SPECS:
+        return WriteResult(False, f"{key!r} is not a live setting")
+    try:
+        with config_files.settings_lock(harness_root):
+            names = config_files.deployment_names(os.path.join(harness_root, "config", "repos"))
+            if name is not None and name not in names:
+                return WriteResult(False, f"unknown deployment '{name}'")
+            return _write_setting(harness_root, name, key, value, names=names,
+                                  load=lambda deployment: from_env(config_files.deployment_env(
+                                      harness_root, deployment, environ)), environ=environ,
+                                  home=environ.get("HOME") or os.path.expanduser("~"),
+                                  open_issues=open_issues, operator=operator)
+    except (OSError, ValueError) as exc:
+        return WriteResult(False, str(exc))
+
+
+def _write_setting(
     harness_root: str,
-    name: str,
+    name: str | None,
     key: str,
     value: str | None,
-    scope: str,
     *,
     names: tuple[str, ...],
     load: Callable[[str], HarnessConfig],
@@ -259,22 +297,34 @@ def write_setting(
     open_issues: Callable[[str], int | None],
     operator: str = "",
 ) -> WriteResult:
-    """Set (or with None unset) one live knob in the repo overlay or shared.env."""
-    if key not in _SPECS:
-        return WriteResult(False, f"{key!r} is not a dashboard setting")
-    if scope not in SCOPES:
-        return WriteResult(False, f"scope must be one of {list(SCOPES)}")
-    files = Files(harness_root, name)
-    target = files.path(scope)
+    scope = "shared" if name is None else "repo"
+    target = (os.path.join(harness_root, "config", "shared.env") if name is None
+              else Files(harness_root, name).overlay)
     try:
         before = config_files.read_text(target)
         after = config_files.set_assignment(before, key, value)
     except (OSError, ValueError) as exc:
         return WriteResult(False, str(exc))
-    affected = (name,) if scope == "repo" else tuple(n for n in names if os.path.isfile(Files(harness_root, n).active))
+    if name is None:
+        scratch = tempfile.mkdtemp(prefix="issue-agent-settings-", dir=_staging_root(
+            environ, os.path.join(home, ".local", "state", "issue-agent")))
+        try:
+            staged = os.path.join(scratch, "shared.env")
+            with open(staged, "w", encoding="utf-8") as handle:
+                handle.write(after)
+            candidate = source_env_file(staged, environ, assigned_only=True)
+            candidate.pop("AGENT_ENV", None)
+            if errors := from_env(candidate).settings_errors():
+                return WriteResult(False, "refused, shared defaults would be invalid: " + "; ".join(errors))
+            if value is not None and candidate.get(key) != value:
+                return WriteResult(False, f"{key} would not read back as {value!r}")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+    affected = ((name,) if name is not None
+                else tuple(n for n in names if os.path.isfile(Files(harness_root, n).active)))
     warnings: list[str] = []
     held: set[str] = set()
-    for deployment in dict.fromkeys((name, *affected)):
+    for deployment in affected:
         refusal, warning, hold = _vet(Files(harness_root, deployment), target, after, key, value, scope, environ,
                                 open_issues, staging=load(deployment).state_dir, home=home,
                                 edited=deployment == name)
@@ -308,9 +358,12 @@ def write_setting(
         warnings += published
     who = operator or _operator()
     for deployment in affected:
-        config_files.journal_change(load(deployment).state_dir, {
-            "operator": who, "deployment": deployment, "key": key, "old": old.get(deployment, ""),
-            "new": "" if value is None else value, "scope": scope, "file": target})
+        try:
+            config_files.journal_change(load(deployment).state_dir, {
+                "operator": who, "deployment": deployment, "key": key, "old": old.get(deployment, ""),
+                "new": "" if value is None else value, "scope": scope, "file": target})
+        except OSError as exc:
+            warnings.append(f"{deployment}: setting applied, but its change journal could not be written: {exc}")
     shown = "(unset)" if value is None else repr(value)
     return WriteResult(True, f"{key}={shown} in {os.path.relpath(target, harness_root)}; "
                              f"{'applies at the next tick' if composed else 'applies at the next launch'}",

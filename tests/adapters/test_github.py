@@ -14,6 +14,7 @@ import pytest
 from issue_agent.adapters.github import (
     Accepted,
     GhUnavailable,
+    FixObservationIncomplete,
     Refused,
     GitHubGateway,
     Identity,
@@ -29,6 +30,24 @@ from issue_agent.domain.checks import Unavailable
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Comment
 from tests.adapters.test_github_fix_observe import issue_node, pr_node, labels
+
+
+@pytest.mark.parametrize("count", [0, 999, 1000, 10**30])
+def test_open_issue_count_returns_the_exact_repository_count(count):
+    def run(argv, token):
+        return json.dumps({"data": {"repository": {"issues": {"totalCount": count}}}})
+
+    assert GitHubGateway("owner/repo", runner=run).open_issue_count() == count
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"issues": None}, {"issues": {}},
+    *({"issues": {"totalCount": value}} for value in (None, True, -1, "1", 1.5))])
+def test_open_issue_count_refuses_an_unreadable_or_malformed_answer(payload):
+    def run(argv, token):
+        return json.dumps({"data": {"repository": payload}})
+
+    with pytest.raises(FixObservationIncomplete):
+        GitHubGateway("owner/repo", runner=run).open_issue_count()
 
 
 def test_parse_pr_maps_the_graphql_shape():

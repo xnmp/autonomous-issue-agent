@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ...adapters import config_files
 from ...adapters.control_path import control_store_path
 from ...adapters.control_store import ControlStoreError, Lease
 from ...adapters.dashweb.readonly_store import ReadOnlyControlStore
@@ -45,7 +46,8 @@ from ...domain.world import WorldState
 from .. import config
 from ..config import HarnessConfig
 from ..tick import Facts, headroom, leg_ends, lifetime_capped
-from . import settings, views
+from .. import settings
+from . import views
 from .ports import GitHubQueries
 
 HARNESS_ROOT = str(Path(__file__).resolve().parents[4])
@@ -223,7 +225,6 @@ class Backend:
         self._observations = _Observations(ttl_s=observe_ttl_s, **(
             {"executor": observe_executor} if observe_executor is not None else {}))
         self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
-        self._settings_lock = threading.Lock()
         self._self_repo = remote_repo(self.harness_root)
 
     # ── configuration ──
@@ -232,7 +233,7 @@ class Backend:
         return os.path.join(self.harness_root, "config", "repos")
 
     def names(self) -> tuple[str, ...]:
-        return system.deployment_names(self.repos_dir)
+        return config_files.deployment_names(self.repos_dir)
 
     def known(self, name: str) -> bool:
         """A deployment the operator configured. Every route gates on this:
@@ -243,7 +244,7 @@ class Backend:
         return self._configs.get_or_load(name, lambda: self._load_deployment(name))
 
     def _load_deployment(self, name: str) -> Deployment:
-        cfg = config.from_env(system.deployment_env(self.harness_root, name, self.environ))
+        cfg = config.from_env(config_files.deployment_env(self.harness_root, name, self.environ))
         problem = "" if cfg.repo else f"no REPO configured for deployment '{name}'"
         try:
             harness: Harness | None = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
@@ -498,17 +499,16 @@ class Backend:
     def set_setting(self, name: str, key: str, value: str | None, scope: str) -> tuple[bool, str, list[str]]:
         if not self.known(name):
             return False, f"unknown deployment '{name}'", []
-        with self._settings_lock:
-            result = settings.write_setting(
-                self.harness_root, name, key, value, scope, names=self.names(),
-                load=lambda deployment: self.deployment(deployment).cfg, environ=self.environ,
-                home=self.environ.get("HOME") or os.path.expanduser("~"), open_issues=self._open_issues)
-            if result.ok:
-                # The composed snapshots changed: re-read them, and observe again
-                # (the issue pickup decides what an observation lists).
-                self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
-                for deployment in self.names():
-                    self._observations.invalidate(deployment)
+        if scope not in settings.SCOPES:
+            return False, f"scope must be one of {list(settings.SCOPES)}", []
+        result = settings.write_setting(
+            self.harness_root, name if scope == "repo" else None, key, value,
+            environ=self.environ, open_issues=self._open_issues)
+        if result.ok:
+            # The issue pickup decides what the next observation lists.
+            self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
+            for deployment in self.names():
+                self._observations.invalidate(deployment)
         return result.ok, result.detail, list(result.warnings)
 
     def _open_issues(self, name: str) -> int | None:

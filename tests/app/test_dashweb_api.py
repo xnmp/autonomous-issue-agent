@@ -374,16 +374,16 @@ def test_a_symlinked_asset_cannot_escape_the_build_directory(tmp_path):
 # today the writes are label changes, which a visited page must not make either.
 def test_a_write_without_the_dashboard_header_is_refused():
     backend = StubBackend()
-    r = client(backend, headers=None).post("/api/repos/demo/issues/9/park")
+    r = client(backend, headers=None).post("/api/repos/demo/issues/9/promote")
     assert r.status_code == 403
-    assert "park" not in backend.calls
+    assert "promote" not in backend.calls
 
 
 def test_a_cross_origin_write_is_refused_even_with_the_header():
     backend = StubBackend()
-    r = client(backend).post("/api/repos/demo/issues/9/park", headers={"Origin": "http://evil.example"})
+    r = client(backend).post("/api/repos/demo/issues/9/promote", headers={"Origin": "http://evil.example"})
     assert r.status_code == 403
-    assert "park" not in backend.calls
+    assert "promote" not in backend.calls
 
 
 def test_a_rebound_hostname_is_refused_on_reads_too():

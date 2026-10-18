@@ -549,9 +549,9 @@ idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`, `adapters/atomic_file.py`,
 `adapters/child_env.py`,
-`adapters/config_files.py` (the dashboard's settings writes: one assignment
-edited in place, `compose-env.sh`, publish to service snapshots; ADR 0007
-amendment),
+`adapters/config_files.py` (settings file I/O for CLI and dashboard: one
+assignment edited in place, process-safe serialization, `compose-env.sh`,
+publish to service snapshots; ADR 0007 amendment),
 `adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
 once per leg; native sub-agents disabled in the isolated profile),
 `adapters/control_path.py`, `adapters/control_store.py`,
@@ -589,6 +589,8 @@ validated, previous kept on refusal),
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict
 once, resubmitting a stored verdict free when its submission never landed),
+`app/settings.py` (the shared live-settings transaction, with explicit shared
+or deployment scope; both CLI and dashboard use it, ADR 0007),
 `app/tick.py` (the daemon both roles run: local facts from SQLite,
 derive → policy → choose, the action executor, bounded paid dispatch, the
 single `run_leg` path, the SIGTERM drain, and `compose_role`: the one

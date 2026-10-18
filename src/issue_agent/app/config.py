@@ -201,7 +201,7 @@ class HarnessConfig:
         return {"fix": self.state_dir, "review": self.review_state_dir}[role]
 
     def validation_errors(self) -> tuple[str, ...]:
-        errors: list[str] = list(self.parse_errors)
+        errors: list[str] = []
         if not self.repo.strip():
             errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
         elif detail := repository_validation_error(self.repo):
@@ -209,6 +209,11 @@ class HarnessConfig:
         if not self.fix_bot.strip():
             # Without it the fixer's own PRs/reviews can never be identified.
             errors.append("FIX_BOT must be set")
+        return (*self.settings_errors(), *errors)
+
+    def settings_errors(self) -> tuple[str, ...]:
+        """Validate defaults before a repository or fixer identity is selected."""
+        errors: list[str] = list(self.parse_errors)
         if account_eq(self.fix_bot, self.review_bot):
             errors.append("FIX_BOT and REVIEW_BOT normalize to the same identity "
                           "(GitHub rejects self-approval with a 422)")

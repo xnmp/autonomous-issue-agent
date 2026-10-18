@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import os
 import stat
+import select
+import subprocess
+import sys
 
 import pytest
 
 from issue_agent.adapters.config_files import (
-    EditRefused, assigns, publish, read_text, service_snapshots, set_assignment, sourced, write_text,
+    EditRefused, assigns, publish, read_text, service_snapshots, set_assignment, settings_lock, sourced, write_text,
 )
 
 SHARED = """# Shared defaults.
@@ -19,6 +22,43 @@ export FIX_MODEL_LOW=claude:sonnet:low  # cheap tier
 DAILY_SPEND_CAP_USD=100
 DAILY_SPEND_CAP_USD="${DAILY_SPEND_CAP_USD:-200}"
 """
+
+
+def test_settings_saves_serialize_across_processes_and_release_on_close(tmp_path):
+    (tmp_path / "config").mkdir()
+    script = """
+import sys
+from issue_agent.adapters.config_files import settings_lock
+print('ready', flush=True)
+with settings_lock(sys.argv[1]):
+    print('entered', flush=True)
+"""
+    child = None
+    try:
+        with settings_lock(str(tmp_path)):
+            child = subprocess.Popen([sys.executable, "-u", "-c", script, str(tmp_path)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert child.stdout is not None
+            assert child.stdout.readline().strip() == "ready"
+            assert not select.select([child.stdout], [], [], 0.1)[0]
+        output, error = child.communicate(timeout=5)
+        assert child.returncode == 0, error
+        assert output.strip() == "entered"
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.communicate()
+
+
+def test_a_settings_lock_refuses_a_symlink_without_touching_its_target(tmp_path):
+    (tmp_path / "config").mkdir()
+    target = tmp_path / "untouched"
+    target.write_text("preserved")
+    (tmp_path / "config" / ".settings.lock").symlink_to(target)
+    with pytest.raises(OSError):
+        with settings_lock(str(tmp_path)):
+            pytest.fail("followed the symlink")
+    assert target.read_text() == "preserved"
 
 
 def test_a_replaced_value_keeps_comments_order_export_and_the_inline_comment():

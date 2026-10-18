@@ -8,7 +8,7 @@ single-instance guard, run the role daemons).
 Checkout-resident, not a wheel: the daemon walks `__file__` up to the harness
 root for `plugin/` and `config/`; `bin/install.sh` installs this editable.
 
-Subcommands: init | start | stop | status | dashboard | doctor | ready |
+Subcommands: init | config | start | stop | status | dashboard | doctor | ready |
 install-service | uninstall-service (plus prepare-remote and
 publish-base-branch, which `bin/point-at.sh` calls).
 """
@@ -31,6 +31,8 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from ..adapters.env_file import source_env_file
+from ..adapters import config_files
+from ..adapters.github import FixObservationIncomplete, GhUnavailable, GitHubGateway
 from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
 from ..adapters.signal_log import send_signal
@@ -38,6 +40,8 @@ from ..domain.deployment import canonical_deployment_name
 from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
 from .config import default_state_dir as config_default_state_dir
+from .config import from_env
+from . import settings
 from .doctor import doctor_findings, identity_findings, parse_unit
 from ..domain.identity import account_eq, configured_account
 
@@ -1116,6 +1120,32 @@ def cmd_publish_base_branch(args) -> int:
     return 0
 
 
+# ── settings ─────────────────────────────────────────────────────────────────
+def cmd_config(args) -> int:
+    """Use one settings transaction for either explicit scope, independent of cwd."""
+    if args.operation == "get":
+        try:
+            print(settings.read_setting(HARNESS_ROOT, args.name, args.key, os.environ))
+            return 0
+        except (OSError, ValueError) as exc:
+            err(str(exc))
+            return 1
+    def open_issues(name: str) -> int | None:
+        cfg = from_env(config_files.deployment_env(HARNESS_ROOT, name, os.environ))
+        try:
+            return GitHubGateway(cfg.repo).open_issue_count()
+        except (GhUnavailable, FixObservationIncomplete, OSError, ValueError):
+            return None
+
+    result = settings.write_setting(
+        HARNESS_ROOT, args.name, args.key, args.value if args.operation == "set" else None,
+        environ=os.environ, open_issues=open_issues, operator=f"{getpass.getuser()} (cli)")
+    (ok if result.ok else err)(result.detail)
+    for warning in result.warnings:
+        warn(warning)
+    return 0 if result.ok else 1
+
+
 # ── OS services ──────────────────────────────────────────────────────────────
 def _service_env(name: str) -> dict[str, str] | None:
     """Compose the snapshot a service will bake; None (reported) on failure, so
@@ -1160,7 +1190,7 @@ def cmd_uninstall_service(args) -> int:
 # ── argument parser ──────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="issue-agent",
-                                description="Autonomous issue-resolving harness — run it from inside a target repo.")
+                                description="Autonomous issue-resolving harness and shared configuration.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def command(name: str, func, help_text: str | None, context: bool = True) -> argparse.ArgumentParser:
@@ -1175,6 +1205,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = command("init", cmd_init, "interactive first-run: create config/shared.env", context=False)
     sp.add_argument("--force", action="store_true", help="overwrite an existing shared.env")
+
+    sp = command("config", cmd_config, "read or edit live settings without a target checkout", context=False)
+    actions = sp.add_subparsers(dest="operation", required=True)
+    for operation in ("get", "set", "unset"):
+        action = actions.add_parser(operation)
+        scope = action.add_mutually_exclusive_group(required=True)
+        scope.add_argument("--shared", dest="name", action="store_const", const=None,
+                           help="harness-wide defaults; no deployment required")
+        scope.add_argument("--name", type=_deployment_name_arg, help="one deployment's overlay")
+        action.add_argument("key", choices=[spec.key for spec in settings.SPECS])
+        if operation == "set":
+            action.add_argument("value")
 
     sp = command("start", cmd_start, "start the watchers against this repo (foreground)")
     sp.add_argument("--roles", nargs="+", choices=ROLES, help="subset to run (default: both)")

@@ -58,6 +58,9 @@ if [ "${1:-}" = "is-active" ] || [ "${1:-}" = "is-enabled" ]; then
 fi
 if [ "${1:-}" = "show" ]; then
   case "$*" in
+    *"property=DropInPaths"*) echo "${UNIT_DIAGNOSTICS:-}"; exit 0 ;;
+  esac
+  case "$*" in
     *"property=ActiveState"*) printf '%s\n' "${ACTIVE_STATE:-active}" ;;
     *"property=SubState"*) printf '%s\n' "${SUB_STATE:-running}" ;;
     *"property=MainPID"*) printf '%s\n' "${MAIN_PID:-0}" ;;
@@ -296,6 +299,29 @@ def test_systemd_installer_rolls_back_if_unit_is_not_running(tmp_path):
     assert result.returncode != 0
     assert "activation check failed" in result.stderr
     assert not tuple(_artifacts(home, True).glob("*.service"))
+
+
+def test_systemd_install_names_a_skipped_condition_and_preserves_operator_overrides(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    installed = _install(env)
+    assert installed.returncode == 0, installed.stderr
+    units = {path: path.read_bytes() for path in _artifacts(home, True).glob("*.service")}
+    override = _artifacts(home, True) / "issue-agent-fix-watcher-target-repo.service.d" / "run-window.conf"
+    override.parent.mkdir()
+    restriction = "[Service]\nExecCondition=/usr/bin/false\nRestart=no\n"
+    override.write_text(restriction)
+    env.update(ACTIVE_STATE="inactive", SUB_STATE="dead", UNIT_DIAGNOSTICS=(
+        "Result=exec-condition\nExecCondition={ path=/usr/bin/false ; code=exited ; status=1 }\n"
+        f"DropInPaths={override}\nRestart=no"))
+
+    result = _install(env)
+
+    assert result.returncode != 0
+    assert "activation check failed" in result.stderr
+    assert "ExecCondition=" in result.stderr and str(override) in result.stderr
+    assert "Operator overrides are preserved" in result.stderr
+    assert override.read_text() == restriction
+    assert all(path.read_bytes() == content for path, content in units.items())
 
 
 def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
