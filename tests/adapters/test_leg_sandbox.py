@@ -9,6 +9,7 @@ tests skip, naming the reason, on a host where bwrap cannot create a sandbox
 from __future__ import annotations
 
 import os
+import asyncio
 import shutil
 import signal
 import socket
@@ -27,9 +28,12 @@ from issue_agent.adapters.leg_sandbox import (
     codex_runtime_state,
     git_link,
 )
+from issue_agent.adapters.codex_runner import CodexRunner
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.adapters.worktree import Worktrees, _subprocess_git
 from issue_agent.domain.contracts import RunId
+from issue_agent.domain.review import Verdict, parse_verdict
 
 _UNAVAILABLE = LegSandbox(home="/nonexistent", repository="/nonexistent", writable=False).preflight()
 needs_bwrap = pytest.mark.skipif(_UNAVAILABLE is not None, reason=f"no usable bubblewrap: {_UNAVAILABLE}")
@@ -114,6 +118,38 @@ def test_a_reviewer_reads_its_checkout_and_writes_nothing(host):
                    'cat code.py; echo y > code.py 2>/dev/null || echo read-only; echo "token=${GH_TOKEN:-none}"')
 
     assert done.stdout.split() == ["x", "=", "1", "read-only", "token=none"]
+
+
+@needs_bwrap
+@pytest.mark.parametrize("resume", [None, "review-session"])
+def test_codex_reviews_read_their_schema_and_return_stdout_inside_the_sandbox(host, resume):
+    codex = host["worktree"] / "codex"
+    codex.write_text('''#!/bin/sh
+schema=""; prev=""
+for arg in "$@"; do
+  [ "$prev" = "--output-schema" ] && schema="$arg"
+  prev="$arg"
+done
+grep -q '"decision"' "$schema" || exit 9
+printf '%s\\n' '{"decision":"APPROVE","body":"Schema readable inside sandbox."}'
+''')
+    codex.chmod(0o700)
+    profile = host["tmp"] / "codex-profile"
+    profile.mkdir()
+    runner = CodexRunner(
+        codex_bin=str(codex), leg_sandbox=sandbox(host, writable=False, credential=None),
+        process_supervisor=ProcessSupervisor(str(host["tmp"] / "runtime-state")),
+        env={"OPENAI_API_KEY": "test-key", "HOME": str(host["home"]), "CODEX_HOME": str(profile)},
+    )
+    schema = {"type": "object", "properties": {
+        "decision": {"type": "string", "enum": ["APPROVE", "REQUEST_CHANGES"]},
+        "body": {"type": "string"}}, "required": ["decision", "body"]}
+
+    result = asyncio.run(runner.run(RuntimePlan(prompt="review", cwd=str(host["worktree"]), schema=schema,
+                                               read_only=True, resume=resume)))
+
+    assert not result.is_error, result.summary
+    assert parse_verdict(result.structured) == Verdict("APPROVE", "Schema readable inside sandbox.")
 
 
 @needs_bwrap

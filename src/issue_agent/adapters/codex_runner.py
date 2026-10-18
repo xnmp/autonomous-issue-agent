@@ -223,7 +223,6 @@ def build_codex_argv(
     sandbox: str = DEFAULT_SANDBOX,
     default_model: str = "",
     schema_path: str | None = None,
-    output_path: str | None = None,
     inject_system_prompt: bool = True,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> list[str]:
@@ -255,8 +254,6 @@ def build_codex_argv(
             argv += ["-C", task.cwd]
     if schema_path:
         argv += ["--output-schema", schema_path]
-    if output_path:
-        argv += ["-o", output_path]
     # The fix contract rides CODEX_HOME's developer_instructions; without it
     # (inject_system_prompt) the system prompt is prepended to the task.
     prompt = task.rendered_prompt
@@ -507,7 +504,7 @@ def parse_codex_envelope(
     stderr: str = "",
     usage: dict | None = None,
 ) -> AgentResult:
-    """Pure: codex exec result -> AgentResult, decided from the `-o` envelope,
+    """Pure: codex exec result -> AgentResult, decided from the final stdout,
     never the exit code. An error only when no envelope parsed and the exit
     was non-zero, or the envelope declares `error`. Pricing happens in `run`."""
     structured: dict | None = None
@@ -687,7 +684,6 @@ class CodexRunner(AgentRuntime):
             schema_path = os.path.join(tmpdir, "schema.json")
             with open(schema_path, "w") as f:
                 json.dump(_strict_schema(task.schema), f)
-        output_path = os.path.join(tmpdir, "last.json")
         model = self._resolved_model(task) or "<runtime-default>"
         codex_home = self._accounting_home(self._child_environment(task), task.cwd)
         # Tokens the resumed session had already burned (and an earlier leg ledgered).
@@ -698,7 +694,7 @@ class CodexRunner(AgentRuntime):
             return _malformed_counters(str(exc), baseline_sid, None)
         argv, stdin_payload = route_oversize_prompt(build_codex_argv(
             task, codex_bin=self.codex_bin, provider=self.provider, sandbox=self.sandbox,
-            default_model=self.default_model, schema_path=schema_path, output_path=output_path,
+            default_model=self.default_model, schema_path=schema_path,
             inject_system_prompt=self.inject_system_prompt, reasoning_effort=self.reasoning_effort,
         ))
         if stdin_payload is not None and len(stdin_payload) > _PROMPT_STDIN_HARD_LIMIT:
@@ -708,7 +704,7 @@ class CodexRunner(AgentRuntime):
                          "to dispatch a leg that cannot fit a model context"),
             )
         result = await self._exec_once(
-            argv, task, output_path, model, codex_home,
+            argv, task, tmpdir, model, codex_home,
             (baseline_sid, baseline) if baseline else None, stdin_payload,
         )
         if isinstance(result.run_usage, EstimatedRunUsage):  # malformed counters: priced at the maximum
@@ -722,7 +718,7 @@ class CodexRunner(AgentRuntime):
         return result
 
     async def _exec_once(
-        self, argv: list[str], task: RuntimePlan, output_path: str, model: str, codex_home: str,
+        self, argv: list[str], task: RuntimePlan, tmpdir: str, model: str, codex_home: str,
         baseline: tuple[str, dict] | None, stdin_payload: bytes | None,
     ) -> AgentResult:
         """One `codex exec`: spawn, pump stderr under the watchdogs and the
@@ -737,7 +733,7 @@ class CodexRunner(AgentRuntime):
                 launch = self.leg_sandbox.launch(argv, cwd=execution_cwd, env=proc_env,
                                              tmp=self.process_supervisor.leg_tmp(supervision_run_id),
                                              runtime_state=codex_runtime_state(proc_env, execution_cwd),
-                                             scratch=(os.path.dirname(output_path),), read_only=task.read_only)
+                                             scratch=(tmpdir,), read_only=task.read_only)
             except SandboxRefused as exc:
                 self._log(f"codex: SANDBOX REFUSED — {exc}")
                 return AgentResult(is_error=True, status="blocked", summary=f"sandbox unavailable: {exc}",
@@ -1009,13 +1005,8 @@ class CodexRunner(AgentRuntime):
                 exit_reason=ExitReason.WALL_TIMEOUT if wall_tripped else ExitReason.IDLE_TIMEOUT,
                 session_id=sid, usage=usage,
             )
-        try:
-            with open(output_path) as f:
-                last_message = f.read()
-        except OSError:
-            last_message = stdout
         result = parse_codex_envelope(
-            exit_code=exit_code, last_message=last_message, session_id=sid, stderr=stderr, usage=usage,
+            exit_code=exit_code, last_message=stdout, session_id=sid, stderr=stderr, usage=usage,
         )
         provider_failure = (
             read_rollout_provider_failure(sid, codex_home, since=rollout_started_at) if result.is_error else None

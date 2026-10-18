@@ -104,13 +104,11 @@ def _go(runner: CodexRunner, **plan):
     return asyncio.run(runner.run(RuntimePlan(prompt="x", max_budget_usd=20.0, **plan)))
 
 
-# The fake codex finds its `-o` output path, and finishes by writing a clean verdict there.
-_OUT_ARG = 'out=""; prev=""\nfor a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-_VERDICT = 'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
+_VERDICT = 'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\'\n'
 
 
 def _chatty_body(sid: str = SID, seconds: int = 40) -> str:
-    return _OUT_ARG + f'for i in $(seq 1 {seconds}); do echo "exec step $i" >&2; sleep 0.05; done\n' + _VERDICT
+    return f'for i in $(seq 1 {seconds}); do echo "exec step $i" >&2; sleep 0.05; done\n' + _VERDICT
 
 
 @pytest.mark.parametrize(
@@ -189,7 +187,7 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
     rollout = _rollout_path(tmp_path)
     rollout.write_text(_session_meta())
     event = _token_event(_usage(5_000_000, 100_000))
-    body = _OUT_ARG + f"printf '%s\\n' '{event}' >> '{rollout}'\n" + _VERDICT
+    body = f"printf '%s\\n' '{event}' >> '{rollout}'\n" + _VERDICT
 
     result = _go(_runner(tmp_path, body, poll_slice=30.0))
 
@@ -202,7 +200,7 @@ def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(tmp_path, monk
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex-home"))
     body = (
         "echo 'Token usage: total=5,100,000 input=0 (+ 0 cached) output=5,100,000' >&2\n"
-        'for i in $(seq 1 10); do echo "exec step $i" >&2; sleep 0.03; done\n' + _OUT_ARG + _VERDICT
+        'for i in $(seq 1 10); do echo "exec step $i" >&2; sleep 0.03; done\n' + _VERDICT
     )
 
     result = _go(_runner(tmp_path, body, poll_slice=0.01))

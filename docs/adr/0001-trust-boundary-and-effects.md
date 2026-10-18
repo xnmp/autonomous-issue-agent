@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/adapters/github.py src/issue_agent/domain/gaps.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py
+Governs: src/issue_agent/app/identity.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/adapters/github.py src/issue_agent/domain/gaps.py src/issue_agent/domain/trust.py src/issue_agent/domain/sandbox.py src/issue_agent/adapters/leg_sandbox.py src/issue_agent/adapters/codex_runner.py
 
 ## Decision
 
@@ -41,6 +41,21 @@ recorded time still equals GitHub's. Provenance of the new input: anyone who
 can edit the PR (the fix bot, collaborators, GitHub Apps) moves
 `lastEditedAt`, and GitHub stamps it. It can only make a review owed, never
 make or keep a verdict, so it cannot produce a merge.
+
+Amended 2026-10-18: Codex's final stdout is the single result channel for fresh
+and resumed legs. The adapter no longer requests or reads a second output file,
+whose readable but unusable contents could mask a valid response already
+captured on stdout. Stderr remains diagnostic, schema files remain inputs, and
+rollouts remain usage evidence (ADR 0002). The final response remains an agent
+claim parsed by the existing envelope and verdict validators; neither files nor
+stderr can substitute an approval for missing or invalid stdout. Head binding,
+accounting receipts and review submission authority are unchanged. Regressions
+cover both directions of conflicting output, fresh/resumed reviews, and schema
+visibility in a real sandbox. This removes the competing file and its selection
+rule without adding state, retries or a recovery path. The metric is duplicate
+paid reviews and cost per merged PR; the guardrail is unchanged verdict
+validation. The next naturally completed Codex review can verify that one stdout
+verdict reaches its stored receipt and submission without a redundant paid leg.
 
 Slice 5d-1 (2026-10-13) removes the durable-command path for every writer.
 There is no `LifecycleCommand`, command queue or effect receipt. Operator

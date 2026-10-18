@@ -1,10 +1,11 @@
 """CodexRunner — pure argv assembly + envelope parsing, plus run() over a fake
 `codex` binary. No real model call: build_codex_argv / parse_codex_envelope are
 pure, and run() is exercised against a tiny shell stub that mimics `codex exec`
-(writes the -o file and a rollout `session_meta`).
+(prints its final response to stdout and writes a rollout `session_meta`).
 """
 
 import re
+import shlex
 import asyncio
 import json
 import os
@@ -34,7 +35,8 @@ from issue_agent.adapters.codex_runner import (
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.app.planners.schemas import FIX_SCHEMA
+from issue_agent.app.planners.schemas import FIX_SCHEMA, REVIEW_SCHEMA
+from issue_agent.domain.review import Verdict, parse_verdict
 from issue_agent.domain.outcome import (
     AgentResult,
     ExitReason,
@@ -91,7 +93,7 @@ def test_oversize_prompt_moves_to_stdin_small_stays_on_argv():
 
 def test_argv_shape():
     argv = build_codex_argv(
-        RuntimePlan(prompt="do it", cwd="/wt/issue-5"), schema_path="/tmp/s.json", output_path="/tmp/o.json"
+        RuntimePlan(prompt="do it", cwd="/wt/issue-5"), schema_path="/tmp/s.json"
     )
     assert argv[:2] == ["codex", "exec"]
     assert argv[-1] == "do it"  # prompt is last positional
@@ -104,7 +106,7 @@ def test_argv_shape():
     assert "-m" not in argv
     assert argv[argv.index("-C") + 1] == "/wt/issue-5"
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
-    assert argv[argv.index("-o") + 1] == "/tmp/o.json"
+    assert "-o" not in argv and "--output-last-message" not in argv and "--json" not in argv
 
 
 @pytest.mark.parametrize(
@@ -128,14 +130,12 @@ def test_argv_resume_omits_exec_only_flags():
     argv = build_codex_argv(
         RuntimePlan(prompt="x", resume="sess-123", cwd="/wt/issue-59"),
         schema_path="/tmp/s.json",
-        output_path="/tmp/o.json",
     )
     assert "--sandbox" not in argv  # forbidden on resume
     assert "-C" not in argv  # forbidden on resume (cwd set on subprocess)
     # sandbox parity uses the resume-legal bypass flag instead
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
-    # -o / --output-schema ARE legal on resume and must survive (else no envelope)
-    assert argv[argv.index("-o") + 1] == "/tmp/o.json"
+    assert "-o" not in argv and "--output-last-message" not in argv and "--json" not in argv
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
 
 
@@ -296,9 +296,9 @@ def test_envelope_maps_fields():
 
 
 # ── run() over a fake codex binary ───────────────────────────────────────────────
-# The envelope a completed stub run writes to the `-o` path.
-_DONE = 'printf \'%s\' \'{"status":"done","summary":"ok","needs":""}\' > "$out"\n'
-_OPENED = 'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
+# Codex emits only the final response on stdout; progress belongs to stderr.
+_DONE = 'printf \'%s\' \'{"status":"done","summary":"ok","needs":""}\'\n'
+_OPENED = 'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\'\n'
 _STATUS_SCHEMA = {
     "type": "object",
     "properties": {"status": {"type": "string"}, "summary": {"type": "string"}, "needs": {"type": "string"}},
@@ -306,14 +306,10 @@ _STATUS_SCHEMA = {
 
 
 def _fake_codex(tmp, body: str) -> str:
-    """Write an executable stub at <tmp>/codex that runs `body` (bash), with
-    `$out` bound to the `-o` envelope path from argv."""
+    """Write an executable stub at <tmp>/codex that runs `body` (bash)."""
     path = os.path.join(str(tmp), "codex")
     with open(path, "w") as f:
-        f.write(
-            '#!/usr/bin/env bash\nout=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
-            + body
-        )
+        f.write('#!/usr/bin/env bash\n' + body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     return path
 
@@ -328,6 +324,40 @@ def _meta(sid: str) -> str:
         "'payload':{'id':sys.argv[1],'originator':'codex_exec','source':'exec','cwd':os.getcwd()}})+'\\n')"
     )
     return f'{sys.executable} -c "{code}" "{sid}"\n'
+
+
+def _review_stdout(stdout: str, legacy: str) -> str:
+    return (
+        'schema=""; prev=""\n'
+        'for arg in "$@"; do [ "$prev" = "--output-schema" ] && schema="$arg"; prev="$arg"; done\n'
+        f'printf \'%s\' {shlex.quote(legacy)} > "$(dirname "$schema")/last.json"\n'
+        f'printf \'%s\\n\' {shlex.quote(stdout)}\n'
+    )
+
+
+@pytest.mark.parametrize("resume", [None, "review-session"])
+@pytest.mark.parametrize("decision", ["APPROVE", "REQUEST_CHANGES"])
+@pytest.mark.parametrize("legacy", ["", "{}", '{"decision":"REQUEST_CHANGES","body":"Old result."}'])
+def test_review_stdout_reaches_the_verdict_parser_despite_an_unusable_or_conflicting_file(
+    tmp_path, resume, decision, legacy,
+):
+    expected = {"decision": decision, "body": "Checked the change.\nUnicode: ✓"}
+    result = _run(tmp_path, _review_stdout(json.dumps(expected), legacy),
+                  plan=RuntimePlan(prompt="review", schema=REVIEW_SCHEMA, resume=resume))
+
+    assert not result.is_error
+    assert result.structured == expected
+    assert parse_verdict(result.structured) == Verdict(decision, expected["body"])
+
+
+@pytest.mark.parametrize("resume", [None, "review-session"])
+@pytest.mark.parametrize("stdout", ["", "{not json}", '{"decision":"APPROVE","body":null}'])
+def test_invalid_review_stdout_cannot_be_replaced_by_an_approval_file(tmp_path, resume, stdout):
+    legacy = json.dumps({"decision": "APPROVE", "body": "File result."})
+    result = _run(tmp_path, _review_stdout(stdout, legacy),
+                  plan=RuntimePlan(prompt="review", schema=REVIEW_SCHEMA, resume=resume))
+
+    assert parse_verdict(result.structured) is None
 
 
 @pytest.mark.parametrize(
@@ -696,8 +726,11 @@ def test_healthy_run_inside_both_caps_is_untouched(tmp_path):
 def test_the_per_run_scratch_dir_is_removed(tmp_path):
     """review M17c: the run dir used to be an un-removed mkdtemp, so a long-lived
     daemon leaked one `codex-run-*` directory per dispatch."""
-    marker = tmp_path / "outpath"
-    r = _run(tmp_path, f'echo "$out" > "{marker}"\n' + _OPENED, plan=RuntimePlan(prompt="x", schema=FIX_SCHEMA))
+    marker = tmp_path / "schema-path"
+    body = ('prev=""\nfor arg in "$@"; do '
+            f'[ "$prev" = "--output-schema" ] && printf \'%s\' "$arg" > {shlex.quote(str(marker))}; '
+            'prev="$arg"; done\n' + _OPENED)
+    r = _run(tmp_path, body, plan=RuntimePlan(prompt="x", schema=FIX_SCHEMA))
 
     assert r.status == "pr_opened"
     run_dir = os.path.dirname(marker.read_text().strip())
