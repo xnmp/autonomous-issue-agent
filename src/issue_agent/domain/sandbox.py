@@ -120,9 +120,14 @@ SYSTEM_ROOTS = (
 # Cargo's config is among them: its linker and rustflags are part of every
 # artifact's hash, so a leg without it rebuilt a shared CARGO_TARGET_DIR from
 # scratch (tauri probe, 2026-10-14). Its tokens live in credentials.toml.
+# `.cache/pw-webkit-sysdeps` is where Playwright's WebKit bundle finds the
+# system libraries a distro it does not support (Arch) lacks: the bundle's
+# library symlinks point there, so without it MiniBrowser fails to load
+# libicudata (tauri #1292, #1334). The operator makes it; absent, it is skipped.
 HOME_TOOLCHAINS = (
     ".rustup", ".cargo/bin", ".cargo/config.toml", ".cargo/config", ".bun/bin", ".local/bin",
     ".local/share/uv/python", ".nvm", ".npm-global", ".deno/bin", ".nix-profile", ".cache/ms-playwright",
+    ".cache/pw-webkit-sysdeps",
 )
 
 # Download caches: a per-leg overlay. Reads hit the operator's cache; a leg's

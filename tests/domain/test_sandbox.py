@@ -133,6 +133,11 @@ def test_toolchains_are_read_only_and_download_caches_are_thrown_away():
     assert visible(plan, "/home/op/.cargo/registry/src/crate/lib.rs") is Access.THROWAWAY
     assert visible(plan, "/home/op/.cache/uv/wheels/x.whl") is Access.THROWAWAY
     assert visible(plan, "/home/op/.cargo/config.toml") is Access.READ_ONLY  # linker and rustflags
+    # The libraries Playwright's WebKit bundle links to on Arch (tauri #1334).
+    assert visible(plan, "/home/op/.cache/ms-playwright/webkit-1/minibrowser-wpe/lib/libicudata.so.74") \
+        is Access.READ_ONLY
+    assert visible(plan, "/home/op/.cache/pw-webkit-sysdeps/usr/lib/x86_64-linux-gnu/libicudata.so.74") \
+        is Access.READ_ONLY
     assert visible(plan, "/home/op/.cargo/credentials.toml") is Access.PRIVATE
     assert visible(plan, "/usr/lib/libc.so") is Access.READ_ONLY
     assert visible(plan, "/run/user/1000/bus") is None
