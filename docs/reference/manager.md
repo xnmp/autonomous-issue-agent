@@ -134,13 +134,16 @@ about paid runners, not a harness fix).
   single loose-ends list (post-deploy verifications, label surgery the
   classifier reserves, superseded PRs). **When the pending list drains** (no
   `ai-ready` issues, no `ai-pr-open` PRs, nothing held or blocked awaiting a
-  daemon), **write the manager handover and commit it directly to `dev`** —
-  `docs/open/<date>-handover-<batch>.md`, the operator-facing batch record,
-  together with the ledger verdicts ticked during the batch, in one docs-only
-  commit. Don't sit on it: a manager session can die at any point and an
-  uncommitted handover dies with it (batch 3, 2026-07-29, took two takeover
-  sessions to reconstruct). Mid-batch the rule stays the opposite — never
-  move `dev` while ai PRs are open; it forces rebases on all of them.
+  daemon), **write the manager handover** to
+  `~/.local/share/issue-agent/handovers/<date>-handover-<batch>.md`, the
+  operator-facing batch record, and commit the ledger verdicts ticked during
+  the batch to `dev` in one docs-only commit. A handover is about one target
+  repo's batch, so it stays out of the harness repo (operator, 2026-10-22);
+  only harness-wide records are committed here. Don't sit on it: a manager
+  session can die at any point and an unwritten handover dies with it (batch
+  3, 2026-07-29, took two takeover sessions to reconstruct). Mid-batch the
+  rule stays the opposite — never move `dev` while ai PRs are open; it forces
+  rebases on all of them.
 - **Remove the worktrees you made.** Nothing else deletes them: the harness
   cleans up only its own leg worktrees, and Claude Code keeps an
   `isolation: "worktree"` agent's worktree whenever the agent changed

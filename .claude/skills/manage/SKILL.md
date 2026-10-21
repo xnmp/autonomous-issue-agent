@@ -85,8 +85,9 @@ daemons will not move on their own (`ai-blocked` = a question awaits a human).
 ## Wrap-up
 
 When the pending list drains: batch readout with the judgment-vs-gap triage
-of every operator action, ledger verdicts ticked, a manager handover at
-`docs/open/<date>-handover-<batch>.md` committed to dev, the memory index
+of every operator action, ledger verdicts ticked and committed to dev, a
+manager handover at `~/.local/share/issue-agent/handovers/<date>-handover-<batch>.md`
+(never in the harness repo: it is target-repo specific), the memory index
 updated, and every worktree this session created removed once its branch
 merged or was abandoned (`git worktree remove`, then `git worktree prune`;
 see manager.md "After"). Do not push dev or touch human-owned PRs unless the operator says so.
