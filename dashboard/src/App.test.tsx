@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -290,5 +290,88 @@ describe("App navigation", () => {
     await waitFor(() => expect(screen.queryByText("Toast notifications")).not.toBeInTheDocument());
     expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("0");
     finishPromotion(json({ ok: true, detail: "promoted" }));
+  });
+
+  describe("settings dialog", () => {
+    const settings = {
+      settings: [{
+        key: "ISSUE_PICKUP", label: "Issue pickup", help: "", kind: "choice", group: "dispatch",
+        value: "ready", source: "default", default: "ready", choices: ["ready", "open"],
+        runtime: null, effective: null,
+      }],
+      runtimes: ["claude"], efforts: { claude: ["low"] }, models: { claude: ["sonnet"] },
+      files: { repo: "/h/repos/demo.env", shared: "/h/shared.env" }, warnings: [],
+    };
+    const stubBackend = () => vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/issues")) return json(issues);
+        if (path.includes("/settings")) return json(settings);
+        return json({ rows: [], warnings: [] });
+      }),
+    );
+
+    it("holds dashboard options and the selected repo's deployment settings, not a tab", async () => {
+      window.location.hash = "#/repo/demo/issues/done";
+      stubBackend();
+      render(<App />);
+
+      const button = await screen.findByRole("button", { name: "Settings" });
+      expect(screen.queryByRole("tab", { name: "Settings" })).not.toBeInTheDocument();
+      await userEvent.click(button);
+
+      const dialog = screen.getByRole("dialog", { name: "Settings" });
+      expect(dialog).toHaveAttribute("aria-modal", "true");
+      expect(within(dialog).getByLabelText("Theme")).toBeInTheDocument();
+      expect(await within(dialog).findByLabelText("Issue pickup")).toHaveValue("ready");
+
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(button).toHaveFocus();
+    });
+
+    it("closes from the close button and the backdrop", async () => {
+      window.location.hash = "#/repo/demo/issues/done";
+      stubBackend();
+      render(<App />);
+
+      await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
+      await userEvent.click(screen.getByRole("button", { name: "Close settings" }));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+      await userEvent.click(screen.getByRole("dialog").parentElement!);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+
+    it("keeps the legacy /settings URL on the repo overview", async () => {
+      window.location.hash = "#/repo/demo/settings";
+      stubBackend();
+      render(<App />);
+
+      expect(await screen.findByText("Merged", { selector: ".tile-label" })).toBeVisible();
+      expect(screen.queryByRole("tab", { name: "Settings" })).not.toBeInTheDocument();
+    });
+
+    it("shows an empty state when no deployment is selected", async () => {
+      window.location.hash = "#/";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const path = String(input);
+          if (path === "/api/repos") return json({ ...repos, repos: [] });
+          if (path === "/api/usage") return json(usage);
+          return json({ rows: [], warnings: [] });
+        }),
+      );
+      render(<App />);
+
+      await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
+      expect(screen.getByText(/Select a deployment/)).toBeInTheDocument();
+      expect(screen.getByLabelText("Theme")).toBeInTheDocument();
+    });
   });
 });

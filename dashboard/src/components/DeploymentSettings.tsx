@@ -35,7 +35,7 @@ interface Outcome {
  * their next tick; nothing restarts. The server validates every write with the
  * daemons' own parser and refuses what they would refuse.
  */
-export function SettingsTab({ repo }: { repo: string }) {
+export function DeploymentSettings({ repo }: { repo: string }) {
   const settings = usePolled(`settings:${repo}`, (signal) => api.settings(repo, signal), POLL_MS);
   const [scope, setScope] = useState<Scope>("repo");
   const [saving, setSaving] = useState<string | null>(null);
@@ -57,7 +57,7 @@ export function SettingsTab({ repo }: { repo: string }) {
   };
 
   return (
-    <div className="tabbody settings">
+    <div className="settings">
       <SectionTitle
         right={
           <label className="settings-scope">

@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { SettingRow, SettingsPayload, SettingWrite } from "../api/types";
-import { SettingsTab } from "./SettingsTab";
+import { DeploymentSettings } from "./DeploymentSettings";
 
 function row(over: Partial<SettingRow> & Pick<SettingRow, "key" | "kind" | "group">): SettingRow {
   return {
@@ -47,10 +47,10 @@ function fakeBackend() {
   return writes;
 }
 
-describe("SettingsTab", () => {
+describe("DeploymentSettings", () => {
   it("saves an edited value and then shows it as the deployment's own", async () => {
     const writes = fakeBackend();
-    render(<SettingsTab repo="demo-save" />);
+    render(<DeploymentSettings repo="demo-save" />);
     const input = await screen.findByLabelText("Fix legs at once");
     const editor = input.closest(".settings-row") as HTMLElement;
 
@@ -65,7 +65,7 @@ describe("SettingsTab", () => {
 
   it("shows the server's reason when a value is refused and keeps the draft for correction", async () => {
     fakeBackend();
-    render(<SettingsTab repo="demo-refuse" />);
+    render(<DeploymentSettings repo="demo-refuse" />);
     const input = await screen.findByLabelText("Fix legs at once");
     const editor = input.closest(".settings-row") as HTMLElement;
 
@@ -81,7 +81,7 @@ describe("SettingsTab", () => {
 
   it("writes to shared.env when that scope is chosen and unsets back to the default", async () => {
     const writes = fakeBackend();
-    render(<SettingsTab repo="demo-shared" />);
+    render(<DeploymentSettings repo="demo-shared" />);
     await screen.findByLabelText("Issue pickup");
 
     await userEvent.selectOptions(screen.getByLabelText("Save to"), "shared");
@@ -102,7 +102,7 @@ describe("SettingsTab", () => {
 
   it("edits a route by runtime, model and effort and sends the composed spec", async () => {
     const writes = fakeBackend();
-    render(<SettingsTab repo="demo-route" />);
+    render(<DeploymentSettings repo="demo-route" />);
     const model = await screen.findByLabelText("Tier low");
     const editor = model.closest(".settings-row") as HTMLElement;
 

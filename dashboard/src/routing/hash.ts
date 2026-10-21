@@ -1,6 +1,6 @@
 /**
  * URL-hash routing (contract: `#/repo/<name>/issue/<n>` so reload restores the
- * open tab). No router dependency — the route space is six shapes.
+ * open tab). No router dependency — the route space is five shapes.
  *
  * The hash is the single source of truth for "what is on screen"; the tab strip
  * renders from it. Which tabs are *open* is separate state (App), because a
@@ -24,8 +24,7 @@ export type Route =
   | { view: "verification" }
   | { view: "overview"; repo: string }
   | { view: "issues"; repo: string; sub: IssuesSub }
-  | { view: "issue"; repo: string; issue: number }
-  | { view: "settings"; repo: string };
+  | { view: "issue"; repo: string; issue: number };
 
 function isSub(s: string | undefined): s is IssuesSub {
   return s === "inflight" || s === "done" || s === "backlog";
@@ -42,11 +41,11 @@ export function parseHash(hash: string): Route {
     if (section === "issues") {
       return { view: "issues", repo, sub: isSub(parts[3]) ? parts[3] : "inflight" };
     }
-    if (section === "settings") return { view: "settings", repo };
     if (section === "issue" && parts[3]) {
       const n = Number.parseInt(parts[3], 10);
       if (Number.isFinite(n)) return { view: "issue", repo, issue: n };
     }
+    // Includes legacy `#/repo/<name>/settings`: settings now live behind the sidebar button.
     return { view: "overview", repo };
   }
   return { view: "home" };
@@ -65,8 +64,6 @@ export function hashFor(route: Route): string {
       return `#/repo/${e(route.repo)}/issues/${route.sub}`;
     case "issue":
       return `#/repo/${e(route.repo)}/issue/${route.issue}`;
-    case "settings":
-      return `#/repo/${e(route.repo)}/settings`;
   }
 }
 

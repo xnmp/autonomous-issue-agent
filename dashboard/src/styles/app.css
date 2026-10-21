@@ -239,10 +239,6 @@
   bottom: var(--s2);
   width: 40px;
 }
-.sidebar-float .options-popover {
-  right: auto;
-  width: 260px;
-}
 /* Beats .sidebar-toggle's absolute positioning (same file, later block). */
 .sidebar-float .sidebar-toggle-float {
   position: fixed;
@@ -1352,23 +1348,10 @@
 .options-menu {
   position: relative;
 }
-.options-popover {
-  position: absolute;
-  z-index: 50;
-  left: 0;
-  right: 0;
-  bottom: calc(100% + var(--s1));
-  max-height: calc(100dvh - 160px);
-  overflow-y: auto;
-  width: auto;
+.options-form {
   display: flex;
   flex-direction: column;
-  align-items: stretch;
   gap: var(--s1);
-  padding: var(--s2);
-  background: var(--elevated);
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-lg);
 }
 .options-theme {
   display: grid;
@@ -1693,6 +1676,38 @@
   width: min(460px, 100%);
   background: var(--elevated);
   box-shadow: var(--shadow-lg);
+}
+.settings-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(960px, 100%);
+  max-height: 100%;
+  background: var(--elevated);
+  box-shadow: var(--shadow-lg);
+}
+.settings-dialog .panel-hd {
+  justify-content: space-between;
+  flex: none;
+}
+.settings-dialog-body {
+  overflow-y: auto;
+  padding: var(--s3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.settings-dialog-heading {
+  margin: 0 0 var(--s2);
+  color: var(--ink-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
 .modal-body p {
   margin: 0 0 var(--s2);

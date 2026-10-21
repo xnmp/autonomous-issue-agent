@@ -131,7 +131,7 @@ export function Sidebar({
   if (collapsed) {
     return (
       <div className="sidebar-float">
-        <OptionsMenu options={options} onChange={onOptionsChange} collapsed />
+        <OptionsMenu options={options} onChange={onOptionsChange} repo={activeRepo} collapsed />
         <button
           className="sidebar-toggle sidebar-toggle-float"
           onClick={toggleCollapsed}
@@ -225,7 +225,7 @@ export function Sidebar({
       </div>
       <div className="sidebar-foot">
         <UsageBlock usage={usage} />
-        <OptionsMenu options={options} onChange={onOptionsChange} />
+        <OptionsMenu options={options} onChange={onOptionsChange} repo={activeRepo} />
         <button
           className={`rail-btn${verificationActive ? " active" : ""}`}
           onClick={onOpenVerification}
