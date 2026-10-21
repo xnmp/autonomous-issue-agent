@@ -40,17 +40,6 @@ def test_open_issue_count_returns_the_exact_repository_count(count):
     assert GitHubGateway("owner/repo", runner=run).open_issue_count() == count
 
 
-def test_the_issue_index_never_offers_an_issue_closed_as_a_duplicate():
-    """tauri-explorer #1332 was named a duplicate of #1333, closed as a duplicate of #1332."""
-    rows = [{"number": 1333, "state": "CLOSED", "stateReason": "DUPLICATE", "title": "HTML preview", "labels": []},
-            {"number": 1325, "state": "CLOSED", "stateReason": "COMPLETED", "title": "peek carets", "labels": []},
-            {"number": 1320, "state": "CLOSED", "stateReason": "NOT_PLANNED", "title": "wontfix", "labels": []},
-            {"number": 1330, "state": "OPEN", "stateReason": None, "title": "lineage", "labels": []},
-            {"number": 1310, "state": "OPEN", "title": "no reason read", "labels": []}]
-    index = GitHubGateway("o/r", runner=lambda argv, token: json.dumps(rows)).issue_index()
-    assert [row[:2] for row in index] == [(1325, "closed"), (1320, "closed"), (1330, "open"), (1310, "open")]
-
-
 @pytest.mark.parametrize("payload", [None, {}, {"issues": None}, {"issues": {}},
     *({"issues": {"totalCount": value}} for value in (None, True, -1, "1", 1.5))])
 def test_open_issue_count_refuses_an_unreadable_or_malformed_answer(payload):

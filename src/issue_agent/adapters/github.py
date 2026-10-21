@@ -1025,19 +1025,16 @@ class GitHubGateway:
         recent issues, open and closed (by `author`, `@me` for this token's
         login, if given; gh reads it as `createdBy`, not the search index):
         the candidates a STEWARD leg may name as a duplicate or a blocker. An
-        issue closed as a duplicate is left out: it is never the original, and
-        offering it named tauri-explorer #1332 a duplicate of #1333, which had
-        been closed as a duplicate of #1332. An unreadable listing raises; the
-        STEWARD leg is then refused (a machine end)."""
+        unreadable listing raises; the STEWARD leg is then refused (a machine end)."""
         data = self._gh_json(["issue", "list", "--repo", self.repo, "--state", "all", "--json",
-                              "number,state,stateReason,title,labels", "--limit", str(limit),
+                              "number,state,title,labels", "--limit", str(limit),
                               *(["--author", author] if author else [])])
         if not isinstance(data, list):
             raise FixObservationIncomplete("issue listing is unreadable")
         return tuple((row["number"], str(row.get("state") or "").lower(), str(row.get("title") or ""),
                       _labels(row.get("labels") if isinstance(row.get("labels"), list) else None))
                      for row in data if isinstance(row, dict) and type(row.get("number")) is int
-                     and row["number"] > 0 and str(row.get("stateReason") or "").upper() != "DUPLICATE")
+                     and row["number"] > 0)
 
     def blocker_link(self, issue: int, blocker: int) -> BlockerLinkFacts:
         """Both ends of a proposed "#issue blocked by #blocker" link, fresh."""

@@ -249,7 +249,12 @@ class FixLegs:
             try:
                 # The steward judges duplicates and blockers against this index:
                 # a failed read is a machine end, never a blind one-shot steward.
-                index = [row for row in self.gateway.issue_index() if row[0] != action.number]
+                # Open issues only. A report on a closed issue is a regression,
+                # a change to what it delivered (#1328 reversed #1325, which a
+                # title alone cannot show) or already fixed, which RESOLVE proves.
+                # A closed one is never the original to close this against.
+                index = [row for row in self.gateway.issue_index()
+                         if row[0] != action.number and row[1] == "open"]
             except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
                 self.log(f"{name} #{action.number}: not dispatched — issue index unavailable: {exc}")
                 self.accounting.record_refused_leg()
@@ -263,8 +268,8 @@ class FixLegs:
                 # Only issues the harness itself will work on and close: model
                 # output must not hold a ready issue behind an epic, an
                 # unadmitted issue or one parked for a human.
-                blockable=tuple(n for n, state, _, labels in index if state == "open"
-                                and Label.AI_READY in labels and Label.NEEDS_HUMAN not in labels),
+                blockable=tuple(n for n, _, _, labels in index
+                                if Label.AI_READY in labels and Label.NEEDS_HUMAN not in labels),
             )
         else:
             task = tasks.build_triage_task(

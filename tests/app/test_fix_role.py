@@ -1370,6 +1370,20 @@ def test_a_steward_is_offered_as_blockers_only_open_issues_the_harness_will_work
     assert agent.tasks[0].schema["properties"]["blocked_by"]["enum"] == [4, None]
 
 
+def test_a_steward_is_offered_as_duplicates_only_open_issues(role):
+    """tauri-explorer #1328 reversed closed #1325 and was held as its duplicate;
+    #1332 was held as a duplicate of #1333, closed as a duplicate of #1332."""
+    gh = FakeGitHub(issues={5: ready(5, "HTML preview"), 4: ready(4, "HTML preview"),
+                            3: replace(ready(3, "HTML preview"), state="closed"),
+                            2: IssueView(2, title="HTML preview")})
+    agent = Agent(stewarded(), stewarded())
+    composed, _ = role(gh, agent, triaged=False)
+    tick(composed)
+    steward = next(task for task in agent.tasks if task.prompt.startswith("Steward GitHub issue #5 "))
+    assert steward.schema["properties"]["duplicate_of"]["enum"] == [2, 4, None]
+    assert "#3 " not in steward.prompt
+
+
 def test_a_link_a_human_deletes_is_never_re_added(role):
     gh, agent, composed = _linked_issue(role)
     gh.issues[5] = replace(gh.issues[5], blocked_by=())  # deleted on GitHub
