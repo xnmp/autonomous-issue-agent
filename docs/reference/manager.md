@@ -141,6 +141,16 @@ about paid runners, not a harness fix).
   uncommitted handover dies with it (batch 3, 2026-07-29, took two takeover
   sessions to reconstruct). Mid-batch the rule stays the opposite — never
   move `dev` while ai PRs are open; it forces rebases on all of them.
+- **Remove the worktrees you made.** Nothing else deletes them: the harness
+  cleans up only its own leg worktrees, and Claude Code keeps an
+  `isolation: "worktree"` agent's worktree whenever the agent changed
+  anything. Once a fix branch merges or is abandoned, run `git worktree remove`
+  on its worktree (`../aia-<n>`, `.worktrees/*`, a merged agent's
+  `.claude/worktrees/agent-*`), then run `git worktree prune`. The branch
+  stays, so no commit is lost. Save any uncommitted change as a patch before
+  you remove a dirty one. 2026-10-21: 63 stale worktrees, some holding
+  pre-refactor harness code, made it hard to show that no second harness was
+  running.
 
 ## Operational gotchas (stable across 3+ deployments — no longer handover news)
 

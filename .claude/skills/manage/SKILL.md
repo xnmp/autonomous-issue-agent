@@ -86,5 +86,7 @@ daemons will not move on their own (`ai-blocked` = a question awaits a human).
 
 When the pending list drains: batch readout with the judgment-vs-gap triage
 of every operator action, ledger verdicts ticked, a manager handover at
-`docs/open/<date>-handover-<batch>.md` committed to dev, and the memory index
-updated. Do not push dev or touch human-owned PRs unless the operator says so.
+`docs/open/<date>-handover-<batch>.md` committed to dev, the memory index
+updated, and every worktree this session created removed once its branch
+merged or was abandoned (`git worktree remove`, then `git worktree prune`;
+see manager.md "After"). Do not push dev or touch human-owned PRs unless the operator says so.
