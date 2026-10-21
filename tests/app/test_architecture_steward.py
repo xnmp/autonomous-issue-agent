@@ -16,6 +16,9 @@ from issue_agent.domain.world import Review
 from tests.app.test_fix_role import Agent, FakeGitHub, did_nothing, dispatched, role, tick
 from tests.app.test_fix_role import _ci
 
+pytestmark = pytest.mark.skip(reason="architecture passes off by operator request 2026-10-21; re-enable "
+                                "with architecture_actions in app/fix.py")
+
 
 class ArchitectureGitHub(FakeGitHub):
     observed_at = ""
