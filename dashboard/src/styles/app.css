@@ -2197,11 +2197,15 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
   font-size: var(--text-xs);
   color: var(--ink-muted);
 }
 .settings-input,
 .settings-scope select {
+  min-width: 0;
+  max-width: 100%;
   min-height: 28px;
   padding: var(--space-1) var(--space-3);
   border: 1px solid var(--border-strong);
