@@ -50,12 +50,12 @@ from issue_agent.domain.state import (
     StopReason,
     Wait,
     WaitReason,
-    derive,
     human_comments,
     issue_key,
     pr_key,
     stop_tag,
 )
+from tests.fakes.recorded import derive
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.triage import Steward
 from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Push, Review, WorldState

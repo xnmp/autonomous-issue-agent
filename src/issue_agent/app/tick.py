@@ -39,7 +39,7 @@ from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
 from ..adapters.accounting_runtime import AccountingRuntime, AdmissionCaps, issue_budget_scope
-from ..adapters.act import reported_gaps
+from ..adapters.act import owned_branches, reported_gaps
 from ..adapters.atomic_file import atomic_write
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import ControlStoreError, LegRun, SQLiteControlStore
@@ -230,6 +230,7 @@ class Facts:
             headroom=capped is not None and self.headroom(),
             lifetime_capped=capped or frozenset(),
             reported=reported_gaps(self.control),
+            owned=owned_branches(self.control, self.repository),
         )
 
 

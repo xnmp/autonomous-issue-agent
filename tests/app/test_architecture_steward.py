@@ -9,7 +9,8 @@ from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.labels import Label
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.state import Dispatch, Harness, Local, derive, pr_key
+from issue_agent.domain.state import Dispatch, Harness, Local, pr_key
+from tests.fakes.recorded import derive
 from issue_agent.domain.refs import harness_branch_issue
 from issue_agent.domain.world import Review
 from tests.app.test_fix_role import Agent, FakeGitHub, did_nothing, dispatched, role, tick

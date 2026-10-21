@@ -316,8 +316,8 @@ _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage sta
             "nodes{{databaseId author{{__typename login}} state submittedAt body commit{{oid}}}}}}")
 _FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
 _FIX_PR = (
-    "id number state headRefName headRefOid baseRefName baseRefOid title author{__typename login} lastEditedAt "
-    "mergeable mergeStateStatus " + _LABELS + " " + _LABELED + " " + _COMMENTS.format(before="") + " "
+    "id number state headRefName headRefOid baseRefName baseRefOid isCrossRepository title author{__typename login} "
+    "lastEditedAt mergeable mergeStateStatus " + _LABELS + " " + _LABELED + " " + _COMMENTS.format(before="") + " "
     + _REVIEWS.format(before="") + " " + _FILES.format(after="")
     + " commits(last:1){nodes{commit{oid committedDate author{user{__typename login}}}}}"
 )
@@ -871,7 +871,9 @@ class GitHubGateway:
         for node in collected["pullRequests"]:
             if not isinstance(node, dict) or type(node.get("number")) is not int or not isinstance(node.get("headRefName"), str):
                 raise FixObservationIncomplete("open PR identity is unreadable")
-            if not node["headRefName"].startswith(_HARNESS_BRANCH_PREFIX):
+            # A fork's PR is never the harness's: its branch name would match a
+            # recorded one (ADR 0018), and the harness cannot push to it.
+            if not node["headRefName"].startswith(_HARNESS_BRANCH_PREFIX) or node.get("isCrossRepository") is not False:
                 continue
             try:
                 comments = self._nested(node, "comments", _COMMENTS, on="PullRequest", backward=True)
@@ -1053,11 +1055,12 @@ class GitHubGateway:
         does not count: a branch pushed after its PR was closed is reopened
         with a new PR."""
         data = self._gh_json(["pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
-                              "--json", "number,headRefName", "--limit", "10"])
+                              "--json", "number,headRefName,isCrossRepository", "--limit", "10"])
         if not isinstance(data, list):
             raise FixObservationIncomplete("PR lookup by branch is unreadable")
+        # A fork's PR of the same name is not this branch's (ADR 0018).
         numbers = [row["number"] for row in data if isinstance(row, dict) and row.get("headRefName") == branch
-                   and type(row.get("number")) is int]
+                   and row.get("isCrossRepository") is False and type(row.get("number")) is int]
         return min(numbers) if numbers else None
 
     def open_pull_request(self, branch: str, base: str, title: str, body: str) -> Accepted | Refused:

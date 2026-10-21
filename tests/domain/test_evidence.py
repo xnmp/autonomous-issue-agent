@@ -17,8 +17,9 @@ from issue_agent.domain.evidence import (
 )
 from issue_agent.domain.routing import DEFAULT_TIER, Tier, escalate
 from issue_agent.domain.state import (
-    AttemptsStop, Backoff, Dispatch, Harness, Local, NeedsHuman, Rerun, Wait, WaitReason, derive, pr_key,
+    AttemptsStop, Backoff, Dispatch, Harness, Local, NeedsHuman, Rerun, Wait, WaitReason, pr_key,
 )
+from tests.fakes.recorded import derive
 from issue_agent.domain.world import Comment, PRView, Review, WorldState
 
 T0 = datetime(2026, 10, 14, 1, 0, tzinfo=timezone.utc)

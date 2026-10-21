@@ -25,6 +25,7 @@ from .ci import GREEN_CONCLUSIONS, RED_CONCLUSIONS, base_fix, base_unsettled, ba
 from .gaps import GapTarget
 from .outcome import OUTSIDE_ENDS
 from .labels import Label
+from .refs import harness_branch_issue
 from .world import WorldState
 from .state import (
     AttemptsStop, Backoff, Blocked, Busy, DerivedState, Dispatch, DuplicateStop, Harness, ItemKey, LinkBlocker, Merge,
@@ -348,9 +349,10 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     if isinstance(state, Rerun):
         return (RerunFailedJobs(key.number, state.head, state.runs),)
     if isinstance(state, OpenPR):
-        if key.target is not Target.ISSUE:
-            raise ValueError("a PR is opened exactly for an issue")
-        return (OpenPullRequest(key.number, state.branch),)
+        if (key.target is Target.PR) != bool(state.head):
+            raise ValueError("a PR is opened for an issue, and recorded on a PR at its head")
+        issue = key.number if key.target is Target.ISSUE else harness_branch_issue(state.branch)
+        return (OpenPullRequest(issue or 0, state.branch, state.head),)
     if isinstance(state, Release):
         return (Relabel(key.target, key.number, remove=Label.NEEDS_HUMAN, add=None),)
     if isinstance(state, NeedsHuman):

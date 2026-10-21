@@ -81,14 +81,19 @@ class MergePullRequest:
 @dataclass(frozen=True)
 class OpenPullRequest:
     """Open the harness PR for a pushed `fix/<issue>-` branch owed one
-    (refactor decision Q11: the agent pushes, the harness opens). Idempotent
-    by lookup: act opens only when no open PR has this head."""
+    (refactor decision Q11: the agent pushes, the harness opens), recording
+    the branch first (ADR 0018). Idempotent by lookup: act opens only when no
+    open PR has this head. With `head`, the open PR there is a harness leg's
+    push to record, opening nothing; without it, an open PR is not the
+    harness's."""
 
     issue: int
     branch: str
+    head: str = ""
 
     def __post_init__(self) -> None:
-        if type(self.issue) is not int or self.issue <= 0 or not isinstance(self.branch, str) or not self.branch:
+        if (type(self.issue) is not int or self.issue <= 0 or not isinstance(self.branch, str) or not self.branch
+                or not isinstance(self.head, str)):
             raise ValueError("opening a PR requires the issue and its pushed branch")
 
 

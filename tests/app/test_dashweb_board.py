@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.fakes.recorded import record_opened
 from issue_agent.adapters.dashweb import ghdata
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.dashweb.service import Backend
@@ -95,6 +96,7 @@ def _write_env(root: Path, state: Path) -> None:
 
 def _store(path: Path) -> None:
     SQLiteControlStore(str(path)).initialize()
+    record_opened(SQLiteControlStore(str(path)), "o/r", _world().prs)  # the harness opened them (ADR 0018)
     db = sqlite3.connect(path)
     ended = (
         "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
@@ -395,6 +397,7 @@ def test_both_roles_can_use_positive_daily_headroom_smaller_than_their_leg_budge
     env.write_text(env.read_text().replace('DAILY_SPEND_CAP_USD="700"', 'DAILY_SPEND_CAP_USD="12"'))
     empty = tmp_path / "empty" / "control.db"
     SQLiteControlStore(str(empty)).initialize()
+    record_opened(SQLiteControlStore(str(empty)), "o/r", (PRView(90, head_ref_name="fix/9-pr"),))
     backend.control_path = lambda cfg: str(empty)
     backend._configs = type(backend._configs)(ttl_s=0)
     green = Observed("h9", "h9", frozenset(), (Check("test", state="SUCCESS", bucket="pass"),))

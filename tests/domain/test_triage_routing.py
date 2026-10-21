@@ -20,8 +20,9 @@ from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import DEFAULT_TIER, ModelRoute, Tier, escalate, parse_model_route, parse_tier
 from issue_agent.domain.state import (
     TRIAGE_TAG, Backoff, Dispatch, DuplicateStop, Harness, Local, PlainStop, Release, StopReason,
-    TriageNote, Wait, WaitReason, derive, issue_key, pr_key, stop_tag,
+    TriageNote, Wait, WaitReason, issue_key, pr_key, stop_tag,
 )
+from tests.fakes.recorded import derive
 from issue_agent.domain.triage import (
     states_criteria,
     MAX_CRITERIA, MAX_CRITERION, MAX_RATIONALE, Steward, Triage, criteria_wanted, link_refusal,

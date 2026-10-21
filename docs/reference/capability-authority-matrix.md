@@ -51,9 +51,10 @@ Fix agents push their own branch with plain `git push` (refactor decision
 Q11), authenticated by `FIX_BOT_TOKEN` through an environment-config git
 helper; nothing is written to the checkout's git config. The harness opens the
 PR from a pushed `fix/<issue>-` branch owed one (ahead of base, no open PR),
-once, through `adapters/act.py`. A fix leg can still run `gh pr create` or
-`gh pr edit` with its token; a PR the agent opened is simply observed and the
-harness opens no second one. `FIX_BOT_TOKEN`'s scope is therefore what a
+once, through `adapters/act.py`, which records the branch first: only a
+recorded branch's open PR is the harness's (ADR 0018). A fix leg can still run
+`gh pr create` or `gh pr edit` with its token; a PR the agent opened is adopted
+(recorded, no second one opened) while its head is the leg's push. `FIX_BOT_TOKEN`'s scope is therefore what a
 hijacked fix leg can do: it must not carry Administration or a branch
 protection bypass.
 A registered supervisor ancestor keeps the run's accounting identity while

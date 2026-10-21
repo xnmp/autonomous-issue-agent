@@ -162,7 +162,8 @@ class Harness:
     """Who the harness is on GitHub. A harness comment carries the hidden
     marker AND a harness login: the marker alone is forgeable by any commenter,
     and the login alone is not enough because FIX_BOT can be the operator's own
-    login (Q1). Reviews and pushes are attributed by login."""
+    login. Reviews and pushes are attributed by login; a PR is the harness's by
+    the act layer's record, not by any GitHub field (ADR 0018)."""
 
     fix_bot: str
     review_bot: str
@@ -187,7 +188,9 @@ class Harness:
 class Local:
     """The local facts derive needs, as plain values. `legs` are the ended legs
     per item; `lifetime_capped` holds issue numbers over their lifetime cap;
-    `headroom` is False when the daily or global cap leaves no room for a leg."""
+    `headroom` is False when the daily or global cap leaves no room for a leg;
+    `owned` holds the head branches the act layer recorded publishing as
+    harness PRs (ADR 0018): the only thing that makes an open PR the harness's."""
 
     now: datetime
     legs: Mapping[ItemKey, tuple[LegEnd, ...]] = field(default_factory=dict)
@@ -196,6 +199,7 @@ class Local:
     lifetime_capped: frozenset[int] = frozenset()
     # The keys of the harness-gap reports already made (`policy.gap_actions`).
     reported: frozenset[str] = frozenset()
+    owned: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.now, datetime) or self.now.utcoffset() is None:
@@ -216,6 +220,8 @@ class Local:
             raise ValueError("lifetime_capped must be a frozenset of issue numbers")
         if not isinstance(self.reported, frozenset) or any(not isinstance(k, str) for k in self.reported):
             raise ValueError("reported must be a frozenset of report keys")
+        if not isinstance(self.owned, frozenset) or any(not isinstance(b, str) or not b for b in self.owned):
+            raise ValueError("owned must be a frozenset of branch names")
 
 
 class WaitReason(str, Enum):
@@ -305,13 +311,18 @@ class Rerun:
 
 @dataclass(frozen=True)
 class OpenPR:
-    """A pushed harness branch has no PR yet: open it (free, no agent)."""
+    """A pushed harness branch has no PR yet: open it (free, no agent). On a
+    PR item, `head` is the harness leg's push the unrecorded PR is at: record
+    it as the harness's, opening nothing (ADR 0018)."""
 
     branch: str
+    head: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.branch, str) or harness_branch_issue(self.branch) is None:
             raise ValueError("OpenPR requires a harness branch")
+        if not isinstance(self.head, str):
+            raise ValueError("OpenPR's head is a commit or empty")
 
 
 @dataclass(frozen=True)
@@ -494,14 +505,21 @@ def picked_up(issue: IssueView, harness: Harness, pickup: Pickup) -> bool:
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
     """Every harness item in `world` mapped to its derived state.
 
-    Items: each open harness PR (head branch `fix/<issue>-`, Q1), and each
-    issue `picked_up` under the observation's scope with no open or merged
-    harness PR. Anything else is not the harness's.
+    Items: each open PR on a branch the act layer recorded opening (`owned`,
+    ADR 0018), and each issue `picked_up` under the observation's scope with
+    no open or merged `fix/<issue>-` PR. Anything else is not the harness's.
+    The branch name only says which issue a PR works on.
     """
-    prs = [(p, n) for p in world.prs if p.state == "OPEN" and (n := harness_branch_issue(p.head_ref_name))]
-    # An open PR shadows its issue; a merged one means the issue is done, even
-    # while it stays open on a non-default base.
-    shadowed = {n for _, n in prs} | {
+    named = [(p, n) for p in world.prs if p.state == "OPEN" and (n := harness_branch_issue(p.head_ref_name))]
+    prs = [(p, n) for p, n in named if p.head_ref_name in local.owned]
+    # An unrecorded PR at a commit a harness leg pushed is the harness's own
+    # publication from before records existed, or one a leg opened itself:
+    # record it (free), whatever its issue's state.
+    adopted = {pr_key(p.number): OpenPR(p.head_ref_name, p.head_ref_oid) for p, n in named
+               if p.head_ref_name not in local.owned and p.number > 0 and _published(p, n, local)}
+    # An open PR on the issue's branch shadows it, whoever's it is; a merged
+    # one means the issue is done, even while it stays open on a non-default base.
+    shadowed = {n for _, n in named} | {
         n for p in world.prs if p.state == "MERGED" and (n := harness_branch_issue(p.head_ref_name))
     }
     pushed: dict[int, list[Branch]] = {}
@@ -523,7 +541,18 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
                else None, origin=Origin.ARCHITECTURE if n in architecture else Origin.HUMAN)
          for p, n in prs if p.number > 0]
     observed = parse_timestamp(world.now)
-    return {item.key: _decide(item, local, harness, observed) for item in items}
+    return {**adopted, **{item.key: _decide(item, local, harness, observed) for item in items}}
+
+
+def _published(pr: PRView, issue: int, local: Local) -> bool:
+    """`pr`'s head is a commit a harness leg on its issue or on it pushed. A leg
+    that pushed nothing (a review) ended on the head it started on, so a
+    human's PR the harness only reviewed is never adopted. Residual (ADR
+    0018): an issue leg starts on no head, so a RESOLVE that pushed nothing
+    onto a branch someone else had pushed reads as its push."""
+    ends = (*local.legs.get(issue_key(issue), ()), *local.legs.get(pr_key(pr.number), ()))
+    return bool(pr.head_ref_oid) and any(
+        leg.end_head == pr.head_ref_oid and leg.end_head != leg.head for leg in ends)
 
 
 def touches_github(paths: Iterable[str]) -> bool:

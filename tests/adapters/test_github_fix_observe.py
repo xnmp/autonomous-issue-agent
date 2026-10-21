@@ -53,6 +53,7 @@ def pr_node(number=100, head="h1", **kw) -> dict:
         "headRefOid": head,
         "baseRefName": "dev",
         "baseRefOid": "b1",
+        "isCrossRepository": False,
         "isDraft": False,
         "title": "Fix",
         "author": {"__typename": "User", "login": "fix-bot"},
@@ -299,11 +300,20 @@ def test_the_pr_lookup_for_a_branch_considers_open_prs_only():
 
     def runner(argv, _token):
         calls.append(argv)
-        return json.dumps([{"number": 101, "headRefName": "fix/5-x"}, {"number": 7, "headRefName": "fix/5-xy"}])
+        return json.dumps([{"number": 101, "headRefName": "fix/5-x", "isCrossRepository": False},
+                           {"number": 7, "headRefName": "fix/5-xy", "isCrossRepository": False}])
 
     assert GitHubGateway("o/r", runner=runner).pull_request_for_branch("fix/5-x") == 101
     (argv,) = calls
     assert argv[argv.index("--state") + 1] == "open" and argv[argv.index("--head") + 1] == "fix/5-x"
+
+
+@pytest.mark.parametrize("fork", [True, None], ids=["fork", "unknown"])
+def test_the_pr_lookup_for_a_branch_ignores_a_fork_of_the_same_name(fork):
+    """Else a fork's PR would stop the harness opening its own, every tick."""
+    rows = [{"number": 6, "headRefName": "fix/5-x", "isCrossRepository": fork}]
+    gateway = GitHubGateway("o/r", runner=lambda argv, _token: json.dumps(rows))
+    assert gateway.pull_request_for_branch("fix/5-x") is None
 
 
 def test_merged_harness_prs_come_only_from_this_repository_and_fix_branches():
@@ -372,6 +382,18 @@ def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
     assert [i.number for i in world.issues] == [5, 4]
     assert [(p.number, p.state) for p in world.prs] == [(9, "MERGED")]
     assert world.branches == (Branch("fix/5-null-token", "2026-10-01T00:00:00Z"),)
+
+
+@pytest.mark.parametrize("fork", [True, None, "false", "absent"], ids=["fork", "null", "not-bool", "absent"])
+def test_a_fork_pr_or_one_github_did_not_say_is_local_is_never_a_harness_pr(fork):
+    """A fork's branch can carry a recorded name (ADR 0018); unknown is a fork."""
+    node = pr_node(number=101, headRefName="fix/5-null-token")
+    if fork == "absent":
+        del node["isCrossRepository"]
+    else:
+        node["isCrossRepository"] = fork
+    runner = GraphQL({"issues": page([]), "pullRequests": page([node]), "refs": page([])})
+    assert GitHubGateway("o/r", runner=runner).build_world("dev").prs == ()
 
 
 def test_an_issue_with_unreadable_comments_is_skipped_not_misread():

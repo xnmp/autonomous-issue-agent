@@ -75,7 +75,8 @@ class Branch:
     """A pushed harness branch (`fix/<issue>-…`) that has never had a pull
     request. The agent pushes and returns; the harness opens the PR (Q11), so
     a branch observed here is publication still owed, e.g. after a crash
-    between the push and the PR-open."""
+    between the push and the PR-open. Derive also builds one for an
+    unrecorded PR it adopts (ADR 0018)."""
 
     name: str
     committed_at: str = ""

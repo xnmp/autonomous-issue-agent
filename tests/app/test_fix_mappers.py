@@ -17,7 +17,8 @@ from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.evidence import CiFailure, CiFailures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.routing import DEFAULT_TIER, escalate
-from issue_agent.domain.state import Dispatch, Harness, Local, Rerun, derive, issue_key, pr_key
+from issue_agent.domain.state import Dispatch, Harness, Local, Rerun, issue_key, pr_key
+from tests.fakes.recorded import derive
 from issue_agent.domain.world import Comment, IssueView, PRView, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)

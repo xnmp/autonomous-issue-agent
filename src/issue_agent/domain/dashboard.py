@@ -388,6 +388,9 @@ def board_status(
         return Working("ci", None, "Re-running failed jobs",
                        "The repair left its failures as a flake; the harness re-runs them once per head.", _iso(ended))
     if isinstance(state, OpenPR):
+        if state.head:
+            return Working("open_pr", None, "Recording PR", f"Its head is a harness push; {state.branch} is "
+                           "recorded as the harness's next tick.", _iso(ended))
         return Working("open_pr", None, "Opening PR", f"Branch {state.branch} is pushed without a PR.",
                        _iso(ended))
     if isinstance(state, TriageNote):

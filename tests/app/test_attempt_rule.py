@@ -16,8 +16,9 @@ from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.routing import DEFAULT_TIER, escalate
 from issue_agent.domain.state import (
-    ATTEMPT_CAP, Backoff, Dispatch, Harness, Local, NeedsHuman, QuestionStop, StopReason, derive, issue_key, pr_key,
+    ATTEMPT_CAP, Backoff, Dispatch, Harness, Local, NeedsHuman, QuestionStop, StopReason, issue_key, pr_key,
 )
+from tests.fakes.recorded import derive
 from issue_agent.domain.world import IssueView, PRView, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)

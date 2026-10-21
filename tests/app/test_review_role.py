@@ -18,6 +18,7 @@ from issue_agent.adapters.github import Accepted, GhUnavailable, Refused
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.app.review import compose_review_daemon
+from tests.fakes.recorded import record_opened
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.evidence import ChangeRequest
 from issue_agent.domain.labels import Label
@@ -137,18 +138,23 @@ def roles(tmp_path):
         checkouts = FakeCheckouts(tmp_path / "checkouts")
 
         def review(self, gh, agent, checkouts=..., **env):
-            return compose_review_daemon(
+            composed = compose_review_daemon(
                 cfg(**env),
                 gh,
                 agent,
                 log=lambda _line: None,
                 checkouts=self.checkouts if checkouts is ... else checkouts,
             )
+            # The PRs a test starts with are ones the harness opened (ADR 0018).
+            record_opened(composed.control, "o/r", gh.prs.values())
+            return composed
 
         def fix(self, gh, agent, **env):
-            return compose_fix_daemon(
+            composed = compose_fix_daemon(
                 cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent, log=lambda _line: None
             )
+            record_opened(composed.control, "o/r", gh.prs.values())
+            return composed
 
     return Roles()
 

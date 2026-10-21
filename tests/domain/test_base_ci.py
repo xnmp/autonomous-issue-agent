@@ -15,7 +15,8 @@ from issue_agent.domain.checks import BaseHealth, BaseIssue, BaseRun, Check, Obs
 from issue_agent.domain.evidence import new_failures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import base_ci_actions, dispatch_order
-from issue_agent.domain.state import Dispatch, Harness, Local, Wait, WaitReason, derive, issue_key, pr_key
+from issue_agent.domain.state import Dispatch, Harness, Local, Wait, WaitReason, issue_key, pr_key
+from tests.fakes.recorded import derive
 from issue_agent.domain.world import BlockerRef, IssueView, PRView, WorldState
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)

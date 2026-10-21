@@ -44,6 +44,8 @@ from .github import Accepted, FixObservationIncomplete, Refused
 _COMMENT_NAMESPACE = "fix-comment"
 _ISSUE_NAMESPACE = "fix-issue"
 _REPORT_NAMESPACE = "fix-report"
+# The record that makes a PR the harness's (ADR 0018), keyed by its head branch.
+_PR_NAMESPACE = "fix-pr"
 # Stable across retries: the comment's read-back matches its exact body.
 _GITHUB_REFUSED = "GitHub would not read or write the link"
 
@@ -52,6 +54,13 @@ def reported_gaps(control) -> frozenset[str]:
     """The keys of the harness-gap reports already confirmed: policy asks
     for no other (`policy.gap_actions`), so a done report is never re-derived."""
     return frozenset(key.removeprefix(f"{_REPORT_NAMESPACE}:") for key in control.done_keys(f"{_REPORT_NAMESPACE}:"))
+
+
+def owned_branches(control, repository: str) -> frozenset[str]:
+    """The head branches the act layer recorded publishing as `repository`'s
+    harness PRs: derive's only test of whether an open PR is the harness's."""
+    prefix = f"{_PR_NAMESPACE}:{repository}:"
+    return frozenset(key.removeprefix(prefix) for key in control.done_keys(prefix))
 
 
 def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str, since: str = "") -> bool:
@@ -349,8 +358,26 @@ class GitHubAct:
         return ""
 
     def open_pr(self, action: OpenPullRequest) -> None:
-        if self.gateway.pull_request_for_branch(action.branch) is not None:
+        # The record comes before the PR (ADR 0018): a crash after it leaves a
+        # recorded branch with no PR, which derive owes this action again, so
+        # no PR the harness opens is ever unrecorded. An open PR already there
+        # is recorded only at the head derive judged a harness leg's push: on a
+        # stale observation it is someone else's.
+        key = f"{_PR_NAMESPACE}:{self.repository}:{action.branch}"
+        if (existing := self.gateway.pull_request_for_branch(action.branch)) is not None:
+            if action.branch in owned_branches(self.control, self.repository):
+                return  # opened by an earlier call whose answer was lost; the observation predates it
+            head = self.gateway.get_pr(existing, mergeability=False, checks=False).head_ref_oid
+            if not action.head or head != action.head:
+                self.log(f"issue #{action.issue}: PR #{existing} on {action.branch} is not the harness's; not recorded")
+                return
+            self._record(key)
+            self.log(f"issue #{action.issue}: recorded PR #{existing} on {action.branch} as the harness's")
             return
+        if action.head:  # the PR derive judged closed since: adoption opens nothing
+            self.log(f"issue #{action.issue}: no open PR on {action.branch} to record")
+            return
+        self._record(key)
         issue = self.gateway.get_issue(action.issue)
         # The agent writes the whole description (AGENT.md step 9). Without
         # one the PR still names its issue; nothing depends on that line,
@@ -362,6 +389,10 @@ class GitHubAct:
         if isinstance(answer, Refused):
             raise RuntimeError(f"issue #{action.issue}: PR for {action.branch} refused (HTTP {answer.status}) {answer.message}")
         self.log(f"issue #{action.issue}: opened PR for {action.branch}")
+
+    def _record(self, key: str) -> None:
+        if self.control.claim_key(key) != "done":
+            self.control.confirm_key(key)
 
     def latest_resolve_summary(self, issue: int) -> str:
         """The agent's summary from the issue's latest returned resolve leg:

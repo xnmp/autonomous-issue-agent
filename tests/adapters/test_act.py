@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from issue_agent.adapters.act import GitHubAct
+from issue_agent.adapters.act import GitHubAct, owned_branches
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.github import Accepted, BlockerLinkFacts, FixObservationIncomplete, GhUnavailable, Refused
 from issue_agent.domain.actions import AgentKind, LinkBlockedBy, OpenPullRequest, PostComment, Target
@@ -679,6 +679,103 @@ def test_a_refused_pr_open_raises_with_githubs_reason_and_opens_nothing(tmp_path
 
     with pytest.raises(RuntimeError, match="refused \\(HTTP 422\\) No commits between"):
         _act(tmp_path, Refusing()).execute(OpenPullRequest(5, "fix/5-null-token"))
+
+
+# ── the record that makes a PR the harness's (ADR 0018) ──────────────────────
+
+
+def test_an_opened_pr_is_recorded_for_its_repository_only(tmp_path):
+    act = _act(tmp_path, PrGateway())
+    act.execute(OpenPullRequest(5, "fix/5-null-token"))
+    assert owned_branches(act.control, "o/r") == {"fix/5-null-token"}
+    assert owned_branches(act.control, "o/other") == frozenset()
+    assert owned_branches(act.control, "o/r2") == frozenset()  # a repository whose name extends this one's
+
+
+def test_the_record_lands_before_the_open_so_a_crash_mid_open_leaves_it(tmp_path):
+    """Crash point: after the record, before GitHub opens the PR. The branch
+    stays recorded with no PR, which derive owes OpenPR again."""
+    class Dying(PrGateway):
+        def open_pull_request(self, branch, base, title, body):
+            raise GhUnavailable("network", "the daemon died mid-open")
+
+    act = _act(tmp_path, Dying())
+    with pytest.raises(GhUnavailable):
+        act.execute(OpenPullRequest(5, "fix/5-null-token"))
+    assert owned_branches(act.control, "o/r") == {"fix/5-null-token"}
+
+
+def test_a_refused_open_still_leaves_the_branch_recorded(tmp_path):
+    """No PR exists to own, so the record decides nothing until one does."""
+    class Refusing(PrGateway):
+        def open_pull_request(self, branch, base, title, body):
+            return Refused(422, "No commits between dev and fix/5-null-token")
+
+    act = _act(tmp_path, Refusing())
+    with pytest.raises(RuntimeError):
+        act.execute(OpenPullRequest(5, "fix/5-null-token"))
+    assert owned_branches(act.control, "o/r") == {"fix/5-null-token"}
+
+
+class Open(PrGateway):
+    """A PR is already open on the branch, at `head`."""
+
+    def __init__(self, head):
+        super().__init__()
+        self.head = head
+
+    def pull_request_for_branch(self, branch):
+        return 100
+
+    def get_pr(self, number, *, mergeability=True, checks=True):
+        return SimpleNamespace(head_ref_oid=self.head)
+
+
+def test_an_open_pr_at_the_judged_harness_push_is_recorded_and_not_opened_again(tmp_path):
+    """Adoption (a leg's own PR, or one from before records). Replays stay
+    one record and open nothing."""
+    gh, lines = Open("pushed"), []
+    act = _act(tmp_path, gh)
+    act.log = lines.append
+    act.execute(OpenPullRequest(5, "fix/5-null-token", "pushed"))
+    act.execute(OpenPullRequest(5, "fix/5-null-token", "pushed"))
+    assert gh.opened == [] and owned_branches(act.control, "o/r") == {"fix/5-null-token"}
+    assert lines == ["issue #5: recorded PR #100 on fix/5-null-token as the harness's"]
+
+
+@pytest.mark.parametrize("judged", ["", "pushed"], ids=["stale-branch", "pushed-over"])
+def test_an_open_pr_someone_else_opened_or_pushed_is_never_recorded(tmp_path, judged):
+    """Derive saw the branch with no PR (or the harness's head), and by the
+    time act runs a human opened a PR there (or pushed onto it)."""
+    gh, lines = Open("theirs"), []
+    act = _act(tmp_path, gh)
+    act.log = lines.append
+    act.execute(OpenPullRequest(5, "fix/5-null-token", judged))
+    assert gh.opened == [] and owned_branches(act.control, "o/r") == frozenset()
+    assert lines == ["issue #5: PR #100 on fix/5-null-token is not the harness's; not recorded"]
+
+
+def test_adoption_whose_pr_closed_since_opens_nothing(tmp_path):
+    """Derive judged an open PR at a harness push; by act it closed (and the
+    branch may have moved). Adoption never opens a PR at an unjudged head."""
+    gh, lines = PrGateway(), []
+    act = _act(tmp_path, gh)
+    act.log = lines.append
+    act.execute(OpenPullRequest(5, "fix/5-null-token", "pushed"))
+    assert gh.opened == [] and owned_branches(act.control, "o/r") == frozenset()
+    assert lines == ["issue #5: no open PR on fix/5-null-token to record"]
+
+
+def test_a_lost_answer_replayed_on_a_stale_observation_opens_nothing_and_says_nothing(tmp_path):
+    """Crash point: the record landed and GitHub opened the PR, but the
+    answer was lost; the next tick's observation predates the PR."""
+    gh, lines = Open("pushed"), []
+    act = _act(tmp_path, gh)
+    act.control.claim_key("fix-pr:o/r:fix/5-null-token")
+    act.control.confirm_key("fix-pr:o/r:fix/5-null-token")
+    act.log = lines.append
+    act.execute(OpenPullRequest(5, "fix/5-null-token"))
+    assert gh.opened == [] and lines == [] and owned_branches(act.control, "o/r") == {"fix/5-null-token"}
 
 
 # ── the harness's one re-run of a head (owner, PR #403) ─────────────────────

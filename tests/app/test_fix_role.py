@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
+from tests.fakes.recorded import record_opened
 from issue_agent.adapters.github import Accepted, BlockerLinkFacts, GhUnavailable, Refused
 from issue_agent.app.config import LIVE_KNOBS, from_env
 from issue_agent.app.fix import compose_fix_daemon
@@ -391,6 +392,8 @@ def role(tmp_path):
         worktrees = FakeWorktrees(tmp_path / "worktrees", gh)
         live = LiveConfig(cfg, str(live_file), read=lambda path: replace(cfg, **live_values(path))) if live_file else None
         composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log, live=live)
+        # The PRs a test starts with are ones the harness opened (ADR 0018).
+        record_opened(composed.control, "o/r", gh.prs.values())
         if triaged:
             # Light legs that returned nothing usable: the issue resolves at the
             # default tier with no triage comment (test_triage_routing covers them).
@@ -1557,6 +1560,7 @@ def test_402_the_base_fix_pr_is_charged_the_bases_failure_and_others_wait(role):
     gh.base_reports = (red,)  # the PRs' failing check fails on the base tip too
     open_pr(gh, issue=issue.number, ci="fail")
     gh.prs[100] = replace(gh.prs[100], base_ref_name="dev")
+    record_opened(composed.control, "o/r", gh.prs.values())
     taken = tick(composed)
     assert [a.number for a in dispatched(taken, AgentKind.FIX_CI)] == [100]
 
@@ -1588,6 +1592,7 @@ def test_402_a_second_red_streak_after_a_merged_fix_files_and_dispatches_a_new_i
     tick(composed)
     (issue,) = base_issues(gh).values()
     open_pr(gh, issue=issue.number, reviews=_APPROVED)
+    record_opened(composed.control, "o/r", gh.prs.values())
     tick(composed)
     assert gh.merged == [(100, "h1")] and gh.issues[issue.number].state == "closed"  # the merge closes it
     gh.base_runs.append(base_run("Smoke", 3, "failure", 5))  # the base is still red

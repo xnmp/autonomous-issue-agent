@@ -53,7 +53,7 @@ The records are flat objects, so a later act can add fields without new state: f
 - `ai-ready`: a human admits the issue.
 - `needs-human`: the only stop, with one writer. A human reply or removing the label releases it.
 
-Harness PRs are identified by branch prefix, not by a label.
+Harness PRs are identified by branch prefix, not by a label. (Superseded 2026-10-21 by ADR 0018: by the act layer's record of opening them.)
 
 ## Quality
 Quality comes from the repo's required CI checks plus one model review on the exact head. PRs touching `.github/workflows/**` get `needs-human`.
