@@ -16,7 +16,7 @@ function leg(idx: number, over: Partial<IssueStep> = {}): IssueStep {
 function detail(over: Partial<IssueDetailPayload> = {}): IssueDetailPayload {
   return {
     issue: 50, title: "An issue", url: "https://github.com/o/r/issues/50", labels: [], board: null, action: null,
-    done: false, held_for_human: false, pull_requests: [], cost_usd: 2, estimated: false,
+    done: false, held_for_human: false, pull_requests: [], cost_usd: 2, held_usd: 0, estimated: false,
     rail: { current: "resolve", furthest: "resolve", resolve_attempts: 1, review_rounds: 0, ci_runs: 0, steps: 1, live: false },
     history: [], steps: [], warnings: [], observed_at: "2026-08-01T08:00:00Z", ...over,
   };
@@ -254,5 +254,18 @@ describe("IssueTab", () => {
     expect(await screen.findByText(/8 legs before the cutover/)).toHaveTextContent("$1.70");
     expect(screen.getByText("legs").parentElement).toHaveTextContent("legs 9");
     expect(screen.getAllByRole("row")).toHaveLength(2);
+  });
+
+  it("shows a running leg's hold beside the spend, and none when nothing is held", async () => {
+    serve(detail({ cost_usd: 0.05, held_usd: 50 }));
+    const { unmount } = render(<IssueTab repo="demo" issue={50} />);
+    expect(await screen.findByText("$0.05")).toBeVisible();
+    expect(screen.getByText(/\+ ≤\$50\.00 held/)).toBeVisible();
+    unmount();
+
+    serve(detail({ cost_usd: 0.05, held_usd: 0 }));
+    render(<IssueTab repo="demo" issue={50} />);
+    expect(await screen.findByText("$0.05")).toBeVisible();
+    expect(screen.queryByText(/held/)).not.toBeInTheDocument();
   });
 });

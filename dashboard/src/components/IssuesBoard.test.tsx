@@ -43,6 +43,7 @@ function card(issue: number, board: BoardStatus, over: Partial<IssueCard> = {}):
     rail: rail(),
     history,
     cost_usd: 1,
+    held_usd: 0,
     estimated: false,
     legs: 4,
     started_ts: "2026-10-12T10:00:00Z",
@@ -309,6 +310,24 @@ describe("issues board drawer", () => {
     expect(within(drawer).getByText("7")).toBeVisible();
     expect(within(drawer).getByText("ai-ready, needs-human")).toBeVisible();
     expect(calls).toEqual([]);
+  });
+
+  it("shows a running leg's hold apart from the spend, and nothing when none is held", async () => {
+    stubFetch();
+    renderBoard({
+      in_flight: [
+        card(181, needs("attempts", null), { cost_usd: 0.05, held_usd: 50, legs: 2 }),
+        card(182, needs("attempts", null), { cost_usd: 0.05, held_usd: 0, legs: 2 }),
+      ],
+    });
+
+    await userEvent.click(row("Issue 181 title"));
+    const held = within(document.getElementById("board-drawer-181") as HTMLElement);
+    expect(held.getByText("$0.05")).toBeVisible();
+    expect(held.getByText(/\+ ≤\$50\.00 held/)).toBeVisible();
+
+    await userEvent.click(row("Issue 182 title"));
+    expect(within(document.getElementById("board-drawer-182") as HTMLElement).queryByText(/held/)).not.toBeInTheDocument();
   });
 
   it("opens the dashboard's own issue page from the drawer", async () => {

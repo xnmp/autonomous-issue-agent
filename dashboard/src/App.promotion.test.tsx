@@ -106,6 +106,7 @@ describe("backlog promotion", () => {
                 },
                 rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
                 cost_usd: 0,
+                held_usd: 0,
                 estimated: false,
                 legs: 0,
                 started_ts: null,

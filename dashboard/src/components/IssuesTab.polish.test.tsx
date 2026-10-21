@@ -29,7 +29,7 @@ function inflight(issue: number, title: string, over: Partial<IssueCard> = {}): 
     board: { status: "waiting", group: "slot", on: "slot", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null },
     action: null,
     rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
-    history: [], cost_usd: 0, estimated: false, legs: 0, started_ts: null, last_ts: null, leg_running: false,
+    history: [], cost_usd: 0, held_usd: 0, estimated: false, legs: 0, started_ts: null, last_ts: null, leg_running: false,
     ...over,
   };
 }

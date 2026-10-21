@@ -512,6 +512,11 @@ export interface components {
             /** Estimated */
             estimated: boolean;
             /**
+             * Held Usd
+             * @default 0
+             */
+            held_usd: number;
+            /**
              * History
              * @default []
              */
@@ -571,6 +576,11 @@ export interface components {
              * @default false
              */
             held_for_human: boolean;
+            /**
+             * Held Usd
+             * @default 0
+             */
+            held_usd: number;
             /**
              * History
              * @default []

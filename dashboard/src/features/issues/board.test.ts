@@ -27,7 +27,7 @@ const rail = (over: Partial<StageRail> = {}): StageRail => ({
 function card(issue: number, board: BoardStatus, over: Partial<IssueCard> = {}): IssueCard {
   return {
     issue, title: `Issue ${issue}`, url: null, labels: [], pr: null, pr_url: null, pr_ci_state: null,
-    board, action: null, rail: rail(), history: [], cost_usd: 0, estimated: false, legs: 0,
+    board, action: null, rail: rail(), history: [], cost_usd: 0, held_usd: 0, estimated: false, legs: 0,
     started_ts: null, last_ts: null, leg_running: false, ...over,
   };
 }

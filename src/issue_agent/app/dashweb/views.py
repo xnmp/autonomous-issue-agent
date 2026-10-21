@@ -126,13 +126,19 @@ def _title(issue: int, item_view: IssueView | None, gh_issue: Mapping | None, pr
     return None
 
 
-def _spend(legs: Iterable[dash.LegRow]) -> tuple[float, bool]:
+def _spend(legs: Iterable[dash.LegRow]) -> tuple[float, float, bool]:
+    """(settled cost, money held by running legs, settled cost is an estimate).
+    A running leg's reservation is a worst-case hold, not spend, so it is
+    reported apart rather than summed into the cost."""
     counted = [leg for leg in legs if leg.counted]
-    return round(sum(leg.cost_usd for leg in counted), 6), any(leg.estimated for leg in counted)
+    ended = [leg for leg in counted if not leg.running]
+    return (round(sum(leg.cost_usd for leg in ended), 6),
+            round(sum(leg.reserved_usd for leg in counted if leg.running), 6),
+            any(leg.estimated for leg in ended))
 
 
 def issue_card(item: Item, repo: str, gh_issue: Mapping | None, models: Mapping[str, str] | None = None) -> dict:
-    cost, estimated = _spend(item.legs)
+    cost, held, estimated = _spend(item.legs)
     counted = [leg for leg in item.legs if leg.counted]
     triage = dash.issue_triage(item.legs)
     # The running leg's model, else the latest leg's; the legs table has the runtime only.
@@ -152,6 +158,7 @@ def issue_card(item: Item, repo: str, gh_issue: Mapping | None, models: Mapping[
         "rail": asdict(dash.rail(item.state, has_pr=item.pr is not None, legs=item.legs)),
         "history": [asdict(visit) for visit in dash.history(item.legs)],
         "cost_usd": cost,
+        "held_usd": held,
         "estimated": estimated,
         "legs": len(counted),
         "started_ts": _iso(counted[0].reserved_at) if counted else None,
@@ -196,7 +203,7 @@ def done_cards(merged: Iterable[Merged], legs: Iterable[dash.LegRow], repo: str,
             continue
         seen.add(m.issue)
         own = dash.issue_legs(rows, m.issue)
-        cost, _ = _spend(own)
+        cost = _spend(own)[0]
         gh_issue = gh_issues.get(m.issue)
         cards.append({
             "issue": m.issue,
@@ -282,7 +289,7 @@ def issue_detail(
     own = dash.issue_legs(legs, number)
     carried = [leg for leg in own if leg.carried and leg.counted]
     merges = [m for m in merged if m.issue == number]
-    cost, estimated = _spend(own)
+    cost, held, estimated = _spend(own)
     pulls = []
     if item is not None and item.pr is not None:
         pulls.append({"number": item.pr.number, "url": pr_url(repo, item.pr.number), "state": "open",
@@ -303,6 +310,7 @@ def issue_detail(
         "held_for_human": item.held if item else False,
         "pull_requests": pulls,
         "cost_usd": cost,
+        "held_usd": held,
         "estimated": estimated,
         "rail": asdict(dash.rail(item.state if item else None, has_pr=bool(pulls), legs=own, done=done))
         if (item or own or merges) else None,

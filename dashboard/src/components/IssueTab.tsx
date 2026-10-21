@@ -6,6 +6,7 @@ import { legNote, outcomeMark, prStateTone } from "../lib/semantics";
 import { duration, localTime, tokens, usd } from "../lib/format";
 import { GROUP_META, boardTone, plainHarnessMessage, railNodes } from "../features/issues/board";
 import { Chip } from "./ui/Chip";
+import { tipProps } from "./ui/Tip";
 import { Icon } from "./ui/Icon";
 import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, SkeletonRows, StoreUnavailable, WarningList, awaitingGitHub } from "./ui/Feedback";
@@ -205,6 +206,11 @@ export function IssueTab({
               <span className="issue-stat">
                 <span className="faint">cost</span>{" "}
                 <span className="mono">{usd(d.cost_usd)}{d.estimated ? " est." : ""}</span>
+                {d.held_usd > 0 ? (
+                  <span className="faint" {...tipProps("The running leg's reserved maximum, not spend; released to its real charge when it ends")}>
+                    {" "}+ ≤{usd(d.held_usd)} held
+                  </span>
+                ) : null}
               </span>
               <span className="issue-stat">
                 <span className="faint">legs</span>{" "}

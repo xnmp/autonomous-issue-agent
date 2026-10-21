@@ -347,14 +347,19 @@ function MiniTrack({ stage }: { stage: StageId }) {
   );
 }
 
+const HELD_TIP = "The running leg's reserved maximum, not spend; released to its real charge when it ends";
+
 function Facts({ item, card }: { item: BoardItem; card: IssueCard }) {
   const nowMs = useNow(30_000);
   return (
     <dl className="board-facts">
       <div>
         <dt>Cost</dt>
-        <dd className="num" {...(card.estimated ? tipProps("Includes estimated or still-reserved spend") : {})}>
+        <dd className="num" {...(card.estimated ? tipProps("Includes estimated spend") : {})}>
           {usd(card.cost_usd)}{card.estimated ? " est." : null}
+          {card.held_usd > 0 ? (
+            <span className="faint" {...tipProps(HELD_TIP)}> + ≤{usd(card.held_usd)} held</span>
+          ) : null}
         </dd>
       </div>
       <div><dt>Legs</dt><dd className="num">{card.legs}</dd></div>

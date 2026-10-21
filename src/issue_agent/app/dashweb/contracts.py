@@ -315,6 +315,8 @@ class IssueCard(Contract):
     rail: StageRail
     history: list[StageVisit] = []
     cost_usd: float
+    # Reserved maximum of running legs: held, not yet spent.
+    held_usd: float = 0.0
     estimated: bool
     legs: int
     started_ts: str | None
@@ -466,6 +468,8 @@ class IssueDetailPayload(Observed):
     held_for_human: bool = False
     pull_requests: list[PullRequestLink]
     cost_usd: float
+    # Reserved maximum of running legs: held, not yet spent.
+    held_usd: float = 0.0
     estimated: bool
     rail: StageRail | None = None
     history: list[StageVisit] = []

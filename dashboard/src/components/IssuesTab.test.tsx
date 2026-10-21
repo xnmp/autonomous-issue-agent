@@ -20,7 +20,7 @@ const doneCard: DoneCard = {
 
 const detail: IssueDetailPayload = {
   issue: 50, title: "Explain completed work", url: null, labels: [], board: null, action: null, done: true,
-  held_for_human: false, pull_requests: [], cost_usd: 2.5, estimated: false, rail: null, history: [], warnings: [],
+  held_for_human: false, pull_requests: [], cost_usd: 2.5, held_usd: 0, estimated: false, rail: null, history: [], warnings: [],
   steps: [{
     idx: 0, leg_id: "L1", kind: "RESOLVE", role: "fix", runtime: "codex", state: "ended", outcome: "done",
     started_ts: "2026-07-29T07:00:00Z", ended_ts: "2026-07-29T07:10:00Z", duration_s: 600, cost_usd: 1.5,

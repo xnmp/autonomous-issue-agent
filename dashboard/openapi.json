@@ -1063,6 +1063,11 @@
             "title": "Estimated",
             "type": "boolean"
           },
+          "held_usd": {
+            "default": 0.0,
+            "title": "Held Usd",
+            "type": "number"
+          },
           "history": {
             "default": [],
             "items": {
@@ -1318,6 +1323,11 @@
             "default": false,
             "title": "Held For Human",
             "type": "boolean"
+          },
+          "held_usd": {
+            "default": 0.0,
+            "title": "Held Usd",
+            "type": "number"
           },
           "history": {
             "default": [],
