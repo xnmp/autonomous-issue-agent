@@ -86,3 +86,29 @@ describe("sidebar width", () => {
     expect(resizer()).toHaveAttribute("aria-valuenow", "248");
   });
 });
+
+describe("sidebar errors", () => {
+  const withError = (error: string) =>
+    render(
+      <Sidebar
+        repos={{ ...polled(repos), error }}
+        usage={polled(usage)}
+        activeRepo={null}
+        verificationActive={false}
+        options={options}
+        onOptionsChange={() => {}}
+        onSelectRepo={() => {}}
+        onOpenVerification={() => {}}
+      />,
+    );
+
+  it("leaves an unreachable backend to the main pane, which already says it", () => {
+    withError("cannot reach the dashboard backend (is `python -m issue_agent.app.dashweb.main` running?)");
+    expect(screen.queryByText(/cannot reach the dashboard backend/)).toBeNull();
+  });
+
+  it("still shows its own deployment-listing failure", () => {
+    withError("deployment listing failed: config/repos unreadable");
+    expect(screen.getByText("deployment listing failed: config/repos unreadable")).toBeVisible();
+  });
+});

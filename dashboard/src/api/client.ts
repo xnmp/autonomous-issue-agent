@@ -40,6 +40,14 @@ export function isAbort(e: unknown): boolean {
   return e instanceof DOMException && e.name === "AbortError";
 }
 
+const BACKEND_UNREACHABLE = "cannot reach the dashboard backend";
+
+/** Every panel fails the same way when the backend is down, so the main pane
+ * says it once and a secondary panel (the sidebar) need not repeat it. */
+export function backendUnreachable(message: string | null | undefined): boolean {
+  return !!message && message.startsWith(BACKEND_UNREACHABLE);
+}
+
 async function decodeError(res: Response): Promise<never> {
   let detail = `${res.status} ${res.statusText}`;
   try {
@@ -48,7 +56,7 @@ async function decodeError(res: Response): Promise<never> {
   } catch {
     // A non-JSON 502/503/504 is a restarting or proxied-away backend.
     if ([502, 503, 504].includes(res.status)) {
-      detail = `cannot reach the dashboard backend (it may be restarting): ${detail.trim()}`;
+      detail = `${BACKEND_UNREACHABLE} (it may be restarting): ${detail.trim()}`;
     }
   }
   throw new ApiError(detail, res.status);
@@ -84,7 +92,7 @@ async function request<T>(
     // The backend is loopback-only; the overwhelmingly likely cause is "not
     // running", so say that instead of the browser's opaque "Failed to fetch".
     throw new ApiError(
-      "cannot reach the dashboard backend (is `python -m issue_agent.app.dashweb.main` running?)",
+      `${BACKEND_UNREACHABLE} (is \`python -m issue_agent.app.dashweb.main\` running?)`,
       0,
     );
   }
@@ -100,7 +108,7 @@ async function request<T>(
     }
     // An empty or cut-off body is what a restarting backend sends.
     throw new ApiError(
-      `cannot reach the dashboard backend (it may be restarting): empty or unreadable reply for ${path}`,
+      `${BACKEND_UNREACHABLE} (it may be restarting): empty or unreadable reply for ${path}`,
       res.status,
     );
   }

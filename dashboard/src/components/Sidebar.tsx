@@ -1,4 +1,5 @@
 import { useState, type KeyboardEvent, type PointerEvent } from "react";
+import { backendUnreachable } from "../api/client";
 import type { Polled } from "../api/hooks";
 import type { HarnessRepoSpend, RepoSummary, ReposPayload, UsagePayload } from "../api/types";
 import { HEALTH_LABEL, HEALTH_TONE, roleHealth, utilTone } from "../lib/semantics";
@@ -162,7 +163,7 @@ export function Sidebar({
         <Icon name="chevron-left" />
       </button>
       <div className="sidebar-scroll">
-        {repos.error ? (
+        {repos.error && !backendUnreachable(repos.error) ? (
           <ErrorBanner message={repos.error} onRetry={repos.refresh} stale={!!repos.data} />
         ) : null}
         <WarningList warnings={repos.data?.warnings} />
