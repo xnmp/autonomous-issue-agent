@@ -7,7 +7,8 @@ The nodemon/uvicorn-reload pattern, with two properties those don't need:
   kills paid work — the constraint learned from manual restarts in the
   2026-07-27 deployment.
 
-* The trigger is the harness repo's HEAD commit, not file mtimes. An mtime
+* The trigger is the last commit that touched what a daemon loads
+  (`RUNTIME_PATHS`), not file mtimes. An mtime
   watch reloads on every editor save, so a tick boundary landing between two
   saves of one logical change would boot the daemon on a half-edited tree.
   Committing is the operator's (and the assistant's) "this state is coherent
@@ -43,14 +44,22 @@ from collections.abc import Callable
 RELOAD_EXIT_CODE = 87
 
 
+# What a running daemon or the dashboard reads from the checkout: code, the
+# leg prompts, the launch scripts, dependencies, the dashboard bundle's source.
+# A commit touching only docs, tests or .claude/ restarts nothing (2026-10-21:
+# a docs commit restarted all four daemons). A new directory read at runtime
+# belongs here, or its changes never reload.
+RUNTIME_PATHS = ("src", "plugin", "bin", "dashboard", "pyproject.toml")
+
+
 def _head_commit(repo_root: str) -> str:
-    """HEAD sha of `repo_root`, or "" when unanswerable (not a repo, no git).
-    A subprocess per tick (~ms at POLL_SECONDS cadence) buys correct handling
-    of every ref layout (branch, detached, packed-refs) over hand-parsing
-    .git internals."""
+    """The sha of the last commit touching `RUNTIME_PATHS`, or "" when
+    unanswerable (not a repo, no git). A subprocess per tick (~ms at
+    POLL_SECONDS cadence) buys correct handling of every ref layout (branch,
+    detached, packed-refs) over hand-parsing .git internals."""
     try:
         res = subprocess.run(
-            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            ["git", "-C", repo_root, "log", "-1", "--format=%H", "HEAD", "--", *RUNTIME_PATHS],
             capture_output=True, text=True, timeout=10,
         )
         return res.stdout.strip() if res.returncode == 0 else ""
@@ -82,7 +91,7 @@ def remote_repo(root: str) -> str:
 
 
 class ReloadWatch:
-    """Baselines the harness repo's HEAD (plus explicit file contents) at
+    """Baselines the harness repo's last runtime commit (plus explicit file contents) at
     construction; `changed()` answers against that baseline."""
 
     def __init__(

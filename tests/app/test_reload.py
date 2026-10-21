@@ -37,7 +37,8 @@ def _git(repo, *args):
 
 def _repo(tmp_path):
     _git(tmp_path, "init", "-q")
-    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n")
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-qm", "one")
     return tmp_path
@@ -59,13 +60,58 @@ def test_uncommitted_edits_do_not_trigger_but_a_commit_does(tmp_path):
     w = ReloadWatch(str(repo))
     assert w.changed() is False
 
-    (repo / "a.py").write_text("x = 2\n")  # dirty tree, no commit
-    (repo / "b.py").write_text("y = 1\n")
+    (repo / "src" / "a.py").write_text("x = 2\n")  # dirty tree, no commit
+    (repo / "src" / "b.py").write_text("y = 1\n")
     assert w.changed() is False
 
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "two")
     assert w.changed() is True
+
+
+def _commit(repo, path: str, text: str) -> None:
+    (repo / path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / path).write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", path)
+
+
+@pytest.mark.parametrize("path", ["docs/a.md", ".claude/skills/manage/SKILL.md", "tests/test_a.py", "README.md"])
+def test_a_commit_touching_nothing_a_daemon_loads_does_not_reload(tmp_path, path):
+    """2026-10-21: a docs-only commit restarted all four daemons."""
+    repo = _repo(tmp_path)
+    w = ReloadWatch(str(repo))
+    _commit(repo, path, "notes\n")
+    assert w.changed() is False
+
+
+@pytest.mark.parametrize("path", ["src/a.py", "plugin/AGENT.md", "bin/point-at.sh", "dashboard/src/App.tsx",
+                                  "pyproject.toml"])
+def test_a_commit_touching_what_a_daemon_loads_reloads(tmp_path, path):
+    repo = _repo(tmp_path)
+    w = ReloadWatch(str(repo))
+    _commit(repo, path, "changed\n")
+    assert w.changed() is True
+
+
+def test_a_runtime_change_committed_beside_docs_reloads_and_a_revert_reloads_again(tmp_path):
+    repo = _repo(tmp_path)
+    w = ReloadWatch(str(repo))
+    (repo / "docs").mkdir()
+    (repo / "docs" / "a.md").write_text("notes\n")
+    _commit(repo, "src/a.py", "x = 2\n")
+    assert w.changed() is True
+    w = ReloadWatch(str(repo))
+    _commit(repo, "src/a.py", "x = 1\n")
+    assert w.changed() is True
+
+
+def test_a_repo_whose_commits_touch_no_runtime_path_never_flaps(tmp_path):
+    _git(tmp_path, "init", "-q")
+    _commit(tmp_path, "docs/a.md", "one\n")
+    w = ReloadWatch(str(tmp_path))
+    _commit(tmp_path, "docs/a.md", "two\n")
+    assert w.changed() is False
 
 
 def test_env_reload_uses_content_not_mtime(tmp_path):

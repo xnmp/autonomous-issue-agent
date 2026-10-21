@@ -30,7 +30,8 @@ environments under ADR 0011. Operational paths do not independently fall back
 to another base branch, repository, model, authority path, or state path.
 
 Hot reload is a new process, never an in-place object-graph mutation. Harness
-code changes are detected from committed HEAD, while the gitignored composed
+code changes are detected from the last commit touching a path the daemons
+load (`adapters/reload.RUNTIME_PATHS`), while the gitignored composed
 env is content-hashed. A valid change closes paid admission, lets active work
 drain while observation continues, and restarts between ticks. Invalid
 candidate configuration does not replace the running snapshot.
