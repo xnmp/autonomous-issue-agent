@@ -344,7 +344,7 @@ describe("issues board drawer", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Issue 185 title" }));
     await userEvent.click(within(document.getElementById("board-drawer-185") as HTMLElement)
-      .getByRole("button", { name: "Open full issue" }));
+      .getByRole("button", { name: "Open full details" }));
 
     expect(onOpenIssue).toHaveBeenCalledWith(185);
   });

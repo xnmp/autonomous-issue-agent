@@ -278,7 +278,7 @@ function BoardDrawer({
       {/* Navigation, not an action: the issue page keeps the step table and
           per-PR review controls the board leaves out. */}
       <button type="button" className="board-linkbtn board-openfull" onClick={() => onOpenIssue(item.issue)}>
-        Open full issue
+        Open full details
       </button>
       <Action repo={repo} item={item} onRefresh={onRefresh} />
     </div>

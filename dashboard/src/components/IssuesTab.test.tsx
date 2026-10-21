@@ -103,7 +103,7 @@ describe("IssuesTab", () => {
     expect(screen.getByText("changes requested")).toBeVisible();
     expect(container.querySelector("ol.task-story")).toBeVisible();
 
-    await userEvent.click(screen.getByRole("button", { name: "Open full issue" }));
+    await userEvent.click(screen.getByRole("button", { name: "Open full details" }));
     expect(onOpenIssue).toHaveBeenCalledWith(50);
 
     fireEvent.contextMenu(screen.getByRole("columnheader", { name: /Issue \/ PR/ }));

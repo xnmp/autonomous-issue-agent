@@ -615,7 +615,7 @@ function TaskDetailRow({
         <div className="row-detail">
           <div className="row-detail-hd">
             <strong>What happened</strong>
-            <button className="btn btn-xs" onClick={onOpen}>Open full issue</button>
+            <button className="btn btn-xs" onClick={onOpen}>Open full details</button>
           </div>
           {detail.error ? (
             <ErrorBanner message={detail.error} onRetry={detail.refresh} />
