@@ -445,7 +445,10 @@ class Daemon:
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
             entry = self._dispatches.pop(future, None)
-            if entry is not None:
+            # Only a dispatch that ended cleanly wakes the next wait. One that
+            # raised (a worker's own GitHub read failing before its lease)
+            # recorded no leg to back it off, so the poll spaces its retry.
+            if entry is not None and not future.cancelled() and future.exception() is None:
                 self._dispatches_ended += 1
             self._dispatch_lock.notify_all()
         if entry is None:
@@ -710,13 +713,15 @@ class Daemon:
                 reason = self._sleep_interval(
                     sleep, scheduler_progress, ended=ended, own_wakes=own_wakes,
                     retick=any(not isinstance(action, RunAgent) for action in taken))
-                # A tick woken by its own trigger is never woken by its own
-                # trigger again: a mutation every tick repeats (an idempotent
-                # re-post, a merge GitHub has not taken yet) or a dispatch that
-                # ends at once every tick (a skip before its claim, a refused
-                # read in the worker: no leg recorded, so no back-off) costs
-                # at most one extra observe per interval, never a loop.
-                own_wakes = reason not in (RETICK, LEG_ENDED)
+                # A tick re-ticked by its own GitHub change is not re-ticked
+                # again: a mutation every tick repeats (an idempotent re-post,
+                # a merge GitHub has not taken yet) costs at most one extra
+                # observe per interval, never a loop. A leg's end always wakes:
+                # a chain (steward, then triage) waited a full poll per link
+                # (#1341: 88 s). Derive never dispatches a leased item, so a
+                # dispatch skipped before its claim is a stale observation the
+                # next one corrects; one that raised wakes nothing.
+                own_wakes = reason != RETICK
                 if reason:
                     self.log(f"{self.name}: woke: {reason}")
             self._transition(DaemonState.DRAINING, "loop completed")

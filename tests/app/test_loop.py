@@ -785,9 +785,10 @@ def test_a_mutation_every_tick_repeats_costs_one_extra_observe_per_interval_neve
     assert observed == [0, 5, 65, 70, 130]
 
 
-def test_a_dispatch_that_ends_at_once_every_tick_costs_one_extra_observe_per_interval_never_a_loop():
-    # A skip before the claim, or a refused read inside the worker, records no
-    # leg, so nothing backs it off: its end must not wake every gap.
+def test_every_legs_end_wakes_the_next_wait_back_to_back_never_sooner_than_the_gap():
+    # #1341: the steward's end woke the loop, the triage after it waited a full
+    # poll (88 s to its comment). Each link of a chain wakes; none faster than
+    # the gap, however soon its leg ends.
     clock, observed, logs = ManualClock(), [], []
     d = _paid(lambda _a: None, poll_seconds=60, observe=_observed_at(clock, observed), log=logs.append)
 
@@ -796,8 +797,27 @@ def test_a_dispatch_that_ends_at_once_every_tick_costs_one_extra_observe_per_int
         clock.advance(seconds)
 
     d.run_forever(sleep=sleep, now=lambda: int(clock()), active_now=clock, max_ticks=5)
-    assert observed == [0, 5, 65, 70, 130]
-    assert "fix: woke: a leg of this role ended" in logs
+    assert observed == [0, 5, 10, 15, 20]
+    assert logs.count("fix: woke: a leg of this role ended") == 5  # one per wait, the last included
+
+
+def test_a_dispatch_that_raises_every_tick_is_retried_at_the_poll_never_the_gap():
+    # A worker's own GitHub read failing before its lease records no leg, so
+    # nothing backs it off: its end must not wake the loop.
+    clock, observed, logs = ManualClock(), [], []
+
+    def fails(_action):
+        raise RuntimeError("gh issue view timed out")
+
+    d = _paid(fails, poll_seconds=60, observe=_observed_at(clock, observed), log=logs.append)
+
+    def sleep(seconds):
+        d.wait_for_dispatches()
+        clock.advance(seconds)
+
+    d.run_forever(sleep=sleep, now=lambda: int(clock()), active_now=clock, max_ticks=3)
+    assert observed == [0, 60, 120]
+    assert "fix: woke: a leg of this role ended" not in logs
 
 
 def test_a_wake_by_the_other_role_does_not_spend_the_next_own_wake():
