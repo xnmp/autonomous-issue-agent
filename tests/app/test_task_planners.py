@@ -462,7 +462,9 @@ def test_fix_ci_task_lists_each_failure_with_where_its_log_is_and_records_their_
     assert "job 11: smoke (ubuntu)" in task.prompt and "sonar (not a GitHub Actions job" in task.prompt
     assert "lint" in task.prompt and "smoke (windows)" in task.prompt and "this same session" in task.prompt
     assert "gh run rerun" not in task.prompt and "flaky/infra" not in task.prompt  # the harness re-runs
-    assert "push\n  nothing and return status=failed" in task.prompt
+    # Outside its diff: merge a base that moved (a re-run tests the old base), else push nothing.
+    assert "git log HEAD..origin/dev" in task.prompt and "merge the base" in task.prompt
+    assert "Otherwise push nothing and return status=failed" in task.prompt
     assert task.evidence == ("check:11@900.1", "status:sonar@t#")
 
 

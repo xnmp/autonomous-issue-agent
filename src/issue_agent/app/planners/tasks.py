@@ -333,9 +333,13 @@ _FIX_CI_DIAGNOSE = """Diagnose by failure class:
   tests), NOT add the file to sonar.coverage.exclusions.
 - Security scan (Wiz/Snyk): address the flagged finding if it is in your diff.
 - Intermittent failure, or one outside your diff (a hang or timeout in a test
-  your change does not touch, or the same failure on the base branch): push
-  nothing and return status=failed with the reason in your summary; the harness
-  re-runs the failed jobs. Never return blocked to ask a human for a re-run (#1117).
+  your change does not touch, or the same failure on the base branch): if your
+  branch is behind its base (`git fetch origin`, then `git log HEAD..origin/{base}`),
+  merge the base, verify, and push: a PR's run, and any re-run of it, tests the
+  base as it was when the run began (ballast #86 waited on a re-run of a fixed
+  failure). Otherwise push nothing and return status=failed with the reason in
+  your summary; the harness re-runs the failed jobs. Never return blocked to ask
+  a human for a re-run (#1117).
 
 Do NOT suppress a quality/security signal for the code THIS PR adds/modifies just
 to go green — default to fixing the cause. Suppression is legitimate ONLY in
@@ -377,7 +381,7 @@ def build_fix_ci_task(
         "behavior this repair does not change. Re-capture only criteria affected by "
         "the CI fix; keep each carried or new image mapped to its criterion in the "
         "PR body.\n\n"
-        f"{_FIX_CI_DIAGNOSE}\n\n"
+        f"{_FIX_CI_DIAGNOSE.format(base=cfg.base_branch)}\n\n"
         + (f"Job logs:\n{commands}\n\n" if commands else "")
         + f"{_fenced('failed checks', as_untrusted(names))}"
         + ("" if not status else
