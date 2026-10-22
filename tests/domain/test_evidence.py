@@ -17,7 +17,8 @@ from issue_agent.domain.evidence import (
 )
 from issue_agent.domain.routing import DEFAULT_TIER, Tier, escalate
 from issue_agent.domain.state import (
-    AttemptsStop, Backoff, Dispatch, Harness, Local, NeedsHuman, Rerun, Wait, WaitReason, pr_key,
+    AttemptsStop, Backoff, Dispatch, Harness, Local, NeedsHuman, Rerun, StopReason, Wait, WaitReason, pr_key,
+    stop_tag,
 )
 from tests.fakes.recorded import derive
 from issue_agent.domain.world import Comment, PRView, Review, WorldState
@@ -364,6 +365,34 @@ def test_a_human_comment_re_arms_handed_evidence():
     nudged = pr(RERUN, comments=(Comment("alice", "try again", at(45).isoformat()),))
     step = state(nudged, fix_end(30, k(11)), fix_end(40, k(21, attempt=2)))
     assert isinstance(step, Dispatch) and step.evidence.keys == (k(21, attempt=2),)
+
+
+def test_a_human_reset_re_arms_the_harness_rerun_once_the_repair_pushes_nothing():
+    # ballast #82: released after its one re-run; the re-armed repair found only a
+    # flake, so the head is re-run again rather than stopped again.
+    nudged = pr(RERUN, comments=(Comment("alice", "try again", at(50).isoformat()),))
+    legs = (fix_end(30, k(11)), fix_end(48, k(21, attempt=2)), fix_end(55, k(21, attempt=2)))
+    assert state(nudged, *legs) == Rerun("h1", ((900, 2),))
+
+
+def test_a_released_stop_re_arms_the_harness_rerun_as_the_ballast_82_release_did():
+    released = pr(RERUN, comments=(Comment("fix-bot", f"{H.marker}\n{stop_tag(StopReason.ATTEMPTS)}\nstop",
+                                           at(50).isoformat()),))  # its needs-human label was removed
+    legs = (fix_end(30, k(11)), fix_end(48, k(21, attempt=2)), fix_end(55, k(21, attempt=2)))
+    assert state(released, *legs) == Rerun("h1", ((900, 2),))
+
+
+def test_a_rerun_after_the_human_reset_uses_up_that_reset():
+    nudged = pr(RERUN, comments=(Comment("alice", "try again", at(40).isoformat()),))
+    legs = (fix_end(30, k(11)), fix_end(48, k(21, attempt=2)))
+    assert state(nudged, *legs) == stop(48)
+
+
+def test_a_rerun_with_an_unreadable_start_is_never_rerun_again_after_a_reset():
+    unread = ci(job(UBUNTU, 21, "fail", required=True, attempt=2, start="?"), job(WINDOWS, 22, "pass", attempt=2))
+    nudged = pr(unread, comments=(Comment("alice", "try again", at(50).isoformat()),))
+    legs = (fix_end(30, k(11)), fix_end(55, "check:21@?"))
+    assert state(nudged, *legs) == stop(55)
 
 
 def test_a_green_head_is_not_a_repair_however_its_optional_jobs_fail():

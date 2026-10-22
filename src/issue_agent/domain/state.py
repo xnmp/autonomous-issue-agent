@@ -46,7 +46,7 @@ Precedence, the single place it is defined (first match wins, per item):
                (tauri #1078; a capped leg was handed nothing), unless every red check is red or rerunning on
                the base tip too -> Wait (#313); none new -> Wait while a
                failing run still runs, else Rerun (free) if no run on the head
-               is past its first attempt, else NeedsHuman (ATTEMPTS);
+               was re-run since the reset floor, else NeedsHuman (ATTEMPTS);
                pending -> Wait; green and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
                head -> ADDRESS_REVIEW; no bot verdict on head, or a bot
                CHANGES_REQUESTED older than the PR body's last edit -> REVIEW; bot
@@ -643,7 +643,7 @@ def _proceed(
         # GitHub does not show it yet. A human reset since then ends the wait.
         return Wait(WaitReason.CI_UNKNOWN)
     else:
-        step = _pr_step(pr, harness, item.base, _handed(legs, pr.head_ref_oid, floor), anchor)
+        step = _pr_step(pr, harness, item.base, _handed(legs, pr.head_ref_oid, floor), floor, anchor)
     if not isinstance(step, Dispatch):
         return step
     # Before the gates: nothing is spent, and a stop would ask a human to act on an issue that is only waiting.
@@ -737,7 +737,8 @@ def _handed(legs: tuple[LegEnd, ...], head: str, floor: datetime | None) -> froz
 
 
 def _pr_step(
-    pr: PRView, harness: Harness, base: tuple[Check, ...] | None, handed: frozenset[str], anchor: str,
+    pr: PRView, harness: Harness, base: tuple[Check, ...] | None, handed: frozenset[str],
+    floor: datetime | None, anchor: str,
 ) -> DerivedState:
     head = pr.head_ref_oid
     if not head:
@@ -761,8 +762,10 @@ def _pr_step(
             # will not re-run a run in progress. Another run's check never holds this.
             return Wait(WaitReason.CI_PENDING)
         # A repair had every failure and pushed nothing: the same evidence cannot help. A
-        # flake gets one harness re-run per head; a run past attempt 1 was re-run already.
-        if runs and all((c.run_attempt or 1) == 1 for c in pr.ci.reports):
+        # flake gets one harness re-run per head and human reset, as handed evidence does
+        # (ballast #82: a release re-armed a paid repair, never the free re-run). A
+        # re-run attempt began when its jobs did; an unreadable start counts as after.
+        if runs and all((c.run_attempt or 1) == 1 or _before(c.started_at, floor) for c in pr.ci.reports):
             return Rerun(head, tuple(sorted(runs)))
         return AttemptsStop(AgentKind.FIX_CI, anchor)
     # The base is the repo's to fix (Q13: flakes are the repo's). The PR
@@ -843,6 +846,11 @@ def _human_change_requests(pr: PRView, harness: Harness) -> Mapping[str, str]:
         who = r.author.strip().casefold()
         latest[who] = max(latest.get(who, rank), rank)
     return {who: commit for who, (_, _, _, state, commit) in latest.items() if state == REVIEW_CHANGES_REQUESTED}
+
+
+def _before(raw: str, floor: datetime | None) -> bool:
+    at = parse_timestamp(raw)
+    return floor is not None and at is not None and at < floor
 
 
 def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) -> int:
