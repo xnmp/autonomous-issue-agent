@@ -200,7 +200,10 @@ def usd_per_million_to_micros(value: str | float | Decimal) -> int:
         raise ValueError(f"invalid rate {value!r}") from exc
     if not amount.is_finite() or amount <= 0:
         raise ValueError("rate must be finite and positive")
-    return int((amount * 1_000_000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    micros = int((amount * 1_000_000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if micros == 0:
+        raise ValueError("rate rounds to zero micros")
+    return micros
 
 
 def parse_model_rate_table(

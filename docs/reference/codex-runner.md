@@ -131,7 +131,7 @@ exit together).
 4. **AGENT.md parity** — port the fixer instructions Claude gets via the system-prompt
    preset into an `AGENTS.md` Codex reads from the cwd (Codex's native instructions
    file), so red→green discipline + `.harness` markers + envelope contract reach GPT-5.5.
-5. **Tests** — `tests/adapters/test_codex_runner.py`: build_codex_argv maps every field
+5. **Tests** — `tests/app/test_codex_runner.py`: build_codex_argv maps every field
    (schema→tempfile+required, model, cwd, resume, provider -c flags, sandbox, hook
    config); envelope parse (incl. is_error on bad/empty output); a fake `codex` binary
    for run().

@@ -966,6 +966,9 @@ def spend_status_lines(cap: float = 0.0, repo: str | None = None, global_cap: fl
 
 def cmd_status(args) -> int:
     repo, target_dir, name = _resolve_context(args)
+    if not repo and not os.path.isfile(os.path.join(REPOS_DIR, f"{name}.env")):
+        err("could not detect the repo. Run inside a target checkout, or pass --repo owner/name or --name.")
+        return 2
     # Read-only: a mismatched overlay is shown with a warning, so status can
     # diagnose the collision from either checkout.
     mismatch = check_overlay_mismatch(name, repo, target_dir)
@@ -1086,7 +1089,8 @@ def cmd_ready(args) -> int:
         return 2
     effects, rc = _operator_effects(repo, "cli"), 0
     for n in args.issues:
-        if not str(n).isdigit():
+        # Bounded ASCII digits: `str.isdigit` also accepts "²", which `int` refuses.
+        if not re.fullmatch(r"[0-9]{1,18}", str(n)) or int(n) < 1:
             err(f"invalid issue number {n!r}")
             rc = 1
             continue
@@ -1191,10 +1195,13 @@ def cmd_uninstall_service(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="issue-agent",
                                 description="Autonomous issue-resolving harness and shared configuration.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Named, so the usage line does not enumerate the commands `--help` hides.
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
 
     def command(name: str, func, help_text: str | None, context: bool = True) -> argparse.ArgumentParser:
-        sp = sub.add_parser(name, help=help_text if help_text is not None else argparse.SUPPRESS)
+        # A command without help stays out of the listing; argparse prints
+        # SUPPRESS literally for a subcommand.
+        sp = sub.add_parser(name, **({} if help_text is None else {"help": help_text}))
         if context:
             sp.add_argument("--repo", default="", help="owner/name (default: auto-detect from cwd)")
             sp.add_argument("--target-dir", default="", help="target working copy (default: git root of cwd)")
@@ -1208,8 +1215,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = command("config", cmd_config, "read or edit live settings without a target checkout", context=False)
     actions = sp.add_subparsers(dest="operation", required=True)
-    for operation in ("get", "set", "unset"):
-        action = actions.add_parser(operation)
+    for operation, summary in (("get", "print a setting's effective value"),
+                               ("set", "write a setting"),
+                               ("unset", "remove a setting, restoring its default")):
+        action = actions.add_parser(operation, help=summary)
         scope = action.add_mutually_exclusive_group(required=True)
         scope.add_argument("--shared", dest="name", action="store_const", const=None,
                            help="harness-wide defaults; no deployment required")

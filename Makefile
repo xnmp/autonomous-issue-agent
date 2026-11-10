@@ -14,17 +14,22 @@ PYTEST_TIMING ?= --durations=10
 help:
 	@echo "Autonomous Issue Agent — make targets:"
 	@echo "  make test               run the full Python, shell and architecture suites"
-	@echo "  make test-domain        run the pure Python domain behavioural suite (Phase 0/1 port)"
-	@echo "  make test-adapters      run the Python adapter suite (Phase 2: AgentRunner + runtimes)"
+	@echo "  make test-domain        run the pure Python domain behavioural suite"
+	@echo "  make test-adapters      run the Python adapter suite (AgentRunner + runtimes)"
 	@echo "  make test-app           run the app-layer suite (dashboard web collectors + endpoints)"
 	@echo "  make dashboard-ui       build the interactive dashboard SPA into dashboard/dist"
 	@echo "  make doctor AGENT_ENV=config/.active.<name>.env   preflight tooling, config, identities, repo access"
 	@echo "  make install            install the 'issue-agent' CLI (uv sync + ~/.local/bin shim)"
-	@echo "  make point-at REPO=<name>   compose config, preflight, ensure dev branch, and run all 3 daemons"
+	@echo "  make point-at REPO=<name>   compose config, preflight, ensure the base branch, and run both daemons"
 	@echo "  make run-fix            run the Python fix watcher in the foreground (Ctrl-C to stop)"
 	@echo "  make run-review         run the Python review watcher in the foreground"
 	@echo "  make install-launchd AGENT_ENV=config/.active.<name>.env   install+load the 2 launchd agents (macOS)"
 	@echo "  make install-systemd AGENT_ENV=config/.active.<name>.env   install+enable the 2 systemd user units (Linux)"
+	@echo "  make uninstall-launchd / uninstall-systemd   remove the service units"
+	@echo "  make typecheck          pyrefly over src and tests"
+	@echo "  make arch               import-linter layer contracts"
+	@echo "  make lint               shellcheck bin/*.sh (warnings and errors)"
+	@echo "  make dashboard          serve the operator dashboard (run dashboard-ui first)"
 	@echo "  make demo-init          create + seed the local demo target repo"
 	@echo "  make clean              remove caches and demo scratch"
 
@@ -111,7 +116,7 @@ install:
 	@bash bin/install.sh
 
 # One command: compose config/shared.env + config/repos/<REPO>.env, preflight,
-# ensure the base branch, prepare local excludes/labels, and run all three daemons in
+# ensure the base branch, prepare local excludes/labels, and run both daemons in
 # the foreground (Ctrl-C stops all). e.g. make point-at REPO=myapp
 point-at:
 	@test -n "$(REPO)" || { echo "usage: make point-at REPO=<name>  (reads config/repos/<name>.env)"; exit 1; }
@@ -143,10 +148,11 @@ uninstall-systemd:
 demo-init:
 	@bash examples/demo-target/init-demo.sh
 
+# SC1090/SC1091: the scripts source the composed env file, a runtime path.
 lint:
-	@command -v shellcheck >/dev/null 2>&1 && shellcheck -x \
-		bin/*.sh \
-		|| echo "shellcheck not installed — skipping (brew install shellcheck)"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck -x --severity=warning -e SC1090,SC1091 bin/*.sh && echo "✓ shellcheck clean"; \
+	else echo "shellcheck not installed — skipping"; fi
 
 clean:
 	@find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true

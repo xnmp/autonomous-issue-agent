@@ -6,7 +6,6 @@ import {
   useMemo,
   useState,
   type CSSProperties,
-  type KeyboardEvent,
   type MouseEvent,
 } from "react";
 import { api } from "../api/client";
@@ -363,7 +362,7 @@ function DoneTable({
 
   return (
     <>
-    <Pager page={page} onPage={onPage} />
+    <Pager page={page} onPage={onPage} placement="top" />
     <div className="tbl-wrap panel">
       <ResizableTable
         storageKey="issues-done"
@@ -382,12 +381,16 @@ function DoneTable({
                 <tr
                   className={`clickable${open ? " expanded" : ""}${recency > 0 ? " recent" : ""}${isNew ? " unread" : ""}`}
                   style={recency > 0 ? ({ "--recency": recency.toFixed(3) } as CSSProperties) : undefined}
-                  tabIndex={0}
-                  aria-expanded={open}
                   onClick={() => setExpanded(open ? null : card.issue)}
-                  onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
                 >
-                  <td><IssueSummary card={card} open={open} isNew={isNew} /></td>
+                  <td>
+                    <IssueSummary
+                      card={card}
+                      open={open}
+                      isNew={isNew}
+                      onToggle={() => setExpanded(open ? null : card.issue)}
+                    />
+                  </td>
                   {visible.has("cost") ? (
                     <td className="r mono cost-cell">{usd(card.cost_usd)}</td>
                   ) : null}
@@ -419,7 +422,7 @@ function DoneTable({
         </tbody>
       </ResizableTable>
     </div>
-    <Pager page={page} onPage={onPage} />
+    <Pager page={page} onPage={onPage} placement="bottom" />
     </>
   );
 }
@@ -494,7 +497,7 @@ function BacklogTable({
   return (
     <>
       {error ? <ErrorBanner message={error} /> : null}
-      <Pager page={page} onPage={onPage} />
+      <Pager page={page} onPage={onPage} placement="top" />
       <div className="tbl-wrap panel">
         <ResizableTable
           storageKey={storageKey}
@@ -510,14 +513,15 @@ function BacklogTable({
                 <Fragment key={card.issue}>
                   <tr
                     className={`clickable${open ? " expanded" : ""}`}
-                    tabIndex={0}
-                    aria-expanded={open}
                     onClick={() => setExpanded(open ? null : card.issue)}
-                    onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
                   >
                     <td>
                       <div className="issue-summary">
-                        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
+                        <ExpandToggle
+                          open={open}
+                          issue={card.issue}
+                          onToggle={() => setExpanded(open ? null : card.issue)}
+                        />
                         <div className="issue-summary-main">
                           <div className="row-wrap">
                             <IssueNumber issue={card.issue} url={card.url} />
@@ -572,7 +576,7 @@ function BacklogTable({
           </tbody>
         </ResizableTable>
       </div>
-      <Pager page={page} onPage={onPage} />
+      <Pager page={page} onPage={onPage} placement="bottom" />
 
       {promote ? (
         <PromoteConfirm
@@ -661,11 +665,41 @@ function TaskStoryLine({ step }: { step: IssueStep }) {
   );
 }
 
-function IssueSummary({ card, open, isNew }: { card: DoneCard; open: boolean; isNew: boolean }) {
+/** The row's disclosure control: the whole row still toggles on click, but the
+ * keyboard and assistive-tech contract lives on this real button (a <tr>
+ * cannot carry aria-expanded). */
+function ExpandToggle({ open, issue, onToggle }: { open: boolean; issue: number; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      className="expand-toggle"
+      aria-expanded={open}
+      aria-label={`Details for #${issue}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onToggle();
+      }}
+    >
+      <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
+    </button>
+  );
+}
+
+function IssueSummary({
+  card,
+  open,
+  isNew,
+  onToggle,
+}: {
+  card: DoneCard;
+  open: boolean;
+  isNew: boolean;
+  onToggle: () => void;
+}) {
   return (
     <div className="issue-cell">
       <div className="issue-summary">
-        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
+        <ExpandToggle open={open} issue={card.issue} onToggle={onToggle} />
         <div className="issue-summary-main">
           <span className="issue-summary-title" title={card.title ?? undefined}>
             {card.title ?? <span className="faint">title unavailable</span>}
@@ -766,21 +800,4 @@ function FormattedIssueBody({ body }: { body: string | null }) {
       </Suspense>
     </div>
   );
-}
-
-function toggleRowFromKeyboard(
-  event: KeyboardEvent<HTMLTableRowElement>,
-  toggle: () => void,
-) {
-  if (
-    event.target instanceof Element
-    && event.target !== event.currentTarget
-    && event.target.closest("a, button, input, select, textarea, [role='button']")
-  ) {
-    return;
-  }
-  if (event.key === "Enter" || event.key === " ") {
-    event.preventDefault();
-    toggle();
-  }
 }

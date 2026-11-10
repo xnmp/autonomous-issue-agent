@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from issue_agent.domain.contracts import Money, TokenUsage
-from issue_agent.domain.pricing import ModelRates, RateTable, UnknownModelPolicy, parse_model_rate_table, price
+from issue_agent.domain.pricing import ModelRates, RateTable, UnknownModelPolicy, parse_model_rate_table, price, usd_per_million_to_micros
 
 
 RATES = ModelRates(
@@ -16,6 +16,17 @@ def test_price_covers_all_disjoint_counters_without_float_drift():
     assert price(usage, RATES) == Money("USD", 32_600_000)
     huge = price(TokenUsage(10**30, 0), RATES)
     assert huge.micros == 2 * 10**30
+
+
+@pytest.mark.parametrize("rate", [0.0000001, "0.0000004", 0, -1, float("nan"), float("inf"), "abc"])
+def test_a_rate_that_is_not_a_positive_number_of_micros_is_rejected(rate):
+    with pytest.raises(ValueError):
+        usd_per_million_to_micros(rate)
+
+
+def test_the_smallest_representable_rate_is_one_micro():
+    assert usd_per_million_to_micros("0.000001") == 1
+    assert usd_per_million_to_micros(2.5) == 2_500_000
 
 
 def test_fractional_micro_rounds_toward_the_cap():

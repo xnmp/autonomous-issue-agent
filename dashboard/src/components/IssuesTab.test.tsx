@@ -82,6 +82,26 @@ describe("IssuesTab", () => {
     expect(screen.queryByText("no legs recorded")).not.toBeInTheDocument();
   });
 
+  it("expresses a done row's disclosure on a real button the keyboard can operate, not on the <tr>", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(detail), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    })));
+    render(<IssuesTab repo="demo" sub="done" issues={polled({ done: [doneCard] })} onOpenIssue={vi.fn()} />);
+
+    const row = screen.getByRole("row", { name: /Explain completed work/ });
+    expect(row).not.toHaveAttribute("aria-expanded");
+    const toggle = screen.getByRole("button", { name: "Details for #50" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    toggle.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(await screen.findByText("Wrote the fix and its test.")).toBeVisible();
+
+    await userEvent.keyboard(" ");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("expands a done row into its legs before opening the full issue, and hides rounds by default", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(detail), {
       status: 200, headers: { "Content-Type": "application/json" },

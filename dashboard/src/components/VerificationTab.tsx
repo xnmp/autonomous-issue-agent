@@ -36,6 +36,8 @@ export function VerificationTab() {
 
   return (
     <div className="tabbody">
+      {/* SectionTitle is not a heading; the page still needs one. */}
+      <h1 className="sr-only">Verification ledger</h1>
       <SectionTitle>Verification ledger</SectionTitle>
       {v.error ? <ErrorBanner message={v.error} onRetry={v.refresh} stale={!!v.data} /> : null}
       <WarningList warnings={v.data?.warnings} />

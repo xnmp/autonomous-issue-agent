@@ -1450,3 +1450,36 @@ def test_a_codex_leg_the_sandbox_refuses_never_spawns(tmp_path):
 def test_a_sandboxed_codex_runner_without_a_process_supervisor_is_a_wiring_error(tmp_path):
     with pytest.raises(ValueError):
         CodexRunner(codex_bin="codex", leg_sandbox=_codex_sandbox(tmp_path))
+
+
+def _rollout_meta(cwd, session_id):
+    return json.dumps(
+        {
+            "type": "session_meta",
+            "timestamp": "2099-01-01T00:00:00Z",
+            "payload": {"originator": "codex_exec", "source": "exec", "cwd": cwd, "id": session_id},
+        }
+    ) + "\n"
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        b'{"type":"x"}\n\xff\xfe\n',
+        b'["session_meta"]\n',
+        b'{"type":"session_meta","payload":["x"]}\n',
+        b'{"type":"session_meta","payload":"x"}\n',
+        b'"session_meta"\n',
+        b"\xff\xfe",
+    ],
+)
+def test_a_malformed_rollout_is_skipped_and_a_good_session_still_found(tmp_path, junk):
+    from issue_agent.adapters.codex_runner import discover_rollout_session
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    day = tmp_path / "home" / "sessions" / "2026" / "11" / "10"
+    day.mkdir(parents=True)
+    (day / "rollout-bad.jsonl").write_bytes(junk)
+    (day / "rollout-good.jsonl").write_text(_rollout_meta(str(cwd), "SESSION-GOOD"))
+    assert discover_rollout_session(str(cwd), time.time() - 10, str(tmp_path / "home")) == "SESSION-GOOD"

@@ -26,10 +26,19 @@ export function paginate<T>(rows: readonly T[], requested: number, size = PAGE_S
 }
 
 /** Hidden when everything fits on one page: controls with nothing to do are noise. */
-export function Pager({ page, onPage }: { page: Page<unknown>; onPage: (page: number) => void }) {
+export function Pager({
+  page,
+  onPage,
+  placement,
+}: {
+  page: Page<unknown>;
+  onPage: (page: number) => void;
+  /** A table is paged above and below; the landmarks need distinct names. */
+  placement: "top" | "bottom";
+}) {
   if (page.pages <= 1) return null;
   return (
-    <nav className="pager" aria-label="Pagination">
+    <nav className="pager" aria-label={`Pagination (${placement})`}>
       <span className="pager-range">{page.from}–{page.to} of {page.total}</span>
       <span className="pager-nav">
         <button type="button" className="seg-btn" disabled={page.page === 0} onClick={() => onPage(page.page - 1)}>

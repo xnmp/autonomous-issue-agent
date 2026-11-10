@@ -266,7 +266,7 @@ def _encodable(value):
 def _safe_asset(dist: str, relative: str) -> str:
     """A file inside `dist` for this URL path, or "" — path traversal never
     escapes the build directory."""
-    if not relative:
+    if not relative or "\0" in relative:
         return ""
     candidate = os.path.realpath(os.path.join(dist, relative))
     base = os.path.realpath(dist)

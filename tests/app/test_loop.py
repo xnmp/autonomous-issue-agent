@@ -254,16 +254,14 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
         AgentKind.REVIEW,
         shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
         monotonic=clock,
-        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
+        # A deadline can already be exhausted by earlier shutdown work;
+        # optional teardown has no remaining allocation in that case.
+        cancel_active_dispatches=lambda: clock.advance(_SHUTDOWN_TIMEOUT if exhausted else _GRACEFUL_WINDOW),
         force_kill_dispatches=kill,
     )
 
     def before_shutdown(_seconds):
         assert started.wait(timeout=1)
-        if exhausted:
-            # A deadline can already be exhausted by earlier shutdown work;
-            # optional teardown has no remaining allocation in that case.
-            daemon._shutdown_deadline = 0
         raise KeyboardInterrupt
 
     try:

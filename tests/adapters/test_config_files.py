@@ -116,10 +116,19 @@ def test_an_assignment_it_cannot_edit_safely_is_refused(text):
         set_assignment(text, "FIX_MODEL", "y")
 
 
-@pytest.mark.parametrize("value", ["a\nb", "a\rb", "a\0b", "x" * 1001])
+@pytest.mark.parametrize(
+    "value",
+    ["a\nb", "a\rb", "a\0b", "x" * 1001, "a\nb\n", "a\n", "a\x0bb", "a\x0cb", "a\x1cb", "a\x1db", "a\x1eb", "a\x85b", "a\u2028b", "a\u2029b"],
+)
 def test_a_value_that_is_not_one_short_line_is_refused(value):
     with pytest.raises(EditRefused):
         set_assignment(SHARED, "FIX_MODEL", value)
+
+
+def test_a_value_it_writes_stays_editable():
+    written = set_assignment(SHARED, "FIX_MODEL", "x y\tz")
+    assert set_assignment(written, "FIX_MODEL", "w").endswith("FIX_MODEL=w\n")
+    assert set_assignment(written, "FIX_MODEL", "").endswith("FIX_MODEL=''\n")
 
 
 @pytest.mark.parametrize("key", ["", "1A", "A-B", "A B", "A=B"])

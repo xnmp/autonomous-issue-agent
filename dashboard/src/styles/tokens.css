@@ -37,7 +37,7 @@
   --surface-sunken: color-mix(in srgb, var(--c-bg) 76%, var(--c-panel));
   --ink: var(--c-fg);
   --ink-muted: var(--c-muted);
-  --ink-faint: color-mix(in srgb, var(--c-muted) 72%, var(--c-bg));
+  --ink-faint: color-mix(in srgb, var(--c-muted) 76%, var(--c-bg));
   --selection: var(--c-selection);
 
   --border: color-mix(in srgb, var(--ink) 8%, transparent);

@@ -243,3 +243,20 @@ def test_usage_payload_marks_unavailable_harness_spend_unknown(monkeypatch):
 
     assert result["harness"]["today_all_repos_usd"] is None
     assert result["warnings"] == ["harness caps unreadable (control store does not exist)"]
+
+
+@pytest.mark.parametrize("stamp", [1e20, float("nan"), float("inf"), -1e20, 10**400])
+def test_an_unrepresentable_reset_time_is_absent_not_an_exception(stamp, tmp_path):
+    body = {"five_hour": {"utilization": 5, "resets_at": stamp}}
+    parsed = usage.parse_claude_usage(body)
+    assert parsed["five_hour_pct"] == 5 and parsed["five_hour_resets_at"] is None
+    served = usage.claude_usage(fetch=lambda _t: body, credentials_path=creds(tmp_path), cache=fresh_cache())
+    assert served["five_hour_pct"] == 5 and served["five_hour_resets_at"] is None
+    block = usage.codex_block({"primary": {"used_percent": 3, "resets_at": stamp}}, None)
+    assert block["weekly_pct"] == 3 and block["resets_at"] is None and block["error"] is None
+
+
+@pytest.mark.parametrize("minutes", [float("inf"), float("-inf"), float("nan")])
+def test_a_non_finite_codex_window_is_absent_not_an_exception(minutes):
+    block = usage.codex_block({"primary": {"used_percent": 3, "window_minutes": minutes}}, None)
+    assert block["window_minutes"] is None and block["weekly_pct"] == 3

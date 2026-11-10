@@ -349,6 +349,10 @@
   background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 22%, transparent);
 }
+/* The selection tint is lighter than the panel; --ink-faint is under AA there. */
+.repo-row.selected .faint {
+  color: var(--ink-muted);
+}
 .repo-row.is-self {
   border-color: color-mix(in srgb, var(--meta) 18%, transparent);
 }
@@ -670,6 +674,9 @@
 .tab-close {
   display: inline-flex;
   align-items: center;
+  cursor: pointer;
+  min-width: 24px;
+  min-height: 24px;
   padding: 0 var(--space-4) 0 0;
   color: var(--ink-faint);
   font-size: 11px;
@@ -851,7 +858,13 @@
     border-color var(--t),
     background var(--t);
 }
+/* A <button> centres its content vertically by default; stack it from the
+ * top so labels line up with the sibling <div> tiles in the same row. */
 .tile-action {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
   width: 100%;
   text-align: left;
   cursor: pointer;
@@ -1176,15 +1189,6 @@
   border-radius: var(--radius-sm);
   background: var(--panel);
   color: var(--ink-muted);
-}
-.empty-icon::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 100%;
-  width: var(--space-4);
-  height: 1px;
-  background: var(--border-emphasis);
 }
 .empty-message {
   max-width: 68ch;
@@ -1899,6 +1903,11 @@
   transition: transform var(--t);
   color: var(--ink-faint);
 }
+.expand-toggle {
+  display: inline-flex;
+  flex: none;
+  padding: 0;
+}
 .chev.open,
 .collapsible.open > .collapsible-hd .chev {
   transform: rotate(90deg);
@@ -2095,24 +2104,20 @@
   }
 }
 @media (max-width: 480px) {
+  /* Expanded, the rail overlays the content instead of squeezing it; collapsed
+   * it is the floating toggle (Sidebar starts collapsed at this width). The
+   * inline width is the desktop drag width, so it is overridden here. */
   .sidebar {
-    width: 56px !important;
-    min-width: 56px;
-    max-width: 56px;
+    position: fixed;
+    z-index: 70;
+    inset: 0 auto 0 0;
+    width: min(86vw, 320px) !important;
+    min-width: 0;
+    max-width: none;
+    box-shadow: var(--shadow-md);
   }
-  .sidebar-brand {
-    padding: 0;
-  }
-  .brand-mark,
-  .brand-copy,
-  .sidebar-scroll,
-  .sidebar-foot,
   .sidebar-resizer {
     display: none;
-  }
-  .sidebar-toggle {
-    left: 12px;
-    right: auto;
   }
   .mainbar {
     position: relative;

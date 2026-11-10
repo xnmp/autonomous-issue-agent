@@ -73,13 +73,13 @@ describe("IssuesTab pagination", () => {
   it("hides the controls when everything fits on one page", () => {
     render(view(doneRows(25)));
     expect(bodyRows()).toHaveLength(25);
-    expect(screen.queryByRole("navigation", { name: "Pagination" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: /^Pagination/ })).not.toBeInTheDocument();
   });
 
   it("shows the empty state and no controls for an empty list", () => {
     render(view([]));
     expect(screen.getByText(/nothing merged/)).toBeVisible();
-    expect(screen.queryByRole("navigation", { name: "Pagination" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: /^Pagination/ })).not.toBeInTheDocument();
   });
 
   it("remembers the page per sub-tab across switching", async () => {

@@ -326,7 +326,7 @@ run_role() {
   # regenerating the composition still needs a point-at rerun). Any other exit
   # status is a real death and propagates as before.
   (
-    cd "$HARNESS_ROOT"
+    cd "$HARNESS_ROOT" || exit
     reloaded=0
     while :; do
       rc=0

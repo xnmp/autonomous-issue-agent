@@ -129,6 +129,18 @@ class PricingBasis(str, Enum):
     SYNTHETIC = "synthetic"
 
 
+class KeyClaim(str, Enum):
+    """What claiming an idempotency key found. NEW: this call claimed it.
+    CLAIMED: an earlier claim never confirmed, so its effect may or may not
+    have landed and is read back. DONE: the effect was confirmed. FULL: a
+    bounded claim refused at its daily ceiling; nothing was claimed."""
+
+    NEW = "new"
+    CLAIMED = "claimed"
+    DONE = "done"
+    FULL = "full"
+
+
 class ChargeOrigin(str, Enum):
     RECOVERY_ESTIMATE = "recovery_estimate"
     NORMAL_RETURN = "normal_return"

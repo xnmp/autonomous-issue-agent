@@ -30,6 +30,7 @@ from ..domain.actions import (
     Target,
     UpdateBranch,
 )
+from ..domain.contracts import KeyClaim
 from ..domain.gaps import GAP_REPORTS_PER_DAY
 from ..domain.labels import Label
 from ..domain.policy import blocker_closed_comment, blocker_comment
@@ -227,7 +228,7 @@ class GitHubAct:
         )
 
     def keyed_write(self, key: str, present: Callable[[], bool], write: Callable[[], Accepted | Refused],
-                    what: str, state: str = "") -> Accepted | Refused | None:
+                    what: str, state: KeyClaim | None = None) -> Accepted | Refused | None:
         """The one keyed write (ADR 0001), None when `present` finds it. A key
         claimed (here, unless `state` is given) but never settled may have
         landed unseen, and a settled one may have been deleted (#395), so
@@ -235,14 +236,14 @@ class GitHubAct:
         settles the key, a refusal with one line; no answer raises, the claim
         standing for the next tick."""
         state = state or self.control.claim_key(key)
-        if state != "new" and present():
+        if state is not KeyClaim.NEW and present():
             self.control.confirm_key(key)
             return None
         answer = write()
         self.control.confirm_key(key)
         if isinstance(answer, Refused):
             self.log(f"{what}: GitHub refused it (HTTP {answer.status}), settled: {answer.message}")
-        elif state == "done":
+        elif state is KeyClaim.DONE:
             self.log(f"{what} was settled but absent (deleted, or refused before); written again")
         return answer
 
@@ -270,9 +271,9 @@ class GitHubAct:
         exact body and a lost comment by its text."""
         key = f"{_REPORT_NAMESPACE}:{action.key}"
         state = self.control.claim_key_within(key, f"{_REPORT_NAMESPACE}:", GAP_REPORTS_PER_DAY)
-        if state == "done":
+        if state is KeyClaim.DONE:
             return
-        if state == "full":
+        if state is KeyClaim.FULL:
             raise RuntimeError(f"harness gap {action.title!r} not reported: {GAP_REPORTS_PER_DAY} gap reports "
                                "already today (the daily ceiling); it is retried tomorrow while it persists")
         gateway = self.gateway if action.repo == self.repository else self.gateway.for_repo(action.repo)
@@ -319,7 +320,7 @@ class GitHubAct:
         not, keyed. Once done, nothing here runs again, so a link a human
         deletes stays deleted (derive also stops at the comment)."""
         key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
-        if (state := self.control.claim_key(key)) == "done":
+        if (state := self.control.claim_key(key)) is KeyClaim.DONE:
             # Derive asks again only when the harness's comment is gone (a
             # human deleted it). Say once more that the matter is closed, so
             # derive moves on; the link itself is never touched again.
@@ -391,7 +392,7 @@ class GitHubAct:
         self.log(f"issue #{action.issue}: opened PR for {action.branch}")
 
     def _record(self, key: str) -> None:
-        if self.control.claim_key(key) != "done":
+        if self.control.claim_key(key) is not KeyClaim.DONE:
             self.control.confirm_key(key)
 
     def latest_resolve_summary(self, issue: int) -> str:

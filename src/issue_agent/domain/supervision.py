@@ -13,6 +13,17 @@ class DaemonState(str, Enum):
     STOPPED = "stopped"
 
 
+# The daemon lifecycle: a state leaves only along these edges.
+DAEMON_TRANSITIONS: dict[DaemonState, frozenset[DaemonState]] = {
+    DaemonState.STARTING: frozenset({DaemonState.RUNNING, DaemonState.DRAINING}),
+    DaemonState.RUNNING: frozenset({DaemonState.DRAINING}),
+    DaemonState.DRAINING: frozenset({DaemonState.STOPPED}),
+    DaemonState.STOPPED: frozenset(),
+}
+# A heartbeat in one of these states speaks for a daemon that is still working.
+LIVE_DAEMON_STATES = frozenset({DaemonState.RUNNING.value, DaemonState.DRAINING.value})
+
+
 class ExitCode(IntEnum):
     CLEAN = 0
     TRANSIENT = 1

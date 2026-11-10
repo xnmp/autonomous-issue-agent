@@ -60,6 +60,21 @@ describe("IssueTab", () => {
     expect(screen.getByText("CI running: Checks are running on the PR head.")).toBeVisible();
   });
 
+  it("names the page with a heading and counts one leg in the singular", async () => {
+    serve(detail({ steps: [leg(0)] }));
+    render(<IssueTab repo="demo" issue={50} />);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Issue #50" })).toHaveClass("sr-only");
+    expect(screen.getByText("1 execution leg")).toBeVisible();
+  });
+
+  it("pluralises the leg count past one", async () => {
+    serve(detail({ steps: [leg(0), leg(1)] }));
+    render(<IssueTab repo="demo" issue={50} />);
+
+    expect(await screen.findByText("2 execution legs")).toBeVisible();
+  });
+
   it("links both issue reference and PR badge to GitHub in new tabs", async () => {
     serve(detail({
       done: true,

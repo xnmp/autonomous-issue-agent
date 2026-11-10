@@ -54,8 +54,10 @@
 .board-chip[aria-pressed="true"] .board-chip-label {
   color: var(--ink);
 }
-.board-chip-zero {
-  opacity: 0.55;
+/* Quiet, not faded: opacity would drop the label below AA contrast. */
+.board-chip-zero .board-chip-n,
+.board-chip-zero .board-chip-label {
+  color: var(--ink-faint);
 }
 
 .board-group-hd {
@@ -208,7 +210,7 @@
   grid-template-columns: repeat(5, minmax(0, 1fr));
   align-items: start;
   margin: 0;
-  padding: 0;
+  padding: var(--space-5) 0 0;
   list-style: none;
 }
 .rail-tone-fail { --rail-tone: var(--fail); }

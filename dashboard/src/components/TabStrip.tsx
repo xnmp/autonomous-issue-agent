@@ -22,6 +22,7 @@ export function TabStrip({ tabs }: { tabs: TabDef[] }) {
       {tabs.map((t) => (
         <div
           key={t.key}
+          role="presentation"
           className={`tab${t.active ? " active" : ""}${t.onClose ? " tab-closeable" : ""}`}
         >
           <button
@@ -29,22 +30,32 @@ export function TabStrip({ tabs }: { tabs: TabDef[] }) {
             role="tab"
             aria-selected={t.active}
             title={t.title}
+            aria-keyshortcuts={t.onClose ? "Delete" : undefined}
             onClick={t.onSelect}
+            onKeyDown={(e) => {
+              if (t.onClose && (e.key === "Delete" || e.key === "Backspace")) {
+                e.preventDefault();
+                t.onClose();
+              }
+            }}
           >
             {t.label}
           </button>
+          {/* A tablist may only contain tabs, so the pointer affordance is not
+              a control of its own: assistive tech and keyboards close the tab
+              with Delete on the tab itself. */}
           {t.onClose ? (
-            <button
+            <span
               className="tab-close"
+              aria-hidden="true"
               title={`Close ${t.title}`}
-              aria-label={`Close ${t.title}`}
               onClick={(e) => {
                 e.stopPropagation();
                 t.onClose?.();
               }}
             >
               <Icon name="close" size={13} />
-            </button>
+            </span>
           ) : null}
         </div>
       ))}

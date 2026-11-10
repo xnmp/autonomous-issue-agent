@@ -14,6 +14,12 @@ const WIDTH_KEY = "issue-agent.dashboard.sidebar-width";
 const MIN_WIDTH = 220;
 const MAX_WIDTH = 480;
 const DEFAULT_WIDTH = 248;
+/** Keep in step with the phone breakpoint in app.css. */
+const PHONE_QUERY = "(max-width: 480px)";
+
+function isPhone(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia(PHONE_QUERY).matches;
+}
 
 /** The rail's width is a whole number of CSS pixels, always within the range
  * the stylesheet is built for — including when it comes back from storage,
@@ -73,6 +79,9 @@ export function Sidebar({
   onOpenVerification,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(() => {
+    // On a phone the expanded rail overlays the content, so it always starts
+    // closed and ignores the desktop preference.
+    if (isPhone()) return true;
     try {
       return localStorage.getItem("issue-agent.dashboard.sidebar-collapsed") === "true";
     } catch {
@@ -90,13 +99,20 @@ export function Sidebar({
   );
   const toggleCollapsed = () => {
     setCollapsed((current) => {
-      try {
-        localStorage.setItem("issue-agent.dashboard.sidebar-collapsed", String(!current));
-      } catch {
-        // The control still works for this session.
+      // The phone overlay is transient; it must not rewrite the desktop choice.
+      if (!isPhone()) {
+        try {
+          localStorage.setItem("issue-agent.dashboard.sidebar-collapsed", String(!current));
+        } catch {
+          // The control still works for this session.
+        }
       }
       return !current;
     });
+  };
+  // Choosing a destination from the phone overlay dismisses it.
+  const dismissOnPhone = () => {
+    if (isPhone()) setCollapsed(true);
   };
   // What gets remembered is the width the drag asked for, never the width the
   // rail was measured at: a measurement is in fractional CSS pixels once the
@@ -170,66 +186,80 @@ export function Sidebar({
 
         {repos.loading ? <SkeletonRows what="deployments" rows={4} /> : null}
 
-        <div className="rail-group">
-          <div className="rail-heading">
-            Active <span className="faint num">{active.length}</span>
-          </div>
-          {!repos.loading && active.length === 0 ? (
-            <EmptyState>no daemons running</EmptyState>
-          ) : null}
-          {active.map((r) => (
-            <RepoRow
-              key={r.name}
-              repo={r}
-              selected={r.name === activeRepo}
-              onSelect={() => onSelectRepo(r.name)}
-              quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
-            />
-          ))}
-        </div>
-
-        {unknown.length > 0 ? (
+        <nav aria-label="Deployments">
           <div className="rail-group">
             <div className="rail-heading">
-              Unknown <span className="faint num">{unknown.length}</span>
+              Active <span className="faint num">{active.length}</span>
             </div>
-            {unknown.map((r) => (
+            {!repos.loading && active.length === 0 ? (
+              <EmptyState>no daemons running</EmptyState>
+            ) : null}
+            {active.map((r) => (
               <RepoRow
                 key={r.name}
                 repo={r}
                 selected={r.name === activeRepo}
-                onSelect={() => onSelectRepo(r.name)}
+                onSelect={() => {
+                  onSelectRepo(r.name);
+                  dismissOnPhone();
+                }}
                 quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
               />
             ))}
           </div>
-        ) : null}
 
-        {past.length > 0 ? (
-          <details className="rail-group rail-past">
-            <summary className="rail-heading">
-              Past <span className="num">{past.length}</span>
-            </summary>
-            <div className="rail-group-body">
-              {past.map((r) => (
+          {unknown.length > 0 ? (
+            <div className="rail-group">
+              <div className="rail-heading">
+                Unknown <span className="faint num">{unknown.length}</span>
+              </div>
+              {unknown.map((r) => (
                 <RepoRow
                   key={r.name}
                   repo={r}
                   selected={r.name === activeRepo}
-                  onSelect={() => onSelectRepo(r.name)}
+                  onSelect={() => {
+                    onSelectRepo(r.name);
+                    dismissOnPhone();
+                  }}
                   quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
                 />
               ))}
             </div>
-          </details>
-        ) : null}
+          ) : null}
+
+          {past.length > 0 ? (
+            <details className="rail-group rail-past">
+              <summary className="rail-heading">
+                Past <span className="num">{past.length}</span>
+              </summary>
+              <div className="rail-group-body">
+                {past.map((r) => (
+                  <RepoRow
+                    key={r.name}
+                    repo={r}
+                    selected={r.name === activeRepo}
+                    onSelect={() => {
+                      onSelectRepo(r.name);
+                      dismissOnPhone();
+                    }}
+                    quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
+                  />
+                ))}
+              </div>
+            </details>
+          ) : null}
+        </nav>
       </div>
       <div className="sidebar-foot">
         <UsageBlock usage={usage} />
         <OptionsMenu options={options} onChange={onOptionsChange} repo={activeRepo} />
         <button
           className={`rail-btn${verificationActive ? " active" : ""}`}
-          onClick={onOpenVerification}
+          onClick={() => {
+            onOpenVerification();
+            dismissOnPhone();
+          }}
           aria-label="Verification ledger"
           title="Verification ledger"
         >

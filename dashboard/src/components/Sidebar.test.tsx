@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Sidebar } from "./Sidebar";
 import type { Polled } from "../api/hooks";
 import type { ReposPayload, UsagePayload } from "../api/types";
@@ -43,6 +43,17 @@ function renderSidebar() {
       onOpenVerification={() => {}}
     />,
   );
+}
+
+const COLLAPSED_KEY = "issue-agent.dashboard.sidebar-collapsed";
+
+function stubViewport(phone: boolean) {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: phone && query.includes("max-width: 480px"),
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
 }
 
 const resizer = () => screen.getByRole("separator", { name: "Resize sidebar" });
@@ -110,5 +121,50 @@ describe("sidebar errors", () => {
   it("still shows its own deployment-listing failure", () => {
     withError("deployment listing failed: config/repos unreadable");
     expect(screen.getByText("deployment listing failed: config/repos unreadable")).toBeVisible();
+  });
+});
+
+describe("sidebar on a phone", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("starts closed whatever the desktop preference, and expands to the full rail", async () => {
+    stubViewport(true);
+    localStorage.setItem(COLLAPSED_KEY, "false");
+    renderSidebar();
+
+    expect(screen.queryByRole("navigation", { name: "Deployments" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(screen.getByRole("navigation", { name: "Deployments" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Verification ledger" })).toBeVisible();
+  });
+
+  it("does not let the transient phone overlay rewrite the desktop preference", async () => {
+    stubViewport(true);
+    localStorage.setItem(COLLAPSED_KEY, "false");
+    renderSidebar();
+    await userEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+
+    expect(localStorage.getItem(COLLAPSED_KEY)).toBe("false");
+  });
+
+  it("closes after a destination is chosen", async () => {
+    stubViewport(true);
+    renderSidebar();
+    await userEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Verification ledger" }));
+
+    expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  });
+
+  it("keeps the remembered collapsed choice on a desktop viewport", () => {
+    stubViewport(false);
+    localStorage.setItem(COLLAPSED_KEY, "true");
+    renderSidebar();
+
+    expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
   });
 });

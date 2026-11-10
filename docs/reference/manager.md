@@ -92,7 +92,7 @@ spend on impossible local repro, and true convergence is an operator decision
 about paid runners, not a harness fix).
 
 - **Before**: read the pending rows of
-  [docs/field-verification.md](docs/field-verification.md) (the append-only
+  [docs/field-verification.md](../field-verification.md) (the append-only
   ledger of what has shipped vs what a live deployment has proven) and add
   rows for anything `git log` shows landed without one — each row names the
   journal evidence that will prove the change works; triage doctor output

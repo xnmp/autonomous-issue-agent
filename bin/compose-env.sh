@@ -39,7 +39,7 @@ _CE_STAGE="$_CE_ACTIVE.tmp.$$"
 # correctly in both modes: `return` for `. compose-env.sh` (stops this file,
 # doesn't kill the caller's shell), `exit` for `bash compose-env.sh`.
 _ce_fail() { echo "compose-env: $1" >&2; }
-if (return 0 2>/dev/null); then _CE_ABORT=return; else _CE_ABORT=exit; fi
+if (return 0 2>/dev/null); then _CE_ABORT='return'; else _CE_ABORT='exit'; fi
 
 [ -n "$_CE_NAME" ]      || { _ce_fail "usage: compose-env.sh <name>"; $_CE_ABORT 1; }
 [ -f "$_CE_SHARED" ]    || { _ce_fail "missing $_CE_SHARED"; $_CE_ABORT 1; }

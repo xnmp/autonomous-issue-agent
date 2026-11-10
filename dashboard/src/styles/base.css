@@ -270,7 +270,7 @@ summary:focus-visible,
   --chip-c: var(--ok);
 }
 .chip-running {
-  --chip-c: var(--running);
+  --chip-c: var(--running-br);
 }
 .chip-fail {
   --chip-c: var(--fail);
@@ -316,7 +316,8 @@ summary:focus-visible,
     opacity: 1;
   }
   50% {
-    opacity: 0.45;
+    /* Floor keeps pulsing chip text at AA contrast through the dip. */
+    opacity: 0.7;
   }
 }
 @media (prefers-reduced-motion: reduce) {

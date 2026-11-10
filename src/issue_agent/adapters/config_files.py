@@ -123,7 +123,7 @@ def set_assignment(text: str, key: str, value: str | None) -> str:
         raise EditRefused("the file contains NUL bytes")
     if not _NAME.fullmatch(key):
         raise EditRefused(f"{key!r} is not a variable name")
-    if value is not None and (len(value) > _VALUE_LIMIT or any(c in value for c in "\r\n\0")):
+    if value is not None and (len(value) > _VALUE_LIMIT or "\0" in value or value.splitlines() not in ([], [value])):
         raise EditRefused(f"{key}'s value must be one line of at most {_VALUE_LIMIT} characters")
     lines = text.splitlines(keepends=True)
     hits: list[tuple[int, re.Match[str]]] = []

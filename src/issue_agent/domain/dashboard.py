@@ -30,6 +30,7 @@ from types import MappingProxyType
 from .actions import ISSUE_ACTS, AgentKind
 from .checks import Observed
 from .ci import Clear, Executing, Failed, Queued, Waiting as CiWaiting, parse_timestamp, reduce_ci
+from .supervision import LIVE_DAEMON_STATES
 from .state import (
     AttemptsStop, Backoff, Blocked, Busy, DerivedState, Dispatch, DuplicateStop, Harness, ItemKey, LinkBlocker, Merge,
     NeedsHuman, OpenPR, PlainStop, QuestionStop, Refresh, Release, Rerun, StopReason, TriageNote, Wait, WaitReason,
@@ -477,7 +478,7 @@ def _wait_status(
 def beat_live(state: str, age_s: float | None) -> bool:
     """A heartbeat speaks for its role only while running or draining and no
     older than the staleness bound (a future stamp is not live either)."""
-    return state in ("running", "draining") and age_s is not None and 0 <= age_s <= STALE_AFTER_S
+    return state in LIVE_DAEMON_STATES and age_s is not None and 0 <= age_s <= STALE_AFTER_S
 
 
 def reload_held(*, state: str, age_s: float | None, reload_pending: bool,

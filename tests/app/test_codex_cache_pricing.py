@@ -55,6 +55,8 @@ def test_rate_card_version_tracks_shipped_prices_without_an_overlay_edit(monkeyp
         "gpt-5.6-sol=5/30/abc",  # non-numeric third component
         "gpt-5.6-sol=5//30",  # empty middle: OUT must not become CACHED_IN
         "gpt-5.6-sol=5/30/1/2",  # four components
+        "m=0.0000001/1",  # rounds to zero micros: the card would silently vanish
+        "m=1/2/0.0000001",
     ],
 )
 def test_a_non_positive_or_malformed_cache_rate_never_reaches_the_card(raw):

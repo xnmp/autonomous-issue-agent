@@ -83,7 +83,7 @@ export function IssueTab({
     ...(visible.has("role") ? [{ key: "role", label: "Role", width: 90 }] : []),
     ...(visible.has("runtime") ? [{ key: "runtime", label: "Runtime / model", width: 190, minWidth: 90 }] : []),
     ...(visible.has("status") ? [{ key: "status", label: "Outcome", width: 190, minWidth: 96 }] : []),
-    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 100, minWidth: 84 }] : []),
+    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 124, minWidth: 108 }] : []),
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 90, minWidth: 76 }] : []),
     ...(visible.has("basis") ? [{ key: "basis", label: "Basis", width: 160, minWidth: 90 }] : []),
     ...(visible.has("tokens") ? [{ key: "tokens", label: "Tokens", width: 260 }] : []),
@@ -147,6 +147,7 @@ export function IssueTab({
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
+      <h1 className="sr-only">Issue #{issue}</h1>
       {detail.error ? (
         <ErrorBanner message={detail.error} onRetry={detail.refresh} stale={!!d} />
       ) : null}
@@ -223,7 +224,7 @@ export function IssueTab({
             <section className="panel issue-lifecycle-panel" aria-labelledby={`issue-${issue}-lifecycle-title`}>
               <div className="panel-hd">
                 <span className="panel-title" id={`issue-${issue}-lifecycle-title`}>Lifecycle</span>
-                <span className="faint num">{d.steps.length} execution legs</span>
+                <span className="faint num">{d.steps.length} execution {d.steps.length === 1 ? "leg" : "legs"}</span>
               </div>
               <LifecycleStepper
                 rail={railNodes(d.rail)}
@@ -371,13 +372,15 @@ function StepRow({
           {step.model ? <span className="faint"> · {step.model}</span> : null}
           {step.tier ? <span className="faint"> · tier: {step.tier}</span> : null}
         </td> : null}
-        {visible.has("status") ? <td className="row-wrap">
-          <StepStatusChip outcome={step.outcome} />
-          {step.end_reason && step.end_reason !== "normal_return" ? (
-            <span className="faint mono trunc" title={step.end_reason}>
-              {step.end_reason.replaceAll("_", " ")}
-            </span>
-          ) : null}
+        {visible.has("status") ? <td>
+          <div className="row-wrap">
+            <StepStatusChip outcome={step.outcome} />
+            {step.end_reason && step.end_reason !== "normal_return" ? (
+              <span className="faint mono trunc" title={step.end_reason}>
+                {step.end_reason.replaceAll("_", " ")}
+              </span>
+            ) : null}
+          </div>
         </td> : null}
         {visible.has("duration") ? (
           <td className="r mono">{duration(step.duration_s, showDurationSeconds)}</td>

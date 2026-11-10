@@ -19,7 +19,7 @@ from datetime import datetime
 from types import MappingProxyType
 
 from ..adapters.control_store import LegRun
-from ..domain.actions import ISSUE_ACTS, ROUTED_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
+from ..domain.actions import ISSUE_ACTS, ROUTED_ACTS, Action, AgentKind, MergePullRequest, RunAgent
 from ..domain.agent_task import RuntimeName
 from ..domain.attempt import AnswerResume, Continue, NextLeg, latest_session, next_leg
 from ..domain.backoff import LegEnd

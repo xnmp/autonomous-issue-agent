@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import urllib.error
 import urllib.request
@@ -45,17 +46,18 @@ def default_codex_sessions_root() -> str:
 
 
 def _iso_from_epoch(value) -> str | None:
+    # A provider's stamp is untrusted: NaN, infinity and out-of-range values are absent.
     try:
         seconds = float(value)
-    except (TypeError, ValueError):
+        if not seconds > 0:
+            return None
+        return (
+            datetime.fromtimestamp(seconds, tz=timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+        )
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
-    if seconds <= 0:
-        return None
-    return (
-        datetime.fromtimestamp(seconds, tz=timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-    )
 
 
 def _pct(block) -> float | None:
@@ -303,7 +305,8 @@ def codex_block(limits: dict | None, sampled_at: str | None) -> dict:
     window = primary.get("window_minutes")
     return {
         "weekly_pct": float(pct) if isinstance(pct, (int, float)) and not isinstance(pct, bool) else None,
-        "window_minutes": int(window) if isinstance(window, (int, float)) and not isinstance(window, bool) else None,
+        "window_minutes": int(window) if isinstance(window, (int, float)) and not isinstance(window, bool)
+        and (isinstance(window, int) or math.isfinite(window)) else None,
         "resets_at": _iso_from_epoch(primary.get("resets_at")),
         "plan": limits.get("plan_type") or None,
         "source": "rollout",

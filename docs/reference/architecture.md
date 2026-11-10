@@ -369,11 +369,6 @@ machine-failure backoff spaces repeats. Only `blocked` is rewritten.
 The machine backoff restarts on any leg that returns normally, so it spaces
 *consecutive* machine failures rather than accumulating over an issue's lifetime.
 
-`tests/app/test_convergence.py` is the regression guard for this whole class:
-each scenario drives a real `Daemon` tick loop over the real workflow, dispatcher,
-executor and store, and asserts a frozen world reaches a steady state without
-buying sessions. **Any new dispatch leg or retry counter needs a row there.**
-
 ## Process supervision
 
 The accounting run ID is also the process-supervision ID. Before an agent

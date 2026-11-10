@@ -34,6 +34,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from functools import partial
 from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
@@ -67,6 +68,7 @@ from ..domain.routing import parse_tier
 from ..domain.triage import parse_triage, steward_from_record
 from ..domain.supervision import (
     ClockSample,
+    DAEMON_TRANSITIONS,
     DaemonState,
     ExitCode,
     suspension_between,
@@ -294,12 +296,26 @@ DEFAULT_RESERVATION_SWEEP_POLLS = 30
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
 _SHUTDOWN_PREPARE_RESERVE_SECONDS = 2.0
 _SHUTDOWN_TERMINALIZE_RESERVE_SECONDS = 3.0
-_ALLOWED_TRANSITIONS = {
-    DaemonState.STARTING: {DaemonState.RUNNING, DaemonState.DRAINING},
-    DaemonState.RUNNING: {DaemonState.DRAINING},
-    DaemonState.DRAINING: {DaemonState.STOPPED},
-    DaemonState.STOPPED: set(),
-}
+
+
+class _Step(Enum):
+    """A shutdown step runs at most once; later callers read its result."""
+
+    NOT_RUN = "not run"
+    CLEAN = "clean"
+    FAILED = "failed"
+
+
+@dataclass
+class _Shutdown:
+    """Shutdown progress, present from the moment admission closes: a step
+    cannot have run, nor a deadline exist, while dispatches are admitted."""
+
+    deadline: float
+    # A cancelled or force-killed dispatch leaves runs to terminalize durably.
+    terminalize_required: bool = False
+    prepare: _Step = _Step.NOT_RUN
+    terminalize: _Step = _Step.NOT_RUN
 
 
 def order_for_execution(actions: list[Action]) -> list[Action]:
@@ -350,15 +366,10 @@ class Daemon:
     _dispatches_ended: int = field(default=0, init=False, repr=False)
     # A hot reload waits for paid work to drain (`_admitting`).
     _reload_pending: bool = field(default=False, init=False, repr=False)
-    _dispatch_closed: bool = field(default=False, init=False, repr=False)
+    # None while admission is open; set once, under `_dispatch_lock`.
+    _shutdown: _Shutdown | None = field(default=None, init=False, repr=False)
     _retry_after_seconds: float | None = field(default=None, init=False, repr=False)
-    _shutdown_deadline: float | None = field(default=None, init=False, repr=False)
     _requires_hard_exit: bool = field(default=False, init=False, repr=False)
-    _shutdown_prepared: bool = field(default=False, init=False, repr=False)
-    _shutdown_prepare_clean: bool = field(default=True, init=False, repr=False)
-    _shutdown_terminalization_required: bool = field(default=False, init=False, repr=False)
-    _terminalized: bool = field(default=False, init=False, repr=False)
-    _terminalize_clean: bool = field(default=True, init=False, repr=False)
     _wake_recovery_pending: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -385,7 +396,7 @@ class Daemon:
     def _transition(self, state: DaemonState, reason: str = "") -> None:
         if state is self._state:
             return
-        if state not in _ALLOWED_TRANSITIONS[self._state]:
+        if state not in DAEMON_TRANSITIONS[self._state]:
             raise RuntimeError(f"invalid daemon transition {self._state.value} -> {state.value}")
         previous, self._state = self._state, state
         self.log(f"{self.name}: state {previous.value} -> {state.value}" + (f" ({reason})" if reason else ""))
@@ -420,7 +431,7 @@ class Daemon:
         # waits at most one light-leg timeout past the last heavy one (the
         # light lane runs in parallel), never a stream of them (#1105 sat
         # 45 min behind #1078's FIX_CI).
-        if self._dispatch_closed or self._wake_recovery_pending:
+        if self._shutdown is not None or self._wake_recovery_pending:
             return False
         return not self._reload_pending or (not heavy and self._in_flight(heavy=True) > 0)
 
@@ -491,15 +502,14 @@ class Daemon:
 
     def _shutdown_dispatches(self, *, cancel: bool) -> bool:
         pool = self._dispatch_pool
-        self._shutdown_terminalization_required |= cancel
-        if self._shutdown_deadline is None:
-            self._shutdown_deadline = self.monotonic() + self.shutdown_timeout_seconds
         with self._dispatch_lock:
-            if self._dispatch_closed:
-                return False if self._dispatches else self._finish_shutdown()
-            self._dispatch_closed = True
+            first = self._shutdown is None
+            shutdown = self._shutdown = self._shutdown or _Shutdown(self.monotonic() + self.shutdown_timeout_seconds)
+            shutdown.terminalize_required |= cancel
+            if not first:
+                return False if self._dispatches else self._finish_shutdown(shutdown)
         if cancel:
-            self._prepare_shutdown()
+            self._prepare_shutdown(shutdown)
             if self.cancel_active_dispatches is not None:
                 try:
                     self.cancel_active_dispatches()
@@ -508,61 +518,47 @@ class Daemon:
         with self._dispatch_lock:
             pending = tuple(self._dispatches)
         reserve = min(_SHUTDOWN_ESCALATION_RESERVE_SECONDS, self.shutdown_timeout_seconds * 0.5)
-        _done, unfinished = wait(pending, timeout=max(0.0, self._remaining_shutdown_time() - reserve))
+        _done, unfinished = wait(pending, timeout=max(0.0, self._remaining(shutdown) - reserve))
         if unfinished:
             self.log(f"{self.name}: shutdown deadline expired with {len(unfinished)} dispatch(es) still active")
-            self._shutdown_terminalization_required = True
-            self._prepare_shutdown()  # persist cancellation intent before teardown
+            shutdown.terminalize_required = True
+            self._prepare_shutdown(shutdown)  # persist cancellation intent before teardown
             terminalize_reserve = min(_SHUTDOWN_TERMINALIZE_RESERVE_SECONDS, self.shutdown_timeout_seconds * 0.2)
-            terminalized = False
             if self.force_kill_dispatches is not None and self._bounded_shutdown_call(
-                    self.force_kill_dispatches, "forced process teardown",
-                    max_seconds=max(0.0, self._remaining_shutdown_time() - terminalize_reserve)):
+                    shutdown, self.force_kill_dispatches, "forced process teardown",
+                    max_seconds=max(0.0, self._remaining(shutdown) - terminalize_reserve)):
                 # A killed provider flushes its final rollout evidence while the
                 # worker unwinds; the worker settles before spend reconciliation.
                 _done, unfinished = wait(unfinished, timeout=max(
-                    0.0, self._remaining_shutdown_time() - terminalize_reserve))
-                if not unfinished:
-                    terminalized = self._terminalize()
-        else:
-            terminalized = self._terminalize() if self._shutdown_terminalization_required else True
+                    0.0, self._remaining(shutdown) - terminalize_reserve))
         pool.shutdown(wait=False, cancel_futures=cancel)
-        return not unfinished and self._shutdown_prepare_clean and terminalized
+        return not unfinished and self._finish_shutdown(shutdown)
 
-    def _finish_shutdown(self) -> bool:
-        terminalized = self._terminalize() if self._shutdown_terminalization_required else True
-        return self._shutdown_prepare_clean and terminalized
+    def _finish_shutdown(self, shutdown: _Shutdown) -> bool:
+        """Terminalize if owed (only once every dispatch has ended); whether
+        every shutdown step that ran was clean."""
+        if shutdown.terminalize_required and shutdown.terminalize is _Step.NOT_RUN:
+            shutdown.terminalize = self._shutdown_step(shutdown, self.terminalize, "durable run terminalization")
+        return _Step.FAILED not in (shutdown.prepare, shutdown.terminalize)
 
-    def _remaining_shutdown_time(self) -> float:
-        if self._shutdown_deadline is None:
-            return self.shutdown_timeout_seconds
-        return max(0.0, self._shutdown_deadline - self.monotonic())
+    def _remaining(self, shutdown: _Shutdown) -> float:
+        return max(0.0, shutdown.deadline - self.monotonic())
 
-    def _prepare_shutdown(self) -> bool:
-        if self._shutdown_prepared:
-            return self._shutdown_prepare_clean
-        self._shutdown_prepared = True
-        if self.prepare_shutdown is None:
-            return True
-        reserve = min(_SHUTDOWN_PREPARE_RESERVE_SECONDS, self.shutdown_timeout_seconds * 0.2)
-        self._shutdown_prepare_clean = self._bounded_shutdown_call(
-            self.prepare_shutdown, "shutdown intent persistence",
-            max_seconds=max(0.0, self._remaining_shutdown_time() - reserve))
-        return self._shutdown_prepare_clean
+    def _prepare_shutdown(self, shutdown: _Shutdown) -> None:
+        if shutdown.prepare is _Step.NOT_RUN:
+            reserve = min(_SHUTDOWN_PREPARE_RESERVE_SECONDS, self.shutdown_timeout_seconds * 0.2)
+            shutdown.prepare = self._shutdown_step(shutdown, self.prepare_shutdown, "shutdown intent persistence",
+                                                   max_seconds=max(0.0, self._remaining(shutdown) - reserve))
 
-    def _terminalize(self) -> bool:
-        if self._terminalized:
-            return self._terminalize_clean
-        self._terminalized = True
-        if self.terminalize is None:
-            return True
-        self._terminalize_clean = self._bounded_shutdown_call(
-            self.terminalize, "durable run terminalization", max_seconds=self._remaining_shutdown_time())
-        return self._terminalize_clean
+    def _shutdown_step(self, shutdown: _Shutdown, callback: Callable[[], object] | None, description: str, *,
+                       max_seconds: float | None = None) -> _Step:
+        if callback is None or self._bounded_shutdown_call(shutdown, callback, description, max_seconds=max_seconds):
+            return _Step.CLEAN
+        return _Step.FAILED
 
-    def _bounded_shutdown_call(self, callback: Callable[[], object], description: str, *,
+    def _bounded_shutdown_call(self, shutdown: _Shutdown, callback: Callable[[], object], description: str, *,
                                max_seconds: float | None = None) -> bool:
-        budget = self._remaining_shutdown_time()
+        budget = self._remaining(shutdown)
         if max_seconds is not None:
             budget = min(budget, max_seconds)
         if budget <= 0:

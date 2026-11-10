@@ -241,6 +241,11 @@ def test_issue_detail_is_404_for_an_unknown_issue():
     assert client().get("/api/repos/demo/issues/7").json()["issue"] == 7
 
 
+@pytest.mark.parametrize("path", ["/%00", "/assets/a%00.js", "/%00/../index.html"])
+def test_a_nul_byte_in_the_path_is_an_unknown_asset_not_a_500(path):
+    assert client().get(path).status_code != 500
+
+
 # ── failure posture ───────────────────────────────────────────────────────────
 @pytest.mark.parametrize(
     "collector,path",

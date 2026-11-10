@@ -39,6 +39,7 @@ from .process_supervisor import ProcessSupervisor
 from ..domain.contracts import (
     BudgetScope,
     ChargeOrigin,
+    KeyClaim,
     Money,
     PricingBasis,
     RunId,
@@ -959,26 +960,23 @@ class SQLiteControlStore:
 
     # -- idempotency -----------------------------------------------------------
 
-    def claim_key(self, key: str) -> str:
-        """Claim an idempotency key before its remote effect. Returns "new" when
-        this call claimed it, "claimed" when an earlier claim never confirmed
-        (the effect may or may not have landed: read it back), "done" when the
-        effect was confirmed."""
+    def claim_key(self, key: str) -> KeyClaim:
+        """Claim an idempotency key before its remote effect."""
         if not key:
             raise ValueError("idempotency key is required")
         with self._transaction() as db:
             row = db.execute("SELECT state FROM idempotency WHERE key=?", (key,)).fetchone()
             if row is not None:
-                return str(row["state"])
+                return KeyClaim(row["state"])
             db.execute(
                 "INSERT INTO idempotency(key, state, claimed_at) VALUES (?, 'claimed', ?)",
                 (key, self._stamp_now()),
             )
-            return "new"
+            return KeyClaim.NEW
 
-    def claim_key_within(self, key: str, prefix: str, per_day: int) -> str:
+    def claim_key_within(self, key: str, prefix: str, per_day: int) -> KeyClaim:
         """`claim_key`, except that a new claim under `prefix` is refused,
-        answering "full", once `per_day` keys under it were claimed this UTC
+        answering FULL, once `per_day` keys under it were claimed this UTC
         day. One transaction, so daemons sharing the store share the ceiling."""
         if not key.startswith(prefix) or not prefix or per_day < 0:
             raise ValueError("a bounded key lies under a non-empty prefix with a non-negative ceiling")
@@ -987,15 +985,15 @@ class SQLiteControlStore:
         with self._transaction() as db:
             row = db.execute("SELECT state FROM idempotency WHERE key=?", (key,)).fetchone()
             if row is not None:
-                return str(row["state"])
+                return KeyClaim(row["state"])
             claimed = db.execute(
                 "SELECT COUNT(*) FROM idempotency WHERE key >= ? AND key < ? AND claimed_at >= ?",
                 (*_prefix_range(prefix), midnight),
             ).fetchone()[0]
             if claimed >= per_day:
-                return "full"
+                return KeyClaim.FULL
             db.execute("INSERT INTO idempotency(key, state, claimed_at) VALUES (?, 'claimed', ?)", (key, _stamp(now)))
-            return "new"
+            return KeyClaim.NEW
 
     def done_keys(self, prefix: str) -> frozenset[str]:
         """The confirmed keys under `prefix`."""

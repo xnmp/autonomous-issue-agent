@@ -15,7 +15,8 @@ import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 
@@ -38,12 +39,25 @@ class ProcessIdentity:
     start_ticks: int
 
 
+class IntentState(str, Enum):
+    """A launch generation: PENDING -> REGISTERED -> CANCELLED, or PENDING ->
+    CANCELLED. Only a PENDING intent may register a process group; CANCELLED
+    tombstones its generation token (a later `prepare_launch` starts a new one)."""
+
+    PENDING = "pending"
+    REGISTERED = "registered"
+    CANCELLED = "cancelled"
+
+
 @dataclass(frozen=True)
 class LaunchIntent:
     run_id: RunId
     token: str
-    state: str
+    state: IntentState
     launcher: ProcessIdentity
+
+    def to(self, state: IntentState) -> "LaunchIntent":
+        return replace(self, state=state)
 
 
 class ProcessSupervisor:
@@ -151,9 +165,7 @@ class ProcessSupervisor:
                 raise RuntimeError(
                     f"run {run_id} still has a process registration"
                 )
-            self._write_intent(
-                LaunchIntent(run_id, token, "pending", identity)
-            )
+            self._write_intent(LaunchIntent(run_id, token, IntentState.PENDING, identity))
         return token
 
     def register_prepared_launch(
@@ -173,7 +185,7 @@ class ProcessSupervisor:
             if (
                 intent is None
                 or intent.token != token
-                or intent.state != "pending"
+                or intent.state is not IntentState.PENDING
             ):
                 raise RuntimeError(
                     "supervised launch was cancelled or superseded"
@@ -181,9 +193,7 @@ class ProcessSupervisor:
             registration = self.register(
                 run_id, pgid, leader_pid=leader_pid
             )
-            self._write_intent(
-                LaunchIntent(run_id, token, "registered", intent.launcher)
-            )
+            self._write_intent(intent.to(IntentState.REGISTERED))
             return registration
 
     def require_registered_launch(self, run_id: RunId, token: str) -> None:
@@ -194,7 +204,7 @@ class ProcessSupervisor:
             if (
                 intent is None
                 or intent.token != token
-                or intent.state != "registered"
+                or intent.state is not IntentState.REGISTERED
                 or self._read(self._path(run_id)) is None
             ):
                 raise RuntimeError(
@@ -238,19 +248,9 @@ class ProcessSupervisor:
                     raise ProcessLookupError(
                         "cancelling process identity is unavailable"
                     )
-                intent = LaunchIntent(
-                    run_id,
-                    f"cancelled-{uuid.uuid4().hex}",
-                    "cancelled",
-                    identity,
-                )
+                intent = LaunchIntent(run_id, f"cancelled-{uuid.uuid4().hex}", IntentState.CANCELLED, identity)
             else:
-                intent = LaunchIntent(
-                    run_id,
-                    intent.token,
-                    "cancelled",
-                    intent.launcher,
-                )
+                intent = intent.to(IntentState.CANCELLED)
             registration = self._read(self._path(run_id))
             unwritten: OSError | None = None
             try:
@@ -277,7 +277,7 @@ class ProcessSupervisor:
             if (
                 current_intent is not None
                 and current_intent.token == intent.token
-                and current_intent.state == "cancelled"
+                and current_intent.state is IntentState.CANCELLED
             ):
                 self._remove_intent(run_id)
         self._remove_tmp(run_id)
@@ -424,7 +424,7 @@ class ProcessSupervisor:
     def _write_intent(self, intent: LaunchIntent) -> None:
         self.intent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         atomic_write(self._intent_path(intent.run_id), json.dumps({
-            "run_id": str(intent.run_id), "token": intent.token, "state": intent.state,
+            "run_id": str(intent.run_id), "token": intent.token, "state": intent.state.value,
             "launcher": {"pid": intent.launcher.pid, "start_ticks": intent.launcher.start_ticks},
         }))
 
@@ -435,7 +435,7 @@ class ProcessSupervisor:
             intent = LaunchIntent(
                 RunId(str(raw["run_id"])),
                 str(raw["token"]),
-                str(raw["state"]),
+                IntentState(str(raw["state"])),
                 ProcessIdentity(
                     int(raw["launcher"]["pid"]),
                     int(raw["launcher"]["start_ticks"]),
@@ -444,7 +444,6 @@ class ProcessSupervisor:
             if (
                 not str(intent.run_id)
                 or not intent.token
-                or intent.state not in {"pending", "registered", "cancelled"}
                 or intent.launcher.pid <= 0
                 or intent.launcher.start_ticks <= 0
             ):
@@ -471,14 +470,7 @@ class ProcessSupervisor:
                 if intent is None:
                     path.rename(path.with_suffix(".invalid"))
                     continue
-                self._write_intent(
-                    LaunchIntent(
-                        intent.run_id,
-                        intent.token,
-                        "cancelled",
-                        intent.launcher,
-                    )
-                )
+                self._write_intent(intent.to(IntentState.CANCELLED))
 
     def _discard_dead_launcher_intents(self) -> None:
         with self._intent_lock():

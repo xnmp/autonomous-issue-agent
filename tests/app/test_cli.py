@@ -1194,3 +1194,43 @@ def test_doctor_reads_the_composed_snapshot_the_daemons_will_see(tmp_path):
 def test_an_unsourceable_snapshot_falls_back_to_the_inherited_environment():
     env = {"AGENT_ENV": "/nonexistent/active.env", "FIX_BOT": "f"}
     assert cli._composed_env(env) == env
+
+
+@pytest.mark.parametrize("number", ["0", "000", "-1", "abc", "²", "", "1.5", "9" * 400 + "x", "9" * 5000])
+def test_ready_refuses_a_malformed_issue_number_without_touching_github(monkeypatch, capsys, number):
+    calls = []
+
+    class Effects:
+        def set_issue_labels(self, issue, *, add=(), remove=()):
+            calls.append(issue)
+            return True, "ok"
+
+    monkeypatch.setattr(cli, "_operator_effects", lambda *_args: Effects())
+
+    assert cli.cmd_ready(argparse.Namespace(repo="o/r", issues=[number, "07"])) == 1
+    assert calls == [7]
+    assert "invalid issue number" in capsys.readouterr().err
+
+
+def test_help_lists_no_placeholder_for_the_internal_commands(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "SUPPRESS" not in out
+    assert "prepare-remote" not in out and "publish-base-branch" not in out
+    assert "ready" in out and "install-service" in out
+    # Hidden, not removed: point-at.sh still calls them.
+    assert cli.build_parser().parse_args(["prepare-remote", "--repo", "o/r"]).cmd == "prepare-remote"
+
+
+def test_status_outside_any_deployment_fails_instead_of_reporting_stopped_roles(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
+    monkeypatch.setattr(cli, "detect_target_dir", lambda _cwd: "")
+    monkeypatch.setattr(cli, "detect_repo", lambda _cwd: "")
+
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["status"])
+    assert stopped.value.code == 2
+    captured = capsys.readouterr()
+    assert "could not detect the repo" in captured.err
+    assert "stopped" not in captured.out

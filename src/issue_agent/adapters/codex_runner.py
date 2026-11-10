@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from .atomic_file import atomic_write
@@ -307,7 +308,7 @@ def discover_rollout_session(cwd: str, started_at: float, codex_home: str | None
         pattern = os.path.join(_codex_home(codex_home), "sessions", "**", "rollout-*.jsonl")
         for path in glob.glob(pattern, recursive=True):
             try:
-                with open(path, encoding="utf-8") as rollout:
+                with open(path, encoding="utf-8", errors="replace") as rollout:
                     for line in rollout:
                         if '"session_meta"' not in line:
                             continue
@@ -315,9 +316,11 @@ def discover_rollout_session(cwd: str, started_at: float, codex_home: str | None
                             event = json.loads(line)
                         except ValueError:
                             continue
-                        if event.get("type") != "session_meta":
+                        if not isinstance(event, dict) or event.get("type") != "session_meta":
                             continue
                         payload = event.get("payload") or {}
+                        if not isinstance(payload, dict):
+                            continue
                         timestamp = _rollout_timestamp(event.get("timestamp"))
                         session_id = payload.get("session_id") or payload.get("id")
                         if (
@@ -543,6 +546,14 @@ def parse_codex_envelope(
         # A parsed envelope (including `blocked`) is the loop's own terminal.
         exit_reason=ExitReason.AGENT_ERROR if is_error else ExitReason.OK,
     )
+
+
+class _Stop(Enum):
+    """The cap that made the watchdog stop a run; the value is the kill's logged reason."""
+
+    IDLE = "idle_timeout"
+    WALL = "wall_timeout"
+    BUDGET = "budget_stop"
 
 
 @dataclass
@@ -795,9 +806,8 @@ class CodexRunner(AgentRuntime):
             feeder = asyncio.get_running_loop().create_task(_feed(stdin_payload))
 
         err_chunks: list[str] = []
-        hung = False
-        wall_tripped = False
-        budget_stop = False
+        # Why this run was stopped, if we stopped it; the first cause stands.
+        stopped: _Stop | None = None
         malformed = ""
         budget_armed = task.max_budget_usd > 0 and self.rate_table is not None
         budget = Money.from_major("USD", task.max_budget_usd) if budget_armed else None
@@ -887,23 +897,20 @@ class CodexRunner(AgentRuntime):
 
         def _trip(now: float, idle: float | None) -> bool:
             """Check every armed cap once against one clock reading; kill on a trip."""
-            nonlocal hung, wall_tripped, budget_stop
+            nonlocal stopped
             if idle is not None and self.idle_timeout is not None and idle >= self.idle_timeout:
-                reason = "idle_timeout"
-                hung = True
+                stopped = _Stop.IDLE
                 self._log(f"codex: IDLE — no stderr event for {idle:.0f}s (>{self.idle_timeout:.0f}s); "
                           "killing subprocess")
             elif self.max_runtime is not None and now - started_at >= self.max_runtime:
-                reason = "wall_timeout"
-                hung = wall_tripped = True
+                stopped = _Stop.WALL
                 self._log(f"codex: WALL — total runtime {now - started_at:.0f}s exceeded max "
                           f"{self.max_runtime:.0f}s; killing subprocess")
             elif _over_budget(now):
-                reason = "budget_stop"
-                budget_stop = True
+                stopped = _Stop.BUDGET
             else:
                 return False
-            _kill(reason)
+            _kill(stopped.value)
             return True
 
         armed = self.idle_timeout is not None or self.max_runtime is not None or budget_armed
@@ -956,12 +963,12 @@ class CodexRunner(AgentRuntime):
                 stdout = await asyncio.wait_for(
                     stdout_task, timeout=self.post_hang_drain_timeout if armed else None)
             except asyncio.TimeoutError:
-                hung = True
+                stopped = stopped or _Stop.IDLE
                 _kill("post_hang_drain_timeout")
                 await _cancel_quietly(stdout_task)
                 stdout = ""
             if not await _observe_exit(10):
-                hung = True
+                stopped = stopped or _Stop.IDLE
                 self._log("codex: process exit was not observed within 10s after stream teardown")
                 _kill("exit_unobserved_after_teardown")
         except asyncio.CancelledError:
@@ -986,18 +993,18 @@ class CodexRunner(AgentRuntime):
         sid = _session()
         usage = _usage()
         if malformed:
-            # Checked first: a malformed-counter kill also sets `budget_stop`.
+            # Checked first: unpriceable counters outrank whatever stopped the run.
             return replace(_malformed_counters(malformed, sid, usage),
                            run_usage=reserved_maximum_usage(sid, model, task.max_budget_usd, malformed))
-        if budget_stop:
-            # Checked before `hung`: the residual drain may set it after our kill.
+        if stopped is _Stop.BUDGET:
             return AgentResult(
                 is_error=True, status=MAX_BUDGET_STATUS, envelope_subtype=MAX_BUDGET_STATUS,
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
                 summary=f"codex spend crossed MAX_BUDGET_USD=${task.max_budget_usd:.2f} mid-run; killed",
                 usage=usage, session_id=sid,
             )
-        if hung:
+        if stopped is not None:
+            wall_tripped = stopped is _Stop.WALL
             limit = (f"exceeded max runtime {self.max_runtime:.0f}s" if wall_tripped
                      else f"idle >{self.idle_timeout or 0:.0f}s (no stderr event)")
             return AgentResult(
@@ -1023,7 +1030,7 @@ class CodexRunner(AgentRuntime):
                              envelope_subtype=PROVIDER_REFUSED_SUBTYPE,
                              summary=f"provider ended the turn: {provider_failure}")
         if exit_code < 0 or exit_code == 128 + signal.SIGKILL:
-            # A signal we did not send (our kills set `hung`/`budget_stop`):
+            # A signal we did not send (our kills set `stopped`):
             # bubblewrap encodes a runtime SIGKILL as exit 137 (ADR 0005).
             self._log(f"codex: killed externally (exit {exit_code}, not by our watchdog) — infra death")
             result = replace(result, exit_reason=ExitReason.KILLED_EXTERNALLY)
